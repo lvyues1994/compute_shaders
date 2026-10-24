@@ -201,6 +201,7 @@ private:
     std::string arrayInit(clang::InitListExpr const *list, clang::QualType element, std::uint64_t size);
     std::string structValue(clang::CXXRecordDecl const *record, clang::SourceLocation loc);
 
+    bool isAtomicTarget(clang::Expr const *e) const;
     void markBufferUse(clang::Expr const *object, Role role);
     void markImageUse(clang::Expr const *image, bool write);
     clang::FieldDecl const *kernelField(clang::Expr const *e) const;
@@ -272,6 +273,13 @@ std::string Writer::typeName(clang::QualType const original, clang::SourceLocati
                           : element == "uint"  ? "u"
                                                : "b";
         return prefix + std::string{"vec"} + std::to_string(vec->size);
+    }
+    if (auto const matrix = asTcMat(type)) {
+        auto const prefix = typeName(matrix->element, loc) == "double" ? "dmat" : "mat";
+        auto const shape = matrix->columns == matrix->rows
+                             ? std::to_string(matrix->columns)
+                             : std::to_string(matrix->columns) + "x" + std::to_string(matrix->rows);
+        return prefix + shape;
     }
     if (auto const array = asStdArray(type)) {
         return typeName(array->element, loc) + "[" + std::to_string(array->size) + "]";
@@ -374,6 +382,9 @@ std::string Writer::zeroValue(clang::QualType const original, clang::SourceLocat
     if (asTcVec(type)) {
         return typeName(type, loc) + "(0)";
     }
+    if (asTcMat(type)) {
+        return typeName(type, loc) + "(0.0)";
+    }
     if (auto const array = asStdArray(type)) {
         auto elements = std::vector<std::string>(array->size, zeroValue(array->element, loc));
         return typeName(type, loc) + "(" + join(elements, ", ") + ")";
@@ -429,6 +440,19 @@ std::string Writer::constantValue(clang::APValue const &value, clang::QualType c
         auto parts = std::vector<std::string>{};
         for (unsigned i = 0; i < vec->size; ++i) {
             parts.push_back(constantValue(fields.getStructField(i), vec->element, loc));
+        }
+        return typeName(type, loc) + "(" + join(parts, ", ") + ")";
+    }
+    if (auto const matrix = asTcMat(type)) {
+        auto const &columns = value.getStructField(0);
+        auto parts = std::vector<std::string>{};
+        for (unsigned c = 0; c < matrix->columns; ++c) {
+            auto const &item = c < columns.getArrayInitializedElts() ? columns.getArrayInitializedElt(c)
+                                                                      : columns.getArrayFiller();
+            auto const &column = item.getStructBase(0);
+            for (unsigned r = 0; r < matrix->rows; ++r) {
+                parts.push_back(constantValue(column.getStructField(r), matrix->element, loc));
+            }
         }
         return typeName(type, loc) + "(" + join(parts, ", ") + ")";
     }
@@ -514,7 +538,8 @@ bool Writer::containsVec3Struct(clang::QualType const original) {
     }
     for (auto const *field : record->fields()) {
         auto const vec = asTcVec(field->getType());
-        if ((vec and vec->size == 3) or containsVec3Struct(field->getType())) {
+        auto const matrix = asTcMat(field->getType());
+        if ((vec and vec->size == 3) or (matrix and matrix->rows == 3) or containsVec3Struct(field->getType())) {
             return true;
         }
     }
@@ -1170,7 +1195,8 @@ clang::FieldDecl const *Writer::kernelField(clang::Expr const *e) const {
 }
 
 std::string Writer::kernelMember(clang::FieldDecl const *field, Role const inherited, clang::SourceLocation const loc) {
-    if (kernel.findBuffer(field) != nullptr or kernel.findImage(field) != nullptr) {
+    if (kernel.findBuffer(field) != nullptr or kernel.findImage(field) != nullptr or kernel.isTexture(field)
+        or kernel.isShared(field)) {
         return glslIdentifier(field->getName());
     }
     if (kernel.findUniform(field) != nullptr) {
@@ -1215,7 +1241,8 @@ std::string Writer::member(clang::MemberExpr const *me, Role const inherited) {
         unsupported(loc, "this member access");
         return "0";
     }
-    if (asTcSpecialization(field->getParent(), "Uniform") != nullptr) {
+    if (asTcSpecialization(field->getParent(), "Uniform") != nullptr
+        or asTcSpecialization(field->getParent(), "Shared") != nullptr) {
         return exprAs(base, inherited);
     }
     auto const object = exprAs(base, inherited);
@@ -1227,6 +1254,30 @@ std::string Writer::member(clang::MemberExpr const *me, Role const inherited) {
         return "0";
     }
     return object + "." + fieldName(field);
+}
+
+// GLSL atomics operate on buffer or shared memory only: a buffer element (or
+// a member of one), or a Shared variable (or an element of one).
+bool Writer::isAtomicTarget(clang::Expr const *e) const {
+    e = e->IgnoreParenImpCasts();
+    if (auto const *me = llvm::dyn_cast<clang::MemberExpr>(e)) {
+        auto const *field = llvm::dyn_cast<clang::FieldDecl>(me->getMemberDecl());
+        if (field != nullptr and asTcSpecialization(field->getParent(), "Shared") != nullptr) {
+            return true;
+        }
+        return not llvm::isa<clang::CXXThisExpr>(me->getBase()->IgnoreParenImpCasts()) and isAtomicTarget(me->getBase());
+    }
+    if (auto const *oc = llvm::dyn_cast<clang::CXXOperatorCallExpr>(e); oc != nullptr and oc->getOperator() == clang::OO_Subscript) {
+        auto const objectType = bareType(oc->getArg(0)->getType());
+        if (asTcSpecialization(objectType, "BufferBinding") != nullptr or asTcSpecialization(objectType, "Shared") != nullptr) {
+            return true;
+        }
+        return (asStdArray(objectType) or asTcVec(objectType)) and isAtomicTarget(oc->getArg(0));
+    }
+    if (auto const *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
+        return isAtomicTarget(subscript->getBase());
+    }
+    return false;
 }
 
 void Writer::markBufferUse(clang::Expr const *object, Role const use) {
@@ -1268,7 +1319,7 @@ std::string Writer::memberCall(clang::CXXMemberCallExpr const *mc, Role const in
     auto const args = llvm::ArrayRef<clang::Expr const *>{mc->getArgs(), mc->getNumArgs()};
 
     if (llvm::isa<clang::CXXConversionDecl>(method)) {
-        if (asTcSpecialization(record, "Uniform") != nullptr) {
+        if (asTcSpecialization(record, "Uniform") != nullptr or asTcSpecialization(record, "Shared") != nullptr) {
             return exprAs(object, inherited);
         }
         unsupported(loc, "user-defined conversion");
@@ -1319,7 +1370,8 @@ std::string Writer::operatorCall(clang::CXXOperatorCallExpr const *oc, Role cons
             auto const name = expr(object);
             return name + "[" + expr(oc->getArg(1)) + "]";
         }
-        if (asTcVec(objectType) or asStdArray(objectType)) {
+        if (asTcVec(objectType) or asTcMat(objectType) or asStdArray(objectType)
+            or asTcSpecialization(objectType, "Shared") != nullptr) {
             auto const base = exprAs(object, inherited);
             return base + "[" + expr(oc->getArg(1)) + "]";
         }
@@ -1382,8 +1434,12 @@ std::string Writer::call(clang::CallExpr const *c) {
     }
     auto const args = llvm::ArrayRef<clang::Expr const *>{c->getArgs(), c->getNumArgs()};
     if (auto const *method = llvm::dyn_cast<clang::CXXMethodDecl>(callee); method != nullptr and method->isStatic()) {
-        if (auto const vec = asTcVec(context.getRecordType(method->getParent())); vec and method->getName() == "length") {
+        auto const recordType = context.getRecordType(method->getParent());
+        if (auto const vec = asTcVec(recordType); vec and method->getName() == "length") {
             return std::to_string(vec->size);
+        }
+        if (auto const matrix = asTcMat(recordType); matrix and method->getName() == "length") {
+            return std::to_string(matrix->columns);
         }
         if (isTcDecl(method)) {
             unsupported(loc, "'" + method->getQualifiedNameAsString() + "'");
@@ -1397,6 +1453,12 @@ std::string Writer::call(clang::CallExpr const *c) {
             markImageUse(c->getArg(0), false);
         } else if (name == "imageStore") {
             markImageUse(c->getArg(0), true);
+        } else if (name == "barrier" and not kernel.usesBarrier) {
+            diags.error(loc, "kernels that call barrier() must declare 'static constexpr bool usesBarrier = true;' "
+                             "so the CPU backend can synchronise their invocations");
+        } else if (name.starts_with("atomic") and c->getNumArgs() > 0 and not isAtomicTarget(c->getArg(0))) {
+            diags.error(c->getArg(0)->getBeginLoc(),
+                        name.str() + " needs a buffer element or a Shared variable as its first argument");
         }
         return glslNameOfTcFunction(name) + "(" + arguments(callee, args) + ")";
     }
@@ -1418,9 +1480,9 @@ std::string Writer::construct(clang::CXXConstructExpr const *ctor, Role const in
     if (decl->isCopyOrMoveConstructor() and ctor->getNumArgs() >= 1) {
         return exprAs(ctor->getArg(0), inherited);
     }
-    if (asTcVec(type)) {
+    if (asTcVec(type) or asTcMat(type)) {
         if (ctor->getNumArgs() == 0) {
-            return typeName(type, loc) + "(0)";
+            return zeroValue(type, loc);
         }
         auto parts = std::vector<std::string>{};
         for (auto const *arg : ctor->arguments()) {
@@ -1502,6 +1564,9 @@ std::optional<GlslBody> Writer::run() {
     }
     for (auto const &uniform : kernel.uniforms) {
         out.uniformTypes.push_back(typeName(uniform.type, uniform.field->getLocation()));
+    }
+    for (auto const &variable : kernel.shared) {
+        out.shared.push_back(declaration(variable.type, variable.name, variable.field->getLocation()));
     }
     requireFunction(kernel.entry, FunctionKind::KernelEntry, kernel.entry->getLocation());
     while (not pending.empty()) {

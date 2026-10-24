@@ -23,6 +23,7 @@ struct EglContext {
     ~EglContext();
 
     void makeCurrent() const;
+    EGLDisplay eglDisplay() const noexcept { return display; }
     GlApi const &api() const noexcept { return gl; }
     std::string const &renderer() const noexcept { return rendererName; }
 

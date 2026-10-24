@@ -37,6 +37,14 @@ struct VecInfo {
 };
 std::optional<VecInfo> asTcVec(clang::QualType type);
 
+// tc::mat<T, C, R>: C columns of R components.
+struct MatInfo {
+    clang::QualType element;
+    unsigned columns = 0;
+    unsigned rows = 0;
+};
+std::optional<MatInfo> asTcMat(clang::QualType type);
+
 clang::QualType templateTypeArg(clang::ClassTemplateSpecializationDecl const *spec, unsigned index);
 std::uint64_t templateIntArg(clang::ClassTemplateSpecializationDecl const *spec, unsigned index);
 

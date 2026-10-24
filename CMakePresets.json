@@ -42,7 +42,7 @@
         "ANDROID_PLATFORM": "android-29",
         "ANDROID_STL": "c++_static",
         "TC_BUILD_TRANSPILER": false,
-        "TC_BUILD_TESTS": false,
+        "TC_BUILD_TESTS": true,
         "TC_TRANSPILER_EXECUTABLE": "${sourceDir}/build/linux-release/transpiler/tc-transpile"
       }
     }

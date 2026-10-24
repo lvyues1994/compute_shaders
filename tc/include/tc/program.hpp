@@ -9,6 +9,7 @@
 #include <tc/dim.hpp>
 #include <tc/gpu_format.hpp>
 #include <tc/span.hpp>
+#include <tc/texture.hpp>
 #include <tc/vec.hpp>
 
 namespace tc {
@@ -16,6 +17,8 @@ namespace tc {
 enum class ResourceKind : std::uint8_t {
     StorageBuffer,
     StorageImage,
+    SampledTexture,
+    ExternalTexture,
 };
 
 enum class Access : std::uint8_t {
@@ -39,14 +42,18 @@ struct ResourceSlot {
     Access access = Access::ReadWrite;
     Dim imageDim = Dim::D2;
     ImageFormat imageFormat{};
+    Filter filter = Filter::Nearest;   // sampled textures only
+    Wrap wrap = Wrap::ClampToEdge;     // sampled textures only
 };
 
-// Reflection of one Uniform<T, Location> member.
+// Reflection of one Uniform<T, Location> member. Matrices have
+// `columns` > 1, each column a vector of `components` scalars.
 struct UniformSlot {
     std::string_view name;
     std::uint32_t location = 0;
     ScalarKind scalar = ScalarKind::Float;
     std::uint32_t components = 1;
+    std::uint32_t columns = 1;
     std::uint32_t pushConstantOffset = 0;
 };
 

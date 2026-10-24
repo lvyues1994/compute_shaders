@@ -29,4 +29,12 @@ struct IsKernel<K, std::void_t<decltype(K::fileLocation), decltype(uvec3{std::de
 template <class K>
 inline constexpr bool isKernel = IsKernel<K>::value;
 
+// `static constexpr bool usesBarrier = true;` marks kernels whose
+// invocations synchronise with barrier().
+template <class K, class = void>
+struct UsesBarrier : std::false_type {};
+
+template <class K>
+struct UsesBarrier<K, std::void_t<decltype(K::usesBarrier)>> : std::bool_constant<K::usesBarrier> {};
+
 } // namespace tc

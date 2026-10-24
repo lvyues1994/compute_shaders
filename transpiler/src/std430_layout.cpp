@@ -99,6 +99,16 @@ struct LayoutChecker {
             auto const align = (vec->size == 2 ? 2 : 4) * component->size;
             return Std430{vec->size * component->size, align};
         }
+        if (auto const matrix = asTcMat(type)) {
+            // Column-major: an array of `columns` vectors of `rows` components.
+            auto const component = scalar(bareType(matrix->element));
+            if (not component) {
+                return std::nullopt;
+            }
+            auto const align = (matrix->rows == 2 ? 2 : 4) * component->size;
+            auto const stride = roundUp(matrix->rows * component->size, align);
+            return Std430{matrix->columns * stride, align};
+        }
         if (auto const arr = asStdArray(type)) {
             return array(arr->element, arr->size);
         }

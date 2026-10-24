@@ -207,4 +207,200 @@ struct TC_KERNEL ImageFormats {
     }
 };
 
+// Buffer atomics: a histogram, order-independent reductions, stream
+// compaction (order varies between runs) and exchange / compare-and-swap.
+struct TC_KERNEL AtomicOps {
+    static constexpr char fileLocation[] = "atomic_ops";
+    uvec3 local_size{64, 1, 1};
+
+    BufferBinding<uint, 0> values;
+    BufferBinding<uint, 1> bins;
+    BufferBinding<uint, 2> stats; // max, min, or, and, xor, compacted count, index sum
+    BufferBinding<uint, 3> compacted;
+    BufferBinding<std::int32_t, 4> slots;
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= uint(values.length())) {
+            return;
+        }
+        uint v = values[i];
+        atomicAdd(bins[v % 16u], 1u);
+        atomicMax(stats[0], v);
+        atomicMin(stats[1], v);
+        atomicOr(stats[2], v);
+        atomicAnd(stats[3], v);
+        atomicXor(stats[4], v);
+        if (v % 3u == 0u) {
+            uint slot = atomicAdd(stats[5], 1u);
+            compacted[slot] = v;
+        }
+        std::int32_t previous = atomicCompSwap(slots[2u * i], 0, int(v & 0xffffu));
+        std::int32_t index = atomicExchange(slots[2u * i + 1u], previous - 5);
+        atomicAdd(stats[6], uint(index));
+    }
+};
+
+// Tree reduction in shared memory, with barrier() inside a loop.
+struct TC_KERNEL WorkgroupReduce {
+    static constexpr char fileLocation[] = "workgroup_reduce";
+    static constexpr bool usesBarrier = true;
+    uvec3 local_size{64, 1, 1};
+
+    BufferBinding<uint, 0> values;
+    BufferBinding<uint, 1> sums;
+    Shared<std::array<uint, 64>> partial;
+
+    void main() {
+        uint local = gl_LocalInvocationIndex;
+        uint i = gl_GlobalInvocationID.x;
+        partial[local] = i < uint(values.length()) ? values[i] : 0u;
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+            if (local < stride) {
+                partial[local] += partial[local + stride];
+            }
+            barrier();
+        }
+        if (local == 0u) {
+            sums[gl_WorkGroupID.x] = partial[0];
+        }
+    }
+};
+
+// Matrix transpose through a padded 16x16 shared tile (2D workgroups).
+struct TC_KERNEL TiledTranspose {
+    static constexpr char fileLocation[] = "tiled_transpose";
+    static constexpr bool usesBarrier = true;
+    uvec3 local_size{16, 16, 1};
+
+    BufferBinding<float, 0> input;
+    BufferBinding<float, 1> output;
+    Uniform<ivec2, 0> size{};
+    Shared<std::array<std::array<float, 17>, 16>> tile;
+
+    void main() {
+        ivec2 local = ivec2(gl_LocalInvocationID.xy());
+        ivec2 origin = ivec2(gl_WorkGroupID.xy()) * 16;
+        ivec2 p = origin + local;
+        if (p.x < size.value.x and p.y < size.value.y) {
+            tile[local.y][local.x] = input[p.y * size.value.x + p.x];
+        }
+        barrier();
+        ivec2 q = ivec2{origin.y, origin.x} + local;
+        if (q.x < size.value.y and q.y < size.value.x) {
+            output[q.y * size.value.y + q.x] = tile[local.x][local.y];
+        }
+    }
+};
+
+// Per-workgroup histogram in shared memory, merged with buffer atomics.
+struct TC_KERNEL SharedHistogram {
+    static constexpr char fileLocation[] = "shared_histogram";
+    static constexpr bool usesBarrier = true;
+    uvec3 local_size{128, 1, 1};
+
+    BufferBinding<uint, 0> values;
+    BufferBinding<uint, 1> bins; // 32 bins, then the total count
+    Shared<std::array<uint, 32>> counts;
+    Shared<uint> total;
+
+    void main() {
+        uint local = gl_LocalInvocationIndex;
+        if (local < 32u) {
+            counts[local] = 0u;
+        }
+        if (local == 0u) {
+            total.value = 0u;
+        }
+        barrier();
+        uint i = gl_GlobalInvocationID.x;
+        if (i < uint(values.length())) {
+            atomicAdd(counts[values[i] % 32u], 1u);
+            atomicAdd(total.value, 1u);
+        }
+        barrier();
+        if (local < 32u) {
+            atomicAdd(bins[local], counts[local]);
+        }
+        if (local == 0u) {
+            atomicAdd(bins[32], total.value);
+        }
+    }
+};
+
+// Matrices in buffers, uniforms (push constants on Vulkan) and constants.
+struct TC_KERNEL MatrixOps {
+    static constexpr char fileLocation[] = "matrix_ops";
+    uvec3 local_size{16, 1, 1};
+
+    BufferBinding<mat3, 0> mats;
+    BufferBinding<vec4, 1> out;
+    Uniform<mat3, 0> colorMatrix{};
+    Uniform<mat2x3, 1> projection{};
+
+    static constexpr mat2 kRotate{0.0f, 1.0f, -1.0f, 0.0f};
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= uint(mats.length())) {
+            return;
+        }
+        mat3 m = mats[i];
+        vec3 v = vec3{float(i), 1.0f, 2.0f};
+        vec3 colored = colorMatrix.value * v;
+        vec2 rotated = kRotate * vec2{v.x, v.y};
+        vec3 projected = projection.value * rotated;
+        out[2u * i] = vec4(colored, determinant(m));
+        out[2u * i + 1u] = vec4(projected, (transpose(m) * v).y + m[2][1]);
+        mats[i] = inverse(m) * 2.0f;
+    }
+};
+
+// Packing and bit-manipulation built-ins.
+struct TC_KERNEL PackingOps {
+    static constexpr char fileLocation[] = "packing_ops";
+    uvec3 local_size{32, 1, 1};
+
+    BufferBinding<uint, 0> words;
+    BufferBinding<uvec4, 1> out;
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        uint w = words[i];
+        vec4 unorm = unpackUnorm4x8(w);
+        vec4 snorm = unpackSnorm4x8(w);
+        vec2 half = unpackHalf2x16(w & 0x3bff3bffu);
+        out[2u * i] = uvec4(packUnorm4x8(unorm.wzyx()), packSnorm4x8(snorm), packHalf2x16(half),
+                            packUnorm2x16(unorm.xy()));
+        out[2u * i + 1u] = uvec4(bitfieldExtract(w, int(i % 24u), 8), uint(bitCount(w)), uint(findMSB(w) + 1),
+                                 bitfieldInsert(w, i, 8, 8));
+    }
+};
+
+// Sampled textures: formats that cannot be storage images on OpenGL ES,
+// bilinear filtering with repeat wrapping, and integer textures.
+struct TC_KERNEL TextureSampling {
+    static constexpr char fileLocation[] = "texture_sampling";
+    uvec3 local_size{8, 8, 1};
+
+    TextureBinding<gpu::R8, Dim::D2, cpu::R8, 0> gray;
+    TextureBinding<gpu::RGBA8, Dim::D2, cpu::RGBA8, 1, Filter::Linear, Wrap::Repeat> color;
+    TextureBinding<gpu::R32UI, Dim::D2, cpu::R32UI, 2> ids;
+    BufferBinding<vec4, 3> out;
+
+    void main() {
+        ivec2 p = ivec2(gl_GlobalInvocationID.xy());
+        ivec2 size = textureSize(gray, 0);
+        if (p.x >= size.x or p.y >= size.y) {
+            return;
+        }
+        uint index = uint(p.y * size.x + p.x);
+        vec2 uv = (vec2(p) + vec2{0.25f, 0.75f}) / vec2(size) * 1.5f;
+        out[index * 3u] = texelFetch(gray, p, 0);
+        out[index * 3u + 1u] = texture(color, uv);
+        out[index * 3u + 2u] = vec4(texelFetch(ids, p, 0)) + vec4(texture(gray, uv).x);
+    }
+};
+
 } // namespace tests

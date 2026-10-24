@@ -117,6 +117,93 @@ TEST(BufferResource, CopiesGetANewIdentity) {
     EXPECT_EQ(moved.identity().key(), key);
 }
 
+TEST(Mat, IsColumnMajorLikeGlsl) {
+    auto const m = mat2{1.0f, 2.0f, 3.0f, 4.0f}; // columns (1, 2) and (3, 4)
+    EXPECT_EQ(m[1], (vec2{3.0f, 4.0f}));
+    EXPECT_EQ((m * vec2{1.0f, 0.0f}), (vec2{1.0f, 2.0f}));
+    EXPECT_EQ((vec2{1.0f, 0.0f} * m), (vec2{1.0f, 3.0f}));
+    EXPECT_EQ((mat3{2.0f} * vec3{1.0f, 2.0f, 3.0f}), (vec3{2.0f, 4.0f, 6.0f}));
+    EXPECT_EQ(transpose(m), (mat2{1.0f, 3.0f, 2.0f, 4.0f}));
+    EXPECT_FLOAT_EQ(determinant(m), -2.0f);
+    auto const product = mat2x3{vec3{1.0f, 0.0f, 0.0f}, vec3{0.0f, 1.0f, 0.0f}} * mat2{1.0f, 2.0f, 3.0f, 4.0f};
+    EXPECT_EQ(product[1], (vec3{3.0f, 4.0f, 0.0f}));
+    EXPECT_EQ(mat3{mat2{5.0f}}, (mat3{5.0f, 0.0f, 0.0f, 0.0f, 5.0f, 0.0f, 0.0f, 0.0f, 1.0f}));
+}
+
+TEST(Mat, InvertsAndMultiplies) {
+    auto const m3 = mat3{2.0f, 1.0f, 0.0f, 0.0f, 3.0f, 1.0f, 1.0f, 0.0f, 4.0f};
+    auto const i3 = m3 * inverse(m3);
+    auto const m4 = mat4{4.0f, 1.0f, 0.0f, 2.0f, 0.0f, 3.0f, 1.0f, 0.0f,
+                         1.0f, 0.0f, 5.0f, 1.0f, 0.0f, 2.0f, 0.0f, 6.0f};
+    auto const i4 = m4 * inverse(m4);
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            if (c < 3 and r < 3) {
+                EXPECT_NEAR(i3[c][r], c == r ? 1.0f : 0.0f, 1e-5f);
+            }
+            EXPECT_NEAR(i4[c][r], c == r ? 1.0f : 0.0f, 1e-5f);
+        }
+    }
+    EXPECT_NEAR(determinant(m4) * determinant(inverse(m4)), 1.0f, 1e-5f);
+    EXPECT_EQ(outerProduct(vec3{1.0f, 2.0f, 3.0f}, vec2{1.0f, 10.0f})[1], (vec3{10.0f, 20.0f, 30.0f}));
+}
+
+TEST(Packing, MatchesGlslDefinitions) {
+    EXPECT_EQ(packUnorm4x8(vec4{0.0f, 1.0f, 0.5f, 2.0f}), 0xff80ff00u);
+    EXPECT_EQ(unpackUnorm4x8(0xff80ff00u), (vec4{0.0f, 1.0f, 128.0f / 255.0f, 1.0f}));
+    EXPECT_EQ(packSnorm4x8(vec4{-1.0f, 1.0f, 0.0f, -0.5f}), 0xc0007f81u);
+    EXPECT_EQ(unpackHalf2x16(packHalf2x16(vec2{1.5f, -0.000061035156f})), (vec2{1.5f, -0.000061035156f}));
+    EXPECT_EQ(packHalf2x16(vec2{65504.0f, 0.0f}), 0x00007bffu);
+    EXPECT_EQ(bitfieldExtract(0xabcdu, 4, 8), 0xbcu);
+    EXPECT_EQ(bitfieldExtract(std::int32_t{0x0f0}, 4, 4), -1);
+    EXPECT_EQ(bitfieldInsert(0xffffu, 0u, 4, 8), 0xf00fu);
+    EXPECT_EQ(bitCount(uvec2{0xffu, 0x10u}), (ivec2{8, 1}));
+    EXPECT_EQ(findLSB(0x18u), 3);
+    EXPECT_EQ(findMSB(std::int32_t{-1}), -1);
+    EXPECT_EQ(findMSB(0x18u), 4);
+    EXPECT_EQ(bitfieldReverse(1u), 0x80000000u);
+}
+
+TEST(Texture, SamplesLikeOpenGl) {
+    auto pixels = BufferResource<cpu::R8, Dim::D2>{ivec2{2, 2}};
+    pixels[ivec2{0, 0}] = cpu::R8{{0}};
+    pixels[ivec2{1, 0}] = cpu::R8{{255}};
+    pixels[ivec2{0, 1}] = cpu::R8{{51}};
+    pixels[ivec2{1, 1}] = cpu::R8{{102}};
+    auto nearest = TextureBinding<gpu::R8, Dim::D2, cpu::R8, 0>{};
+    auto linear = TextureBinding<gpu::R8, Dim::D2, cpu::R8, 1, Filter::Linear, Wrap::Repeat>{};
+    nearest.attach(pixels);
+    linear.attach(pixels);
+    EXPECT_FLOAT_EQ(texelFetch(nearest, ivec2{1, 0}, 0).x, 1.0f);
+    EXPECT_FLOAT_EQ(texture(nearest, vec2{0.9f, 0.9f}).x, 0.4f);
+    EXPECT_FLOAT_EQ(texture(nearest, vec2{1.9f, 0.1f}).x, 1.0f); // clamped
+    EXPECT_NEAR(texture(linear, vec2{0.5f, 0.25f}).x, 0.5f, 1e-6f);
+    EXPECT_NEAR(texture(linear, vec2{0.5f, 0.5f}).x, (0.0f + 1.0f + 0.2f + 0.4f) / 4.0f, 1e-6f);
+    EXPECT_NEAR(texture(linear, vec2{0.0f, 0.25f}).x, 0.5f, 1e-6f); // wraps between columns 1 and 0
+    EXPECT_EQ(textureSize(linear, 0), (ivec2{2, 2}));
+    EXPECT_EQ(texture(nearest, vec2{0.25f, 0.25f}).w, 1.0f);
+}
+
+TEST(BufferResource, WrapsExternalMemory) {
+    auto backing = std::make_shared<std::vector<float>>(8, 1.5f);
+    auto watcher = std::weak_ptr<std::vector<float>>{backing};
+    auto memory = ExternalMemory{reinterpret_cast<std::byte *>(backing->data()), 8 * sizeof(float), backing};
+    backing.reset();
+    {
+        auto resource = BufferResource<float>::wrap(8, std::move(memory), ResourceIdentity::create());
+        EXPECT_TRUE(resource.usesExternalMemory());
+        EXPECT_FLOAT_EQ(resource[3], 1.5f);
+        resource[3] = 2.0f;
+        auto const copy = resource;
+        EXPECT_FALSE(copy.usesExternalMemory());
+        EXPECT_FLOAT_EQ(copy[3], 2.0f);
+        auto const moved = std::move(resource);
+        EXPECT_TRUE(moved.usesExternalMemory());
+        EXPECT_FALSE(watcher.expired());
+    }
+    EXPECT_TRUE(watcher.expired());
+}
+
 struct TC_KERNEL Doubler {
     static constexpr char fileLocation[] = "doubler";
     uvec3 local_size{8, 1, 1};
@@ -145,6 +232,54 @@ TEST(CpuDevice, RunsKernelsWithoutTranspilation) {
     for (int i = 0; i < 100; ++i) {
         EXPECT_EQ(data[i], 2 * i + i % 8);
     }
+}
+
+struct TC_KERNEL DivergentBarrier {
+    static constexpr char fileLocation[] = "divergent_barrier";
+    static constexpr bool usesBarrier = true;
+    uvec3 local_size{4, 1, 1};
+
+    BufferBinding<uint, 0> out;
+
+    void main() {
+        if (gl_LocalInvocationIndex == 2u) {
+            return;
+        }
+        barrier();
+        out[gl_LocalInvocationIndex] = 1u;
+    }
+};
+
+struct TC_KERNEL UndeclaredBarrier {
+    static constexpr char fileLocation[] = "undeclared_barrier";
+    uvec3 local_size{4, 1, 1};
+
+    BufferBinding<uint, 0> out;
+
+    void main() {
+        barrier();
+        out[gl_LocalInvocationIndex] = 1u;
+    }
+};
+
+template <class K>
+void runOnCpu(K &kernel) {
+    auto device = cpu::createDevice(cpu::CpuDeviceConfig{1});
+    auto out = BufferResource<uint>{4};
+    kernel.out.attach(out);
+    device->useKernel(kernel);
+    device->bindBuffer(kernel.out);
+    device->execute(kernel, uvec3{1u, 1u, 1u});
+}
+
+TEST(CpuDeviceDeathTest, DetectsInvocationsSkippingABarrier) {
+    auto kernel = DivergentBarrier{};
+    EXPECT_DEATH(runOnCpu(kernel), "not reached by every invocation");
+}
+
+TEST(CpuDeviceDeathTest, RequiresUsesBarrier) {
+    auto kernel = UndeclaredBarrier{};
+    EXPECT_DEATH(runOnCpu(kernel), "usesBarrier");
 }
 
 TEST(CpuDevice, RejectsUnattachedBindings) {

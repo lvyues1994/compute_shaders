@@ -19,9 +19,10 @@ struct GlFormat {
 // Throws DeviceError for formats without an OpenGL equivalent.
 GlFormat glFormatOf(ImageFormat const &format);
 
-// Compute shader that copies every texel of the image at unit 0 into the
+// Compute shader that copies every texel of the texture at unit 0 into the
 // SSBO at binding 0 as four 32-bit components (OpenGL ES has no
-// glGetTexImage, so both APIs read images back this way).
+// glGetTexImage, so both APIs read images back this way). It uses
+// texelFetch, which works for formats that cannot be storage images.
 std::string readbackShaderSource(ImageFormat const &format, Dim dim, OpenGLApi api);
 
 // Packs four 32-bit shader components (float, int or uint bits) into one

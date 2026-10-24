@@ -6,6 +6,11 @@ namespace tc::opengl {
 
 // glProgramUniform*dv exist only in desktop OpenGL.
 using PfnProgramUniformDv = void(GL_APIENTRY *)(GLuint, GLint, GLsizei, double const *);
+// glBufferStorage: OpenGL 4.4, or GL_EXT_buffer_storage on OpenGL ES.
+using PfnBufferStorage = void(GL_APIENTRY *)(GLenum, GLsizeiptr, void const *, GLbitfield);
+
+inline constexpr GLbitfield kMapPersistentBit = 0x0040;
+inline constexpr GLbitfield kMapCoherentBit = 0x0080;
 
 // Entry points of the OpenGL 4.3 core / OpenGL ES 3.1 common subset that the
 // backend uses, loaded at runtime so one binary drives both APIs.
@@ -59,7 +64,22 @@ using PfnProgramUniformDv = void(GL_APIENTRY *)(GLuint, GLint, GLsizei, double c
     X(PFNGLPROGRAMUNIFORM1FVPROC, glProgramUniform1fv)                                                                 \
     X(PFNGLPROGRAMUNIFORM2FVPROC, glProgramUniform2fv)                                                                 \
     X(PFNGLPROGRAMUNIFORM3FVPROC, glProgramUniform3fv)                                                                 \
-    X(PFNGLPROGRAMUNIFORM4FVPROC, glProgramUniform4fv)
+    X(PFNGLPROGRAMUNIFORM4FVPROC, glProgramUniform4fv)                                                                 \
+    X(PFNGLPROGRAMUNIFORMMATRIX2FVPROC, glProgramUniformMatrix2fv)                                                     \
+    X(PFNGLPROGRAMUNIFORMMATRIX3FVPROC, glProgramUniformMatrix3fv)                                                     \
+    X(PFNGLPROGRAMUNIFORMMATRIX4FVPROC, glProgramUniformMatrix4fv)                                                     \
+    X(PFNGLPROGRAMUNIFORMMATRIX2X3FVPROC, glProgramUniformMatrix2x3fv)                                                 \
+    X(PFNGLPROGRAMUNIFORMMATRIX3X2FVPROC, glProgramUniformMatrix3x2fv)                                                 \
+    X(PFNGLPROGRAMUNIFORMMATRIX2X4FVPROC, glProgramUniformMatrix2x4fv)                                                 \
+    X(PFNGLPROGRAMUNIFORMMATRIX4X2FVPROC, glProgramUniformMatrix4x2fv)                                                 \
+    X(PFNGLPROGRAMUNIFORMMATRIX3X4FVPROC, glProgramUniformMatrix3x4fv)                                                 \
+    X(PFNGLPROGRAMUNIFORMMATRIX4X3FVPROC, glProgramUniformMatrix4x3fv)                                                 \
+    X(PFNGLACTIVETEXTUREPROC, glActiveTexture)                                                                         \
+    X(PFNGLGENSAMPLERSPROC, glGenSamplers)                                                                             \
+    X(PFNGLDELETESAMPLERSPROC, glDeleteSamplers)                                                                       \
+    X(PFNGLSAMPLERPARAMETERIPROC, glSamplerParameteri)                                                                 \
+    X(PFNGLBINDSAMPLERPROC, glBindSampler)                                                                             \
+    X(PFNGLGETSTRINGIPROC, glGetStringi)
 
 #define TC_GL_OPTIONAL_FUNCTIONS(X)                                                                                    \
     X(PFNGLDEBUGMESSAGECALLBACKPROC, glDebugMessageCallback)                                                           \
@@ -67,7 +87,9 @@ using PfnProgramUniformDv = void(GL_APIENTRY *)(GLuint, GLint, GLsizei, double c
     X(PfnProgramUniformDv, glProgramUniform1dv)                                                                        \
     X(PfnProgramUniformDv, glProgramUniform2dv)                                                                        \
     X(PfnProgramUniformDv, glProgramUniform3dv)                                                                        \
-    X(PfnProgramUniformDv, glProgramUniform4dv)
+    X(PfnProgramUniformDv, glProgramUniform4dv)                                                                        \
+    X(PfnBufferStorage, glBufferStorage)                                                                               \
+    X(PfnBufferStorage, glBufferStorageEXT)
 
 struct GlApi {
 #define TC_GL_DECLARE(type, name) type name = nullptr;

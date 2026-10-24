@@ -44,12 +44,34 @@ KernelArtifact makeArtifact(KernelModel const &model, ShaderVariants const &shad
         resource.format = image.format;
         artifact.resources.push_back(resource);
     }
+    for (auto const &texture : model.textures) {
+        auto resource = ResourceArtifact{};
+        resource.name = texture.name;
+        resource.binding = texture.binding;
+        resource.kind = tc::ResourceKind::SampledTexture;
+        resource.access = tc::Access::ReadOnly;
+        resource.dim = texture.dim;
+        resource.format = texture.format;
+        resource.filter = texture.filter;
+        resource.wrap = texture.wrap;
+        artifact.resources.push_back(resource);
+    }
+    for (auto const &texture : model.externalTextures) {
+        auto resource = ResourceArtifact{};
+        resource.name = texture.name;
+        resource.binding = texture.binding;
+        resource.kind = tc::ResourceKind::ExternalTexture;
+        resource.access = tc::Access::ReadOnly;
+        resource.filter = tc::Filter::Linear;
+        artifact.resources.push_back(resource);
+    }
     for (auto const &uniform : model.uniforms) {
         auto slot = UniformArtifact{};
         slot.name = uniform.name;
         slot.location = uniform.location;
         slot.scalar = uniform.scalar;
         slot.components = uniform.components;
+        slot.columns = uniform.columns;
         slot.pushConstantOffset = uniform.pushConstantOffset;
         artifact.uniforms.push_back(slot);
     }

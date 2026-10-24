@@ -45,12 +45,35 @@ struct ImageModel {
     AccessUsage usage;
 };
 
+struct TextureModel {
+    std::string name;
+    std::uint32_t binding = 0;
+    tc::ImageFormat format;
+    tc::Dim dim = tc::Dim::D2;
+    tc::Filter filter = tc::Filter::Nearest;
+    tc::Wrap wrap = tc::Wrap::ClampToEdge;
+    clang::FieldDecl const *field = nullptr;
+};
+
+struct ExternalTextureModel {
+    std::string name;
+    std::uint32_t binding = 0;
+    clang::FieldDecl const *field = nullptr;
+};
+
+struct SharedModel {
+    std::string name;
+    clang::QualType type;
+    clang::FieldDecl const *field = nullptr;
+};
+
 struct UniformModel {
     std::string name;
     std::uint32_t location = 0;
     clang::QualType type;
     tc::ScalarKind scalar = tc::ScalarKind::Float;
     std::uint32_t components = 1;
+    std::uint32_t columns = 1;
     std::uint32_t pushConstantOffset = 0;
     clang::FieldDecl const *field = nullptr;
 };
@@ -63,8 +86,35 @@ struct KernelModel {
     std::array<std::uint32_t, 3> localSize{1, 1, 1};
     std::vector<BufferModel> buffers;
     std::vector<ImageModel> images;
+    std::vector<TextureModel> textures;
+    std::vector<ExternalTextureModel> externalTextures;
+    std::vector<SharedModel> shared;
     std::vector<UniformModel> uniforms;
     std::uint32_t pushConstantSize = 0;
+    bool usesBarrier = false; // `static constexpr bool usesBarrier = true;`
+
+    bool isShared(clang::FieldDecl const *field) const {
+        for (auto const &variable : shared) {
+            if (variable.field == field) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isTexture(clang::FieldDecl const *field) const {
+        for (auto const &texture : textures) {
+            if (texture.field == field) {
+                return true;
+            }
+        }
+        for (auto const &texture : externalTextures) {
+            if (texture.field == field) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     BufferModel *findBuffer(clang::FieldDecl const *field) {
         for (auto &buffer : buffers) {
@@ -98,6 +148,7 @@ struct KernelModel {
 struct GlslBody {
     std::vector<std::string> bufferTypes;  // GLSL element type per KernelModel::buffers entry
     std::vector<std::string> uniformTypes; // GLSL type per KernelModel::uniforms entry
+    std::vector<std::string> shared;       // `T name[N]` per KernelModel::shared entry
     std::vector<std::string> structs;
     std::vector<std::string> constants;
     std::vector<std::string> prototypes;
@@ -113,6 +164,8 @@ struct ResourceArtifact {
     tc::Access access = tc::Access::ReadWrite;
     tc::Dim dim = tc::Dim::D2;
     tc::ImageFormat format;
+    tc::Filter filter = tc::Filter::Nearest;
+    tc::Wrap wrap = tc::Wrap::ClampToEdge;
 };
 
 struct UniformArtifact {
@@ -120,6 +173,7 @@ struct UniformArtifact {
     std::uint32_t location = 0;
     tc::ScalarKind scalar = tc::ScalarKind::Float;
     std::uint32_t components = 1;
+    std::uint32_t columns = 1;
     std::uint32_t pushConstantOffset = 0;
 };
 

@@ -21,12 +21,15 @@ struct CpuDevice final : Device {
     explicit CpuDevice(CpuDeviceConfig const &config) : threadCount(resolveThreadCount(config.threadCount)) {}
 
     DeviceInfo info() const override {
-        return DeviceInfo{"cpu", "host (" + std::to_string(threadCount) + " threads)"};
+        return DeviceInfo{"cpu", "host (" + std::to_string(threadCount) + " threads)", true};
     }
 
 protected:
     // Host memory is the working copy, so transfers, bindings and uniforms
     // need no work: kernels read their members directly.
+    std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &, std::size_t) override {
+        return std::nullopt;
+    }
     void doUploadBuffer(ResourceIdentity const &, ConstByteSpan) override {}
     void doDownloadBuffer(ResourceIdentity const &, ByteSpan) override {}
     void doUploadImage(ImageTransfer const &) override {}
@@ -34,9 +37,12 @@ protected:
     void doUseKernel(KernelUse const &) override {}
     void doBindBuffer(BufferBindRequest const &) override {}
     void doBindImage(ImageBindRequest const &) override {}
+    void doBindTexture(TextureBindRequest const &) override {}
+    void doBindExternalTexture(ExternalTextureBindRequest const &request) override { request.image->snapshot(); }
     void doSetUniform(UniformWrite const &) override {}
 
     void doExecute(Dispatch const &dispatch) override;
+    void doFinish() override {}
 
 private:
     std::uint32_t threadCount;
@@ -50,11 +56,12 @@ void CpuDevice::doExecute(Dispatch const &dispatch) {
     }
     auto next = std::atomic<std::uint64_t>{0};
     auto const work = [&dispatch, &next, groups, total] {
+        auto const runWorkGroup = dispatch.makeWorker();
         for (auto i = next.fetch_add(1); i < total; i = next.fetch_add(1)) {
             auto const x = static_cast<uint>(i % groups.x);
             auto const y = static_cast<uint>(i / groups.x % groups.y);
             auto const z = static_cast<uint>(i / (std::uint64_t{groups.x} * groups.y));
-            dispatch.runWorkGroup(uvec3{x, y, z});
+            runWorkGroup(uvec3{x, y, z});
         }
     };
     auto const helperCount = static_cast<std::size_t>(std::min<std::uint64_t>(threadCount, total) - 1);

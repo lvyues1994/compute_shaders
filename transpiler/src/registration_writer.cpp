@@ -63,8 +63,21 @@ std::string resourceSlot(ResourceArtifact const &resource) {
     text += "        slot.name = \"" + resource.name + "\";\n";
     text += "        slot.binding = " + std::to_string(resource.binding) + ";\n";
     text += "        slot.access = " + std::string{accessName(resource.access)} + ";\n";
-    if (resource.kind == tc::ResourceKind::StorageImage) {
-        text += "        slot.kind = tc::ResourceKind::StorageImage;\n";
+    if (resource.kind == tc::ResourceKind::ExternalTexture) {
+        text += "        slot.kind = tc::ResourceKind::ExternalTexture;\n";
+    } else if (resource.kind != tc::ResourceKind::StorageBuffer) {
+        auto const isTexture = resource.kind == tc::ResourceKind::SampledTexture;
+        text += isTexture ? "        slot.kind = tc::ResourceKind::SampledTexture;\n"
+                          : "        slot.kind = tc::ResourceKind::StorageImage;\n";
+        if (isTexture) {
+            text += std::string{"        slot.filter = "}
+                  + (resource.filter == tc::Filter::Linear ? "tc::Filter::Linear" : "tc::Filter::Nearest") + ";\n";
+            text += std::string{"        slot.wrap = "}
+                  + (resource.wrap == tc::Wrap::Repeat           ? "tc::Wrap::Repeat"
+                     : resource.wrap == tc::Wrap::MirroredRepeat ? "tc::Wrap::MirroredRepeat"
+                                                                 : "tc::Wrap::ClampToEdge")
+                  + ";\n";
+        }
         text += "        slot.imageDim = tc::Dim::D" + std::to_string(static_cast<int>(resource.dim)) + ";\n";
         text += "        slot.imageFormat.encoding = " + std::string{encodingName(resource.format.encoding)} + ";\n";
         text += "        slot.imageFormat.isSigned = " + std::string{resource.format.isSigned ? "true" : "false"} + ";\n";
@@ -82,6 +95,7 @@ std::string uniformSlot(UniformArtifact const &uniform) {
     text += "        slot.location = " + std::to_string(uniform.location) + ";\n";
     text += "        slot.scalar = " + std::string{scalarName(uniform.scalar)} + ";\n";
     text += "        slot.components = " + std::to_string(uniform.components) + ";\n";
+    text += "        slot.columns = " + std::to_string(uniform.columns) + ";\n";
     text += "        slot.pushConstantOffset = " + std::to_string(uniform.pushConstantOffset) + ";\n";
     return text + "        return slot;\n    }(),\n";
 }

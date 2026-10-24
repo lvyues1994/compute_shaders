@@ -59,6 +59,15 @@ std::optional<VecInfo> asTcVec(clang::QualType const type) {
     return VecInfo{templateTypeArg(spec, 0), static_cast<unsigned>(templateIntArg(spec, 1))};
 }
 
+std::optional<MatInfo> asTcMat(clang::QualType const type) {
+    auto const *spec = asTcSpecialization(type, "mat");
+    if (spec == nullptr) {
+        return std::nullopt;
+    }
+    return MatInfo{templateTypeArg(spec, 0), static_cast<unsigned>(templateIntArg(spec, 1)),
+                   static_cast<unsigned>(templateIntArg(spec, 2))};
+}
+
 clang::QualType templateTypeArg(clang::ClassTemplateSpecializationDecl const *spec, unsigned const index) {
     return spec->getTemplateArgs()[index].getAsType();
 }

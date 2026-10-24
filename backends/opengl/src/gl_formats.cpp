@@ -74,14 +74,14 @@ std::string readbackShaderSource(ImageFormat const &format, Dim const dim, OpenG
     auto source = std::string{api == OpenGLApi::ES ? "#version 310 es\nprecision highp float;\nprecision highp int;\n"
                                                    : "#version 430\n"};
     source += "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n";
-    source += "layout(binding = 0, " + glslFormatQualifier(format) + ") readonly uniform highp " + prefix + "image"
-            + (is3d ? "3D" : "2D") + " source;\n";
+    source += std::string{"layout(binding = 0) uniform highp "} + prefix + "sampler" + (is3d ? "3D" : "2D")
+            + " source;\n";
     source += std::string{"layout(std430, binding = 0) writeonly buffer Texels { "} + scalar + " texels[]; };\n";
     source += "void main() {\n";
-    source += is3d ? "    ivec3 size = imageSize(source);\n" : "    ivec3 size = ivec3(imageSize(source), 1);\n";
+    source += is3d ? "    ivec3 size = textureSize(source, 0);\n" : "    ivec3 size = ivec3(textureSize(source, 0), 1);\n";
     source += "    ivec3 p = ivec3(gl_GlobalInvocationID);\n";
     source += "    if (any(greaterThanEqual(p, size))) { return; }\n";
-    source += std::string{"    "} + prefix + "vec4 v = imageLoad(source, " + (is3d ? "p" : "p.xy") + ");\n";
+    source += std::string{"    "} + prefix + "vec4 v = texelFetch(source, " + (is3d ? "p" : "p.xy") + ", 0);\n";
     source += "    int base = ((p.z * size.y + p.y) * size.x + p.x) * 4;\n";
     source += "    texels[base] = v.x;\n    texels[base + 1] = v.y;\n";
     source += "    texels[base + 2] = v.z;\n    texels[base + 3] = v.w;\n}\n";

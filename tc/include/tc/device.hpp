@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -9,11 +10,15 @@
 
 #include <tc/buffer.hpp>
 #include <tc/builtins.hpp>
+#include <tc/external_image.hpp>
 #include <tc/image.hpp>
 #include <tc/kernel.hpp>
+#include <tc/mat.hpp>
 #include <tc/program.hpp>
 #include <tc/span.hpp>
+#include <tc/texture.hpp>
 #include <tc/uniform.hpp>
+#include <tc/workgroup.hpp>
 
 namespace tc {
 
@@ -26,6 +31,9 @@ struct DeviceError : std::runtime_error {
 struct DeviceInfo {
     std::string backend;
     std::string deviceName;
+    // createBuffer() memory is GPU-local as well as CPU-visible (mobile and
+    // integrated GPUs, desktop GPUs with resizable BAR).
+    bool unifiedMemory = false;
 };
 
 // Type-erased requests passed from the template API to a backend.
@@ -49,10 +57,27 @@ struct ImageBindRequest {
     ImageFormat format{};
 };
 
+struct TextureBindRequest {
+    std::uint32_t binding = 0;
+    ResourceIdentity const *identity = nullptr;
+    ImageFormat format{};
+    Filter filter = Filter::Nearest;
+    Wrap wrap = Wrap::ClampToEdge;
+};
+
+struct ExternalTextureBindRequest {
+    std::uint32_t binding = 0;
+    ExternalImage *image = nullptr;
+};
+
+// A scalar, vector or matrix value. `bytes` holds `columns` columns of
+// `components` scalars each, `columnStride` bytes apart (16 for mat3).
 struct UniformWrite {
     std::uint32_t location = 0;
     ScalarKind scalar = ScalarKind::Float;
     std::uint32_t components = 1;
+    std::uint32_t columns = 1;
+    std::uint32_t columnStride = 0;
     ConstByteSpan bytes;
 };
 
@@ -65,7 +90,10 @@ struct Dispatch {
     std::string_view programName;
     uvec3 localSize{};
     uvec3 workGroups{};
-    std::function<void(uvec3)> runWorkGroup; // runs every invocation of one workgroup on the host
+    // Host execution: each worker thread calls makeWorker() once and gets a
+    // function that runs whole workgroups on its own copy of the kernel, so
+    // Shared variables of concurrently running workgroups stay apart.
+    std::function<std::function<void(uvec3)>()> makeWorker;
 };
 
 namespace detail {
@@ -81,29 +109,69 @@ struct ScalarKindOf<float> : std::integral_constant<ScalarKind, ScalarKind::Floa
 template <>
 struct ScalarKindOf<double> : std::integral_constant<ScalarKind, ScalarKind::Double> {};
 
+// Scalar type and shape of a uniform value: scalar, vecN or matCxR.
 template <class T>
-constexpr std::uint32_t componentCount() noexcept {
-    if constexpr (VecTraits<T>::isVector) {
-        return static_cast<std::uint32_t>(T::length());
-    } else {
-        return 1;
-    }
+struct UniformShape {
+    using Scalar = T;
+    static constexpr std::uint32_t components = 1;
+    static constexpr std::uint32_t columns = 1;
+};
+template <class T, int N>
+struct UniformShape<vec<T, N>> {
+    using Scalar = T;
+    static constexpr std::uint32_t components = N;
+    static constexpr std::uint32_t columns = 1;
+};
+template <class T, int C, int R>
+struct UniformShape<mat<T, C, R>> {
+    using Scalar = T;
+    static constexpr std::uint32_t components = R;
+    static constexpr std::uint32_t columns = C;
+};
+
+template <class I>
+inline constexpr bool isImageLike = IsImageBinding<I>::value or IsTextureBinding<I>::value;
+
+struct WorkGroupPosition {
+    uvec3 groupId{};
+    uvec3 localSize{};
+    uvec3 workGroups{};
+};
+
+// Sets the GLSL built-ins of invocation `index` of a workgroup.
+inline void enterInvocation(WorkGroupPosition const &position, uint const index) noexcept {
+    auto const size = position.localSize;
+    gl_NumWorkGroups = position.workGroups;
+    gl_WorkGroupSize = size;
+    gl_WorkGroupID = position.groupId;
+    gl_LocalInvocationID = uvec3{index % size.x, index / size.x % size.y, index / (size.x * size.y)};
+    gl_GlobalInvocationID = position.groupId * size + gl_LocalInvocationID;
+    gl_LocalInvocationIndex = index;
 }
 
-// Emulates one workgroup: invocations run one after another on this thread.
+// Emulates one workgroup on this thread. Without barriers the invocations
+// simply run one after another; with barriers they run as fibers that wait
+// for each other at every barrier().
 template <class K>
-void runWorkGroup(K &kernel, uvec3 const groupId, uvec3 const localSize, uvec3 const workGroups) {
-    gl_NumWorkGroups = workGroups;
-    gl_WorkGroupSize = localSize;
-    gl_WorkGroupID = groupId;
-    for (uint z = 0; z < localSize.z; ++z) {
-        for (uint y = 0; y < localSize.y; ++y) {
-            for (uint x = 0; x < localSize.x; ++x) {
-                gl_LocalInvocationID = uvec3{x, y, z};
-                gl_GlobalInvocationID = groupId * localSize + gl_LocalInvocationID;
-                gl_LocalInvocationIndex = (z * localSize.y + y) * localSize.x + x;
-                kernel.main();
-            }
+void runWorkGroup(K &kernel, WorkGroupPosition const &position) {
+    auto const count = position.localSize.x * position.localSize.y * position.localSize.z;
+    if constexpr (UsesBarrier<K>::value) {
+        struct Context {
+            K *kernel;
+            WorkGroupPosition position;
+        };
+        auto context = Context{&kernel, position};
+        auto group = CooperativeGroup{};
+        group.context = &context;
+        group.prepare = [](void *const c, std::uint32_t const index) {
+            enterInvocation(static_cast<Context *>(c)->position, index);
+        };
+        group.run = [](void *const c, std::uint32_t) { static_cast<Context *>(c)->kernel->main(); };
+        runCooperative(count, group);
+    } else {
+        for (uint index = 0; index < count; ++index) {
+            enterInvocation(position, index);
+            kernel.main();
         }
     }
 }
@@ -131,6 +199,20 @@ struct Device {
 
     virtual DeviceInfo info() const = 0;
 
+    // A buffer the CPU and this device share without copies when the device
+    // can map its memory (Vulkan; OpenGL with buffer storage). uploadBuffer
+    // and downloadBuffer then only synchronise. Otherwise an ordinary host
+    // buffer. Contents start zeroed.
+    template <class T, Dim D = Dim::D1>
+    BufferResource<T, D> createBuffer(typename DimTraits<D>::IndexType const extent) {
+        auto identity = ResourceIdentity::create();
+        auto const bytes = static_cast<std::size_t>(DimTraits<D>::product(extent)) * sizeof(T);
+        if (auto memory = doAllocateBuffer(identity, bytes)) {
+            return BufferResource<T, D>::wrap(extent, std::move(*memory), std::move(identity));
+        }
+        return BufferResource<T, D>{extent};
+    }
+
     template <class T, Dim D>
     void uploadBuffer(BufferResource<T, D> const &resource) {
         doUploadBuffer(resource.identity(), resource.bytes());
@@ -141,7 +223,8 @@ struct Device {
         doDownloadBuffer(resource.identity(), resource.bytes());
     }
 
-    template <class I, std::enable_if_t<IsImageBinding<I>::value, int> = 0>
+    // Works for ImageBinding and TextureBinding: both describe the GPU format.
+    template <class I, std::enable_if_t<detail::isImageLike<I>, int> = 0>
     void uploadImage(I const &image) {
         auto &resource = detail::requireAttached(image);
         auto transfer = imageTransfer<I>(resource);
@@ -149,7 +232,7 @@ struct Device {
         doUploadImage(transfer);
     }
 
-    template <class I, std::enable_if_t<IsImageBinding<I>::value, int> = 0>
+    template <class I, std::enable_if_t<detail::isImageLike<I>, int> = 0>
     void downloadImage(I const &image) {
         auto &resource = detail::requireAttached(image);
         auto transfer = imageTransfer<I>(resource);
@@ -183,19 +266,50 @@ struct Device {
         doBindImage(request);
     }
 
+    template <class I, std::enable_if_t<IsTextureBinding<I>::value, int> = 0>
+    void bindTexture(I const &texture) {
+        auto request = TextureBindRequest{};
+        request.binding = I::binding;
+        request.identity = &detail::requireAttached(texture).identity();
+        request.format = I::Traits::format;
+        request.filter = I::filter;
+        request.wrap = I::wrap;
+        doBindTexture(request);
+    }
+
+    // Binds the frame as it is now; bind again after the producer writes a
+    // new frame into the same platform buffer.
+    template <std::uint32_t B>
+    void bindExternalTexture(ExternalTextureBinding<B> const &texture) {
+        auto *image = texture.attachedImage();
+        if (image == nullptr) {
+            throw DeviceError{"binding " + std::to_string(B) + " has no attached external image"};
+        }
+        doBindExternalTexture(ExternalTextureBindRequest{B, image});
+    }
+
     template <class T, std::uint32_t L>
     void setUniform(Uniform<T, L> const &uniform) {
-        using Component = detail::ComponentOf<T>;
+        using Shape = detail::UniformShape<T>;
+        using Scalar = typename Shape::Scalar;
         auto write = UniformWrite{};
         write.location = L;
-        write.scalar = detail::ScalarKindOf<Component>::value;
-        write.components = detail::componentCount<T>();
+        write.scalar = detail::ScalarKindOf<Scalar>::value;
+        write.components = Shape::components;
+        write.columns = Shape::columns;
+        write.columnStride = Shape::columns == 1 ? Shape::components * sizeof(Scalar) : sizeof(T) / Shape::columns;
         write.bytes = ConstByteSpan{reinterpret_cast<std::byte const *>(&uniform.value),
-                                    write.components * sizeof(Component)};
+                                    (write.columns - 1) * write.columnStride + write.components * sizeof(Scalar)};
         doSetUniform(write);
     }
 
-    // Runs `workGroups` workgroups of kernel.local_size invocations each.
+    // Waits until all queued work has finished and its results are visible
+    // to the CPU. GPU backends queue execute() calls; downloads wait on their
+    // own, but reading createBuffer() memory in place needs finish() first,
+    // and so does writing such memory while queued work still reads it.
+    void finish() { doFinish(); }
+
+    // Queues `workGroups` workgroups of kernel.local_size invocations each.
     template <class K>
     void execute(K &kernel, uvec3 const workGroups) {
         static_assert(isKernel<K>, "K must declare fileLocation, local_size and main()");
@@ -204,13 +318,18 @@ struct Device {
         dispatch.programName = K::fileLocation;
         dispatch.localSize = localSize;
         dispatch.workGroups = workGroups;
-        dispatch.runWorkGroup = [&kernel, localSize, workGroups](uvec3 const groupId) {
-            detail::runWorkGroup(kernel, groupId, localSize, workGroups);
+        dispatch.makeWorker = [&kernel, localSize, workGroups]() -> std::function<void(uvec3)> {
+            return [copy = kernel, localSize, workGroups](uvec3 const groupId) mutable {
+                detail::runWorkGroup(copy, detail::WorkGroupPosition{groupId, localSize, workGroups});
+            };
         };
         doExecute(dispatch);
     }
 
 protected:
+    // Allocates `bytes` of device memory mapped for the CPU and registers it
+    // as the device mirror of `identity`; nullopt when the device cannot.
+    virtual std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes) = 0;
     virtual void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes) = 0;
     virtual void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes) = 0;
     virtual void doUploadImage(ImageTransfer const &transfer) = 0;
@@ -218,8 +337,11 @@ protected:
     virtual void doUseKernel(KernelUse const &use) = 0;
     virtual void doBindBuffer(BufferBindRequest const &request) = 0;
     virtual void doBindImage(ImageBindRequest const &request) = 0;
+    virtual void doBindTexture(TextureBindRequest const &request) = 0;
+    virtual void doBindExternalTexture(ExternalTextureBindRequest const &request) = 0;
     virtual void doSetUniform(UniformWrite const &write) = 0;
     virtual void doExecute(Dispatch const &dispatch) = 0;
+    virtual void doFinish() = 0;
 
 private:
     template <class I>

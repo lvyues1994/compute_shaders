@@ -24,9 +24,16 @@ char const *accessQualifier(tc::Access const access) {
     return "";
 }
 
+char const *typePrefix(tc::ImageFormat const &format) {
+    return format.encoding != tc::Encoding::Integer ? "" : format.isSigned ? "i" : "u";
+}
+
 std::string imageType(ImageModel const &image) {
-    auto const prefix = image.format.encoding != tc::Encoding::Integer ? "" : image.format.isSigned ? "i" : "u";
-    return std::string{prefix} + "image" + (image.dim == tc::Dim::D3 ? "3D" : "2D");
+    return std::string{typePrefix(image.format)} + "image" + (image.dim == tc::Dim::D3 ? "3D" : "2D");
+}
+
+std::string samplerType(TextureModel const &texture) {
+    return std::string{typePrefix(texture.format)} + "sampler" + (texture.dim == tc::Dim::D3 ? "3D" : "2D");
 }
 
 bool isR32(tc::ImageFormat const &format) {
@@ -66,7 +73,11 @@ std::string assemble(KernelModel const &kernel, GlslBody const &body, std::strin
         text += "#version 430\n";
         break;
     case Dialect::Es:
-        text += "#version 310 es\nprecision highp float;\nprecision highp int;\n";
+        text += "#version 310 es\n";
+        if (not kernel.externalTextures.empty()) {
+            text += "#extension GL_OES_EGL_image_external_essl3 : require\n";
+        }
+        text += "precision highp float;\nprecision highp int;\n";
         break;
     case Dialect::Vulkan:
         text += "#version 450\n";
@@ -92,6 +103,17 @@ std::string assemble(KernelModel const &kernel, GlslBody const &body, std::strin
               + ") " + accessQualifier(imageAccess(image)) + "uniform " + precision + imageType(image) + " "
               + image.name + ";\n";
     }
+    for (auto const &texture : kernel.textures) {
+        auto const precision = dialect == Dialect::Es ? "highp " : "";
+        text += "layout(binding = " + std::to_string(texture.binding) + ") uniform " + precision
+              + samplerType(texture) + " " + texture.name + ";\n";
+    }
+    // Platform frames: an external sampler on OpenGL ES; on Vulkan a plain
+    // sampler2D whose YCbCr conversion is part of the descriptor.
+    for (auto const &texture : kernel.externalTextures) {
+        auto const type = dialect == Dialect::Es ? "highp samplerExternalOES " : "sampler2D ";
+        text += "layout(binding = " + std::to_string(texture.binding) + ") uniform " + type + texture.name + ";\n";
+    }
     if (dialect == Dialect::Vulkan) {
         if (not kernel.uniforms.empty()) {
             text += "layout(push_constant) uniform TcPushConstants {\n";
@@ -108,6 +130,9 @@ std::string assemble(KernelModel const &kernel, GlslBody const &body, std::strin
             text += "layout(location = " + std::to_string(uniform.location) + ") uniform " + body.uniformTypes[i] + " "
                   + uniform.name + ";\n";
         }
+    }
+    for (auto const &variable : body.shared) {
+        text += "shared " + variable + ";\n";
     }
     text += "\n";
     for (auto const &constant : body.constants) {
