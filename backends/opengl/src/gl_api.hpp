@@ -1,0 +1,86 @@
+#pragma once
+
+#include <GLES3/gl32.h>
+
+namespace tc::opengl {
+
+// glProgramUniform*dv exist only in desktop OpenGL.
+using PfnProgramUniformDv = void(GL_APIENTRY *)(GLuint, GLint, GLsizei, double const *);
+
+// Entry points of the OpenGL 4.3 core / OpenGL ES 3.1 common subset that the
+// backend uses, loaded at runtime so one binary drives both APIs.
+#define TC_GL_REQUIRED_FUNCTIONS(X)                                                                                    \
+    X(PFNGLGETSTRINGPROC, glGetString)                                                                                 \
+    X(PFNGLGETERRORPROC, glGetError)                                                                                   \
+    X(PFNGLGETINTEGERVPROC, glGetIntegerv)                                                                             \
+    X(PFNGLGETINTEGERI_VPROC, glGetIntegeri_v)                                                                         \
+    X(PFNGLCREATESHADERPROC, glCreateShader)                                                                           \
+    X(PFNGLSHADERSOURCEPROC, glShaderSource)                                                                           \
+    X(PFNGLCOMPILESHADERPROC, glCompileShader)                                                                         \
+    X(PFNGLGETSHADERIVPROC, glGetShaderiv)                                                                             \
+    X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog)                                                                   \
+    X(PFNGLDELETESHADERPROC, glDeleteShader)                                                                           \
+    X(PFNGLCREATEPROGRAMPROC, glCreateProgram)                                                                         \
+    X(PFNGLATTACHSHADERPROC, glAttachShader)                                                                           \
+    X(PFNGLLINKPROGRAMPROC, glLinkProgram)                                                                             \
+    X(PFNGLGETPROGRAMIVPROC, glGetProgramiv)                                                                           \
+    X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog)                                                                 \
+    X(PFNGLDELETEPROGRAMPROC, glDeleteProgram)                                                                         \
+    X(PFNGLUSEPROGRAMPROC, glUseProgram)                                                                               \
+    X(PFNGLGENBUFFERSPROC, glGenBuffers)                                                                               \
+    X(PFNGLDELETEBUFFERSPROC, glDeleteBuffers)                                                                         \
+    X(PFNGLBINDBUFFERPROC, glBindBuffer)                                                                               \
+    X(PFNGLBUFFERDATAPROC, glBufferData)                                                                               \
+    X(PFNGLBUFFERSUBDATAPROC, glBufferSubData)                                                                         \
+    X(PFNGLMAPBUFFERRANGEPROC, glMapBufferRange)                                                                       \
+    X(PFNGLUNMAPBUFFERPROC, glUnmapBuffer)                                                                             \
+    X(PFNGLBINDBUFFERBASEPROC, glBindBufferBase)                                                                       \
+    X(PFNGLGENTEXTURESPROC, glGenTextures)                                                                             \
+    X(PFNGLDELETETEXTURESPROC, glDeleteTextures)                                                                       \
+    X(PFNGLBINDTEXTUREPROC, glBindTexture)                                                                             \
+    X(PFNGLTEXPARAMETERIPROC, glTexParameteri)                                                                         \
+    X(PFNGLTEXSTORAGE2DPROC, glTexStorage2D)                                                                           \
+    X(PFNGLTEXSTORAGE3DPROC, glTexStorage3D)                                                                           \
+    X(PFNGLTEXSUBIMAGE2DPROC, glTexSubImage2D)                                                                         \
+    X(PFNGLTEXSUBIMAGE3DPROC, glTexSubImage3D)                                                                         \
+    X(PFNGLPIXELSTOREIPROC, glPixelStorei)                                                                             \
+    X(PFNGLBINDIMAGETEXTUREPROC, glBindImageTexture)                                                                   \
+    X(PFNGLDISPATCHCOMPUTEPROC, glDispatchCompute)                                                                     \
+    X(PFNGLMEMORYBARRIERPROC, glMemoryBarrier)                                                                         \
+    X(PFNGLFINISHPROC, glFinish)                                                                                       \
+    X(PFNGLPROGRAMUNIFORM1IVPROC, glProgramUniform1iv)                                                                 \
+    X(PFNGLPROGRAMUNIFORM2IVPROC, glProgramUniform2iv)                                                                 \
+    X(PFNGLPROGRAMUNIFORM3IVPROC, glProgramUniform3iv)                                                                 \
+    X(PFNGLPROGRAMUNIFORM4IVPROC, glProgramUniform4iv)                                                                 \
+    X(PFNGLPROGRAMUNIFORM1UIVPROC, glProgramUniform1uiv)                                                               \
+    X(PFNGLPROGRAMUNIFORM2UIVPROC, glProgramUniform2uiv)                                                               \
+    X(PFNGLPROGRAMUNIFORM3UIVPROC, glProgramUniform3uiv)                                                               \
+    X(PFNGLPROGRAMUNIFORM4UIVPROC, glProgramUniform4uiv)                                                               \
+    X(PFNGLPROGRAMUNIFORM1FVPROC, glProgramUniform1fv)                                                                 \
+    X(PFNGLPROGRAMUNIFORM2FVPROC, glProgramUniform2fv)                                                                 \
+    X(PFNGLPROGRAMUNIFORM3FVPROC, glProgramUniform3fv)                                                                 \
+    X(PFNGLPROGRAMUNIFORM4FVPROC, glProgramUniform4fv)
+
+#define TC_GL_OPTIONAL_FUNCTIONS(X)                                                                                    \
+    X(PFNGLDEBUGMESSAGECALLBACKPROC, glDebugMessageCallback)                                                           \
+    X(PFNGLENABLEPROC, glEnable)                                                                                       \
+    X(PfnProgramUniformDv, glProgramUniform1dv)                                                                        \
+    X(PfnProgramUniformDv, glProgramUniform2dv)                                                                        \
+    X(PfnProgramUniformDv, glProgramUniform3dv)                                                                        \
+    X(PfnProgramUniformDv, glProgramUniform4dv)
+
+struct GlApi {
+#define TC_GL_DECLARE(type, name) type name = nullptr;
+    TC_GL_REQUIRED_FUNCTIONS(TC_GL_DECLARE)
+    TC_GL_OPTIONAL_FUNCTIONS(TC_GL_DECLARE)
+#undef TC_GL_DECLARE
+
+    // Loads every entry point of the current context; throws DeviceError
+    // naming the first missing required function.
+    static GlApi load();
+};
+
+// Throws DeviceError when glGetError reports a pending error.
+void checkGl(GlApi const &gl, char const *operation);
+
+} // namespace tc::opengl
