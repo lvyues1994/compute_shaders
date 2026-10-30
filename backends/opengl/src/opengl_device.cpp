@@ -296,6 +296,8 @@ protected:
     void doUploadImage(ImageTransfer const &transfer) override;
     void doUploadCompressed(CompressedTransfer const &transfer) override;
     void doDownloadImage(ImageTransfer const &transfer) override;
+    bool doCreateImage(ImageCreation const &request) override;
+    void doCopyBufferToImage(BufferImageCopy const &copy) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
@@ -303,7 +305,7 @@ protected:
     void doBindExternalTexture(ExternalTextureBindRequest const &request) override;
     void doBindExternalImage(ExternalImageBindRequest const &request) override;
     void doWaitFor(SyncFence fence) override;
-    SyncFence doSubmitWithFence() override;
+    FencedSubmission doSubmitWithFence() override;
     void doSetUniform(UniformWrite const &write) override;
     void doExecute(Dispatch const &dispatch) override;
     Submission doSubmit() override;
@@ -313,7 +315,7 @@ protected:
         hazards.barrierRecorded();
         gl().glFinish();
     }
-    std::vector<KernelTiming> doTakeTimings() override;
+    std::vector<KernelTiming> doTakeTimings(std::uint64_t last) override;
 
 private:
     struct PendingTiming {
@@ -321,6 +323,8 @@ private:
         uvec3 workGroups{};
         GlObject query;
         bool indirect = false;
+        std::uint64_t submission = 0;
+        bool disjoint = false; // a disjoint event was reported while it was pending
     };
 
     std::optional<TimerQueries> findTimerQueries() const;
@@ -330,6 +334,9 @@ private:
     PfnBufferStorage bufferStorage() const;
     PfnTextureView findTextureView() const;
     std::pair<GLuint, GLint> imageLevel(ImageMirror &mirror, std::uint32_t level);
+    // Replaces `mirror` with new immutable storage.
+    void allocateTexture(ImageMirror &mirror, ResourceIdentity const &identity, ImageFormat const &format,
+                         std::optional<CompressedFormat> compressed, Dim dim, ivec3 extent, std::uint32_t levels);
     GLuint samplerFor(Filter filter, Wrap wrap, Mip mip);
     void bindTextureUnit(GLuint unit, ImageMirror const &mirror, Filter filter, Wrap wrap, Mip mip);
     void collectGarbage();
@@ -464,12 +471,31 @@ DeviceLimits OpenGLDevice::queryLimits() const {
     family(CompressedFormat::Etc2Rgb8, CompressedFormat::EacRg11, true);
     family(CompressedFormat::Astc4x4, CompressedFormat::Astc12x12,
            hasGlExtension(gl(), "GL_KHR_texture_compression_astc_ldr"));
+    // OpenGL ES cannot be asked which formats 2D arrays take; try each.
+    for (std::uint32_t i = 0; i < kCompressedFormatCount; ++i) {
+        auto const bit = compressedBit(static_cast<CompressedFormat>(i));
+        if ((result.compressedFormats & bit) == 0) {
+            continue;
+        }
+        while (gl().glGetError() != GL_NO_ERROR) {
+        }
+        auto const probe = makeTexture(gl());
+        gl().glBindTexture(GL_TEXTURE_2D_ARRAY, probe.get());
+        gl().glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, glCompressedFormat(static_cast<CompressedFormat>(i)), 4, 4, 1);
+        if (gl().glGetError() == GL_NO_ERROR) {
+            result.compressedArrayFormats |= bit;
+        }
+    }
+    gl().glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
     if (api == OpenGLApi::Desktop and hasGlExtension(gl(), "GL_ARB_gpu_shader_int64")) {
         result.features |= static_cast<std::uint32_t>(KernelFeature::Int64);
         if (hasGlExtension(gl(), "GL_NV_shader_atomic_int64")) {
             result.features |= static_cast<std::uint32_t>(KernelFeature::Int64Atomics);
         }
     }
+    result.imageDimension2D = integer(GL_MAX_TEXTURE_SIZE);
+    result.imageDimension3D = integer(GL_MAX_3D_TEXTURE_SIZE);
+    result.imageArrayLayers = integer(GL_MAX_ARRAY_TEXTURE_LAYERS);
     return result;
 }
 
@@ -501,22 +527,34 @@ bool OpenGLDevice::gpuDisjoint() const {
     return disjoint != 0;
 }
 
-std::vector<KernelTiming> OpenGLDevice::doTakeTimings() {
+// The queries of submissions up to `last` have results: their fences have
+// signalled. Later queries stay pending.
+std::vector<KernelTiming> OpenGLDevice::doTakeTimings(std::uint64_t const last) {
     egl->makeCurrent();
-    auto const disjoint = gpuDisjoint();
+    // The flag does not say which queries the event affected.
+    if (gpuDisjoint()) {
+        for (auto &pending : pendingTimings) {
+            pending.disjoint = true;
+        }
+    }
     auto result = std::vector<KernelTiming>{};
-    result.reserve(pendingTimings.size());
+    auto kept = std::vector<PendingTiming>{};
     for (auto &pending : pendingTimings) {
+        if (pending.submission > last) {
+            kept.push_back(std::move(pending));
+            continue;
+        }
         auto nanoseconds = GLuint64{0};
         timerQueries->result(pending.query.get(), GL_QUERY_RESULT, &nanoseconds);
-        auto timing = KernelTiming{std::move(pending.program), pending.workGroups, std::nullopt, pending.indirect};
-        if (not disjoint) {
+        auto timing = KernelTiming{std::move(pending.program), pending.workGroups, std::nullopt, pending.indirect,
+                                   pending.submission};
+        if (not pending.disjoint) {
             timing.milliseconds = static_cast<double>(nanoseconds) * 1e-6;
         }
         result.push_back(std::move(timing));
         idleQueries.push_back(std::move(pending.query));
     }
-    pendingTimings.clear();
+    pendingTimings = std::move(kept);
     checkGl(gl(), "takeTimings");
     return result;
 }
@@ -663,6 +701,79 @@ void OpenGLDevice::doDownloadBuffer(ResourceIdentity const &identity, ByteSpan c
     checkGl(gl(), "downloadBuffer");
 }
 
+void OpenGLDevice::allocateTexture(ImageMirror &mirror, ResourceIdentity const &identity, ImageFormat const &format,
+                                   std::optional<CompressedFormat> const compressed, Dim const dim, ivec3 const extent,
+                                   std::uint32_t const levels) {
+    auto const target = textureTarget(dim);
+    auto const internal = compressed ? glCompressedFormat(*compressed) : glFormatOf(format).internalFormat;
+    mirror = ImageMirror{};
+    mirror.owner = identity.watch();
+    mirror.texture = makeTexture(gl());
+    mirror.format = format;
+    mirror.compressed = compressed;
+    mirror.dim = dim;
+    mirror.extent = extent;
+    mirror.levels = levels;
+    gl().glBindTexture(target, mirror.texture.get());
+    if (isLayered(dim)) {
+        gl().glTexStorage3D(target, static_cast<GLsizei>(levels), internal, extent.x, extent.y, extent.z);
+    } else {
+        gl().glTexStorage2D(target, static_cast<GLsizei>(levels), internal, extent.x, extent.y);
+    }
+    gl().glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl().glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+}
+
+bool OpenGLDevice::doCreateImage(ImageCreation const &request) {
+    egl->makeCurrent();
+    collectGarbage();
+    allocateTexture(images[request.identity->key()], *request.identity, request.format, request.compressed, request.dim,
+                    request.extent, request.levels);
+    checkGl(gl(), "createImage");
+    return false;
+}
+
+// glTexSubImage from a pixel unpack buffer: the copy stays on the GPU.
+void OpenGLDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
+    egl->makeCurrent();
+    auto const buffer = buffers.find(copy.buffer->key());
+    if (buffer == buffers.end() or buffer->second.size < copy.offset + copy.bytes) {
+        throw DeviceError{"copyBufferToImage: the buffer was never uploaded to this device (or changed size)"};
+    }
+    auto &mirror = images.at(copy.image->key());
+    barrierBefore({detail::ResourceAccess{copy.buffer->key(), copy.offset, copy.bytes, true, false},
+                   detail::ResourceAccess{copy.image->key(), 0, 0, false, true}});
+    auto const target = textureTarget(mirror.dim);
+    auto const *offset = reinterpret_cast<void const *>(static_cast<std::uintptr_t>(copy.offset));
+    gl().glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer->second.handle());
+    gl().glBindTexture(target, mirror.texture.get());
+    gl().glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    auto const level = static_cast<GLint>(copy.level);
+    if (copy.compressed) {
+        auto const internal = glCompressedFormat(*copy.compressed);
+        auto const bytes = static_cast<GLsizei>(copy.bytes);
+        if (isLayered(mirror.dim)) {
+            gl().glCompressedTexSubImage3D(target, level, 0, 0, static_cast<GLint>(copy.firstLayer), copy.extent.x,
+                                           copy.extent.y, static_cast<GLsizei>(copy.layers), internal, bytes, offset);
+        } else {
+            gl().glCompressedTexSubImage2D(target, level, 0, 0, copy.extent.x, copy.extent.y, internal, bytes, offset);
+        }
+        gl().glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        checkGl(gl(), "copyBufferToImage");
+        return;
+    }
+    auto const format = glFormatOf(mirror.format);
+    if (isLayered(mirror.dim)) {
+        gl().glTexSubImage3D(target, level, 0, 0, static_cast<GLint>(copy.firstLayer), copy.extent.x, copy.extent.y,
+                             static_cast<GLsizei>(copy.layers), format.pixelFormat, format.pixelType, offset);
+    } else {
+        gl().glTexSubImage2D(target, level, 0, 0, copy.extent.x, copy.extent.y, format.pixelFormat, format.pixelType,
+                             offset);
+    }
+    gl().glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    checkGl(gl(), "copyBufferToImage");
+}
+
 void OpenGLDevice::doUploadImage(ImageTransfer const &transfer) {
     egl->makeCurrent();
     collectGarbage();
@@ -674,22 +785,8 @@ void OpenGLDevice::doUploadImage(ImageTransfer const &transfer) {
     auto first = transfer.firstLevel;
     auto count = transfer.levelCount;
     if (not sameShape) {
-        mirror.owner = transfer.identity->watch();
-        mirror.texture = makeTexture(gl());
-        mirror.format = transfer.format;
-        mirror.dim = transfer.dim;
-        mirror.extent = transfer.extent;
-        mirror.levels = transfer.levels;
-        gl().glBindTexture(target, mirror.texture.get());
-        auto const levels = static_cast<GLsizei>(transfer.levels);
-        if (isLayered(transfer.dim)) {
-            gl().glTexStorage3D(target, levels, format.internalFormat, transfer.extent.x, transfer.extent.y,
-                                transfer.extent.z);
-        } else {
-            gl().glTexStorage2D(target, levels, format.internalFormat, transfer.extent.x, transfer.extent.y);
-        }
-        gl().glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        gl().glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        allocateTexture(mirror, *transfer.identity, transfer.format, std::nullopt, transfer.dim, transfer.extent,
+                        transfer.levels);
         first = 0; // a new texture starts with every level
         count = transfer.levels;
     }
@@ -722,27 +819,26 @@ void OpenGLDevice::doUploadCompressed(CompressedTransfer const &transfer) {
     }
     auto const internal = glCompressedFormat(transfer.format);
     auto &mirror = images[transfer.identity->key()];
-    auto const extent3 = ivec3{transfer.extent, 1};
-    if (mirror.texture.get() == 0 or mirror.compressed != transfer.format or not(mirror.extent == extent3)
-        or mirror.levels != transfer.levels) {
-        mirror = ImageMirror{};
-        mirror.owner = transfer.identity->watch();
-        mirror.texture = makeTexture(gl());
-        mirror.dim = Dim::D2;
-        mirror.extent = extent3;
-        mirror.levels = transfer.levels;
-        mirror.compressed = transfer.format;
-        gl().glBindTexture(GL_TEXTURE_2D, mirror.texture.get());
-        gl().glTexStorage2D(GL_TEXTURE_2D, static_cast<GLsizei>(transfer.levels), internal, transfer.extent.x,
-                            transfer.extent.y);
+    auto const extent3 = ivec3{transfer.extent, static_cast<std::int32_t>(transfer.layers)};
+    if (mirror.texture.get() == 0 or mirror.compressed != transfer.format or mirror.dim != transfer.dim
+        or not(mirror.extent == extent3) or mirror.levels != transfer.levels) {
+        allocateTexture(mirror, *transfer.identity, ImageFormat{}, transfer.format, transfer.dim, extent3,
+                        transfer.levels);
     }
     barrierBefore({detail::ResourceAccess{transfer.identity->key(), 0, 0, false, true}});
-    gl().glBindTexture(GL_TEXTURE_2D, mirror.texture.get());
+    auto const target = textureTarget(transfer.dim);
+    gl().glBindTexture(target, mirror.texture.get());
     for (std::uint32_t level = 0; level < transfer.levels; ++level) {
         auto const size = transfer.image->extent(level);
         auto const &blocks = transfer.image->blocks(level);
-        gl().glCompressedTexSubImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), 0, 0, size.x, size.y, internal,
-                                       static_cast<GLsizei>(blocks.size()), blocks.data());
+        auto const bytes = static_cast<GLsizei>(blocks.size());
+        if (transfer.dim == Dim::D2Array) {
+            gl().glCompressedTexSubImage3D(target, static_cast<GLint>(level), 0, 0, 0, size.x, size.y,
+                                           static_cast<GLsizei>(transfer.layers), internal, bytes, blocks.data());
+        } else {
+            gl().glCompressedTexSubImage2D(target, static_cast<GLint>(level), 0, 0, size.x, size.y, internal, bytes,
+                                           blocks.data());
+        }
     }
     checkGl(gl(), "uploadImage (compressed)");
 }
@@ -929,7 +1025,7 @@ void OpenGLDevice::doBindImage(ImageBindRequest const &request) {
 
 void OpenGLDevice::doBindTexture(TextureBindRequest const &request) {
     auto const it = images.find(request.identity->key());
-    auto const matches = it != images.end()
+    auto const matches = it != images.end() and it->second.dim == request.dim
                      and (request.compressed ? it->second.compressed == request.compressed
                                              : not it->second.compressed and it->second.format == request.format);
     if (not matches) {
@@ -992,11 +1088,12 @@ void OpenGLDevice::doWaitFor(SyncFence fence) {
     sync.destroy(egl->eglDisplay(), imported);
 }
 
-SyncFence OpenGLDevice::doSubmitWithFence() {
+FencedSubmission OpenGLDevice::doSubmitWithFence() {
     auto const &sync = egl->sync();
     if (not sync.nativeFences) {
-        doSubmit().wait();
-        return SyncFence{};
+        auto submission = doSubmit();
+        submission.wait();
+        return FencedSubmission{std::move(submission), SyncFence{}};
     }
     egl->makeCurrent();
     gl().glMemoryBarrier(GL_ALL_BARRIER_BITS);
@@ -1008,8 +1105,9 @@ SyncFence OpenGLDevice::doSubmitWithFence() {
     }
     gl().glFlush(); // the descriptor exists once the fence is flushed
     auto const fd = sync.dupNativeFence(egl->eglDisplay(), fence);
-    sync.destroy(egl->eglDisplay(), fence);
-    return SyncFence{fd == EGL_NO_NATIVE_FENCE_FD_ANDROID ? -1 : fd};
+    // The host waits on the same sync object.
+    return FencedSubmission{Submission{std::make_shared<EglFenceCompletion>(egl, fence)},
+                            SyncFence{fd == EGL_NO_NATIVE_FENCE_FD_ANDROID ? -1 : fd}};
 }
 
 void OpenGLDevice::doSetUniform(UniformWrite const &write) {
@@ -1199,7 +1297,7 @@ void OpenGLDevice::doExecute(Dispatch const &dispatch) {
         gpuDisjoint(); // clears a disjoint event from before this measurement
     }
     auto pending = PendingTiming{std::string{dispatch.programName}, dispatch.indirect ? uvec3{} : dispatch.workGroups,
-                                 GlObject{}, dispatch.indirect.has_value()};
+                                 GlObject{}, dispatch.indirect.has_value(), nextSubmission()};
     if (idleQueries.empty()) {
         pending.query = makeQuery(gl());
     } else {

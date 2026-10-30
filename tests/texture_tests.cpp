@@ -238,6 +238,144 @@ TEST(HalfFloat, ConvertsLikeTheGpu) {
     EXPECT_EQ(cpu::R16F{}.get<Channel::A>().bits, 0x3c00u) << "missing alpha reads as 1";
 }
 
+// Packed RGBA8 texel `i` of a pool layer filled from the host.
+uint poolTexel(int const layer, int const i) {
+    return static_cast<uint>((i * 37 + layer * 101) & 0xFF) | static_cast<uint>((i * 11) & 0xFF) << 8
+         | static_cast<uint>(layer * 60) << 16 | 0xFFu << 24;
+}
+
+struct PoolContents {
+    std::vector<vec4> level0;
+    std::vector<vec4> level1;
+};
+
+// A texture pool that lives only on the device, filled the ways an engine
+// does: copies from a staging ring (at an offset, several layers at once),
+// a copy kernel, and texels another kernel computed.
+PoolContents fillAndReadPool(Device &device) {
+    auto const size = ivec3{16, 8, 4};
+    auto pool = device.createImage<gpu::RGBA8, Dim::D2Array>(size, 2);
+    constexpr int kLayer0 = 16 * 8;
+    constexpr int kLayer1 = 8 * 4;
+    auto staging = device.createBuffer<uint>(2 * kLayer0 + 4 * kLayer1);
+    for (int i = 0; i < kLayer0; ++i) {
+        staging[i] = poolTexel(1, i);
+        staging[kLayer0 + i] = poolTexel(0, i);
+    }
+    for (int layer = 0; layer < 4; ++layer) {
+        for (int i = 0; i < kLayer1; ++i) {
+            staging[2 * kLayer0 + layer * kLayer1 + i] = poolTexel(layer + 4, i);
+        }
+    }
+    device.uploadBuffer(staging);
+    device.copyBufferToImage(staging, kLayer0 * sizeof(uint), pool, 0, 0, 1);
+    device.copyBufferToImage(staging, 0, pool, 0, 1, 1);
+    device.copyBufferToImage(staging, 2 * kLayer0 * sizeof(uint), pool, 1, 0, 4);
+
+    auto source = BufferResource<uint>{kLayer0};
+    for (int i = 0; i < kLayer0; ++i) {
+        source[i] = poolTexel(2, i);
+    }
+    device.uploadBuffer(source);
+    auto copy = tests::CopyIntoLayer{};
+    copy.texels.attach(source);
+    copy.pool.attach(pool, 0);
+    copy.layer = 2;
+    device.useKernel(copy);
+    device.bindBuffer(copy.texels);
+    device.bindImage(copy.pool);
+    device.setUniform(copy.layer);
+    device.execute(copy, uvec3{2u, 1u, 1u});
+
+    auto generated = BufferResource<uint>{kLayer0};
+    device.uploadBuffer(generated);
+    auto make = tests::MakeTexels{};
+    make.texels.attach(generated);
+    make.seed = 0x5a5a5a5au;
+    device.useKernel(make);
+    device.bindBuffer(make.texels);
+    device.setUniform(make.seed);
+    device.execute(make, uvec3{2u, 1u, 1u});
+    device.copyBufferToImage(generated, 0, pool, 0, 3, 1); // after the kernel that wrote `generated`
+
+    auto result = PoolContents{};
+    auto read = tests::ReadPool{};
+    read.pool.attach(pool);
+    device.useKernel(read);
+    for (int level = 0; level < 2; ++level) {
+        auto const extent = pool.extent(static_cast<std::uint32_t>(level));
+        auto out = BufferResource<vec4>{extent.x * extent.y * extent.z * 2};
+        device.uploadBuffer(out);
+        read.out.attach(out);
+        read.level = level;
+        device.bindTexture(read.pool);
+        device.bindBuffer(read.out);
+        device.setUniform(read.level);
+        device.execute(read, uvec3{static_cast<uint>(extent.x + 7) / 8u, static_cast<uint>(extent.y + 3) / 4u,
+                                   static_cast<uint>(extent.z)});
+        device.downloadBuffer(out);
+        (level == 0 ? result.level0 : result.level1) = contents(out);
+    }
+    return result;
+}
+
+TEST_P(Equivalence, DeviceImagePool) {
+    auto const [expected, actual] = runBoth<PoolContents>(fillAndReadPool);
+    ASSERT_EQ(expected.level0.size(), actual.level0.size());
+    for (auto const level : {&PoolContents::level0, &PoolContents::level1}) {
+        auto const &e = expected.*level;
+        auto const &a = actual.*level;
+        for (std::size_t i = 0; i < e.size(); ++i) {
+            expectNear(e[i], a[i], (i % 2 == 0 ? 0.5f : 4.0f) / 255.0f, "output " + std::to_string(i));
+        }
+    }
+    // llvmpipe converts unorm8 to float with a different rounding than unpackUnorm4x8.
+    auto const check = [](vec4 const &value, uint const packed, std::string const &what) {
+        expectNear(unpackUnorm4x8(packed), value, 1e-6f, what);
+    };
+    auto const &level0 = actual.level0;
+    auto const fetched = [&level0](int const layer, int const texel) { return level0[(layer * 128 + texel) * 2]; };
+    check(fetched(0, 5), poolTexel(0, 5), "copied from an offset");
+    check(fetched(1, 77), poolTexel(1, 77), "copied");
+    check(fetched(2, 9), poolTexel(2, 9), "written by a kernel");
+    check(fetched(3, 100), (100u * 2654435761u) ^ 0x5a5a5a5au, "computed, then copied");
+    check(actual.level1[(3 * 32 + 6) * 2], poolTexel(7, 6), "level 1, four layers at once");
+}
+
+TEST_P(Equivalence, DeviceImagesHaveNoHostCopy) {
+    for (auto *device : {cpu.get(), gpu.get()}) {
+        auto const name = device->info().backend;
+        auto image = device->createImage<gpu::RGBA8, Dim::D2Array>(ivec3{8, 8, 2});
+        EXPECT_EQ(image.extent(), (ivec3{8, 8, 2}));
+        EXPECT_EQ(image.levels(), 1u);
+        auto const alias = image;
+        EXPECT_EQ(alias.identity().key(), image.identity().key()) << "copies are the same image";
+        EXPECT_EQ(image.shared()->host != nullptr, device == cpu.get()) << name << ": host storage only on the CPU";
+        auto texture = tests::ReadPool{}.pool;
+        texture.attach(image);
+        EXPECT_TRUE(texture.isDeviceImage());
+        EXPECT_THROW(device->uploadImage(texture), DeviceError) << name;
+        EXPECT_THROW(device->downloadImage(texture), DeviceError) << name;
+
+        auto staging = device->createBuffer<uint>(64 * 3);
+        device->uploadBuffer(staging);
+        EXPECT_THROW(device->copyBufferToImage(staging, 2, image, 0), DeviceError) << name << ": misaligned";
+        EXPECT_THROW(device->copyBufferToImage(staging, 0, image, 0, 1, 2), DeviceError) << name << ": layer 2";
+        EXPECT_THROW(device->copyBufferToImage(staging, 0, image, 1), DeviceError) << name << ": level 1";
+        EXPECT_THROW(device->copyBufferToImage(staging, 256 * 3 - 4, image, 0), DeviceError) << name << ": past the end";
+        EXPECT_NO_THROW(device->copyBufferToImage(staging, 0, image, 0, 1)) << name;
+        EXPECT_THROW((device->createImage<gpu::RGBA8, Dim::D2>(ivec2{0, 4})), DeviceError) << name;
+        EXPECT_THROW((device->createImage<gpu::RGBA8, Dim::D2>(ivec2{4, 4}, 4)), DeviceError) << name << ": 3 levels";
+        auto const limits = device->info().limits;
+        if (limits.imageArrayLayers < std::numeric_limits<std::uint32_t>::max()) {
+            EXPECT_GE(limits.imageArrayLayers, 256u) << name;
+            EXPECT_GE(limits.imageDimension2D, 2048u) << name;
+            auto const layers = static_cast<int>(limits.imageArrayLayers) + 1;
+            EXPECT_THROW((device->createImage<gpu::RGBA8, Dim::D2Array>(ivec3{4, 4, layers})), DeviceError) << name;
+        }
+    }
+}
+
 TEST(MipChain, HalvesEveryLevel) {
     auto const chain = MipChain<cpu::RGBA8, Dim::D2>{ivec2{20, 6}};
     ASSERT_EQ(chain.levels(), 5u);

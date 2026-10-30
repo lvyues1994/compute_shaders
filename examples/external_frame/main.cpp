@@ -166,7 +166,7 @@ void renderToFrame(tc::Device &device, tc::ivec2 const size) {
         kernel.time = 0.25f * static_cast<float>(f + 1);
         device.setUniform(kernel.time);
         device.execute(kernel, groups);
-        release = device.submitWithFence(); // the compositor's acquire fence; here it comes straight back
+        release = device.submitWithFence().fence; // the compositor's acquire fence; here it comes straight back
     }
     release.wait();
     auto const milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();

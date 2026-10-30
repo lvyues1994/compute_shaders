@@ -282,12 +282,12 @@ bool classifyField(clang::FieldDecl const *field, KernelModel &model, clang::AST
     if (auto const *spec = asTcSpecialization(field->getType(), "CompressedTextureBinding")) {
         auto texture = TextureModel{};
         texture.name = name;
-        texture.format = tc::ImageFormat{}; // normalized RGBA: a float sampler2D
-        texture.dim = tc::Dim::D2;
+        texture.format = tc::ImageFormat{}; // normalized RGBA: a float sampler2D or sampler2DArray
         texture.binding = static_cast<std::uint32_t>(templateIntArg(spec, 0));
         texture.filter = static_cast<tc::Filter>(templateIntArg(spec, 1));
         texture.wrap = static_cast<tc::Wrap>(templateIntArg(spec, 2));
         texture.mip = static_cast<tc::Mip>(templateIntArg(spec, 3));
+        texture.dim = static_cast<tc::Dim>(templateIntArg(spec, 4));
         texture.field = field;
         model.textures.push_back(texture);
         return true;

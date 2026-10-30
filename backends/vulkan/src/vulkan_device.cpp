@@ -438,6 +438,7 @@ struct Batch {
     std::vector<PendingTiming> pendingTimings;
     std::vector<DeviceObject<VkSemaphore>> semaphores; // waited on or signalled by the submission
     std::uint64_t serial = 0;                    // submission order
+    std::uint64_t submission = 0;                // the Submission::sequence() it is part of
     std::shared_ptr<FenceCompletion> completion; // set while in flight
 };
 
@@ -487,6 +488,9 @@ struct VulkanDevice final : Device {
                         | (context->int64 ? static_cast<std::uint32_t>(KernelFeature::Int64) : 0u)
                         | (context->int64Atomics ? static_cast<std::uint32_t>(KernelFeature::Int64Atomics) : 0u);
         limits.subgroupSize = context->subgroupSize;
+        limits.imageDimension2D = supported.maxImageDimension2D;
+        limits.imageDimension3D = supported.maxImageDimension3D;
+        limits.imageArrayLayers = supported.maxImageArrayLayers;
         for (std::uint32_t i = 0; i < kCompressedFormatCount; ++i) {
             auto const format = static_cast<CompressedFormat>(i);
             auto const family = i <= static_cast<std::uint32_t>(CompressedFormat::Bc7)      ? context->bc
@@ -494,6 +498,15 @@ struct VulkanDevice final : Device {
                                                                                           : context->astc;
             if (family and (formatFeatures(vkCompressedFormat(format)) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0) {
                 limits.compressedFormats |= compressedBit(format);
+                auto image = VkImageFormatProperties{};
+                if (vkGetPhysicalDeviceImageFormatProperties(physical, vkCompressedFormat(format), VK_IMAGE_TYPE_2D,
+                                                             VK_IMAGE_TILING_OPTIMAL,
+                                                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                             0, &image)
+                        == VK_SUCCESS
+                    and image.maxArrayLayers > 1) {
+                    limits.compressedArrayFormats |= compressedBit(format);
+                }
             }
         }
         return result;
@@ -512,6 +525,8 @@ protected:
     void doUploadImage(ImageTransfer const &transfer) override;
     void doUploadCompressed(CompressedTransfer const &transfer) override;
     void doDownloadImage(ImageTransfer const &transfer) override;
+    bool doCreateImage(ImageCreation const &request) override;
+    void doCopyBufferToImage(BufferImageCopy const &copy) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
@@ -521,12 +536,12 @@ protected:
     void doBindExternalImage(ExternalImageBindRequest const &request) override;
 #endif
     void doWaitFor(SyncFence fence) override;
-    SyncFence doSubmitWithFence() override;
+    FencedSubmission doSubmitWithFence() override;
     void doSetUniform(UniformWrite const &write) override;
     void doExecute(Dispatch const &dispatch) override;
     Submission doSubmit() override { return submitBatch(); }
     void doFinish() override { flush(); }
-    std::vector<KernelTiming> doTakeTimings() override { return std::exchange(timings, {}); }
+    std::vector<KernelTiming> doTakeTimings(std::uint64_t last) override;
 
 private:
     static constexpr std::uint32_t kQueryCapacity = 256;
@@ -534,6 +549,9 @@ private:
     VkFormatFeatureFlags formatFeatures(VkFormat format) const;
     VkSampler samplerFor(Filter filter, Wrap wrap, Mip mip);
     DeviceObject<VkImageView> createView(ImageMirror const &mirror, std::uint32_t first, std::uint32_t count) const;
+    // Replaces `mirror` with a new image in GENERAL layout (contents undefined).
+    void allocateImage(ImageMirror &mirror, ResourceIdentity const &identity, ImageFormat const &format,
+                       std::optional<CompressedFormat> compressed, Dim dim, ivec3 extent, std::uint32_t levels);
     VkImageView levelView(ImageMirror &mirror, std::uint32_t level);
     void createInstance(VulkanDeviceConfig const &config);
     void pickPhysicalDevice(VulkanDeviceConfig const &config);
@@ -954,6 +972,7 @@ Batch &VulkanDevice::recordingBatch() {
     recordingNow = std::move(idleBatches.back());
     idleBatches.pop_back();
     recordingNow->serial = nextSerial++;
+    recordingNow->submission = nextSubmission();
     check(vkResetCommandBuffer(recordingNow->commandBuffer, 0), "vkResetCommandBuffer");
     auto begin = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1089,20 +1108,33 @@ void VulkanDevice::doWaitFor(SyncFence fence) {
     pendingWaits.push_back(std::move(semaphore));
 }
 
-SyncFence VulkanDevice::doSubmitWithFence() {
+FencedSubmission VulkanDevice::doSubmitWithFence() {
     if (not context->syncFdExport) {
-        flush();
-        return SyncFence{};
+        auto submission = submitBatch();
+        submission.wait();
+        return FencedSubmission{std::move(submission), SyncFence{}};
     }
     auto semaphore = makeSemaphore(true);
     auto const handle = semaphore.get();
-    submitBatch(std::move(semaphore));
+    auto submission = submitBatch(std::move(semaphore));
     auto info = vkStruct<VkSemaphoreGetFdInfoKHR>(VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR);
     info.semaphore = handle;
     info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
     auto fd = -1;
     check(getSemaphoreFd(device.handle, &info, &fd), "vkGetSemaphoreFdKHR");
-    return SyncFence{fd}; // -1 when the work has already finished
+    return FencedSubmission{std::move(submission), SyncFence{fd}}; // -1 when the work has already finished
+}
+
+// Batches complete in order, so waiting for those of submissions up to
+// `last` leaves later batches running.
+std::vector<KernelTiming> VulkanDevice::doTakeTimings(std::uint64_t const last) {
+    for (auto const &batch : inFlight) {
+        if (batch->submission <= last) {
+            batch->completion->wait();
+        }
+    }
+    retireCompleted();
+    return takeThrough(timings, last);
 }
 
 std::uint32_t VulkanDevice::reserveTimestamps(VkCommandBuffer const cmd) {
@@ -1138,7 +1170,8 @@ void VulkanDevice::readTimestamps(Batch &batch) {
     for (auto &pending : batch.pendingTimings) {
         auto const elapsed = (ticks[pending.firstQuery + 1] - ticks[pending.firstQuery]) & mask;
         timings.push_back(KernelTiming{std::move(pending.program), pending.workGroups,
-                                       static_cast<double>(elapsed) * nanosecondsPerTick * 1e-6, pending.indirect});
+                                       static_cast<double>(elapsed) * nanosecondsPerTick * 1e-6, pending.indirect,
+                                       batch.submission});
     }
     batch.pendingTimings.clear();
     batch.queriesUsed = 0;
@@ -1290,57 +1323,112 @@ void VulkanDevice::doDownloadBuffer(ResourceIdentity const &identity, ByteSpan c
     std::memcpy(bytes.data() + range.offset, slice.mapped, range.size);
 }
 
-void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
-    collectGarbage();
-    auto const format = vkFormatOf(transfer.format);
-    auto &mirror = images[transfer.identity->key()];
-    auto const isNew = mirror.image.get() == VK_NULL_HANDLE or not(mirror.format == transfer.format)
-                    or not(mirror.extent == transfer.extent) or mirror.levels != transfer.levels;
-    auto const layers = layerCount(transfer.dim, transfer.extent);
-    if (isNew) {
-        // The same image may be written as a storage image and read as a
-        // sampled texture later, so request every usage the format supports.
-        auto const features = formatFeatures(format);
-        auto usage = VkImageUsageFlags{VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+void VulkanDevice::allocateImage(ImageMirror &mirror, ResourceIdentity const &identity, ImageFormat const &imageFormat,
+                                 std::optional<CompressedFormat> const compressed, Dim const dim, ivec3 const extent,
+                                 std::uint32_t const levels) {
+    auto const format = compressed ? vkCompressedFormat(*compressed) : vkFormatOf(imageFormat);
+    auto const layers = layerCount(dim, extent);
+    // The same image may be written as a storage image and read as a
+    // sampled texture later, so request every usage the format supports.
+    // Compressed images are only sampled.
+    auto const features = formatFeatures(format);
+    auto usage = VkImageUsageFlags{VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    if (not compressed) {
+        usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if ((features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0) {
             usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         }
-        if ((features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0) {
-            usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-        }
-        if ((usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) == 0) {
-            throw DeviceError{"image format " + glslFormatQualifier(transfer.format)
-                              + " can be neither stored nor sampled on " + properties.deviceName};
-        }
-        if (mirror.image.get() != VK_NULL_HANDLE) {
-            bury(std::move(mirror)); // queued commands may still use the old image
-        }
-        mirror = ImageMirror{};
-        mirror.usage = usage;
-        mirror.owner = transfer.identity->watch();
-        mirror.format = transfer.format;
-        mirror.dim = transfer.dim;
-        mirror.extent = transfer.extent;
-        mirror.levels = transfer.levels;
-        auto info = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
-        info.imageType = transfer.dim == Dim::D3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-        info.format = format;
-        info.extent = levelExtent(transfer.dim, transfer.extent, 0);
-        info.mipLevels = transfer.levels;
-        info.arrayLayers = layers;
-        info.samples = VK_SAMPLE_COUNT_1_BIT;
-        info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        info.usage = usage;
-        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        auto image = VkImage{};
-        check(vkCreateImage(device.handle, &info, nullptr, &image), "vkCreateImage");
-        mirror.image = DeviceObject<VkImage>{device.handle, image, vkDestroyImage};
-        auto requirements = VkMemoryRequirements{};
-        vkGetImageMemoryRequirements(device.handle, image, &requirements);
-        mirror.memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        check(vkBindImageMemory(device.handle, image, mirror.memory.get(), 0), "vkBindImageMemory");
-        mirror.view = createView(mirror, 0, transfer.levels);
+    }
+    if ((features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0) {
+        usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    if ((usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) == 0) {
+        auto const name = compressed ? std::string{compressedFormatInfo(*compressed).name} : glslFormatQualifier(imageFormat);
+        throw DeviceError{"image format " + name + " can be neither stored nor sampled on " + properties.deviceName};
+    }
+    if (mirror.image.get() != VK_NULL_HANDLE) {
+        bury(std::move(mirror)); // queued commands may still use the old image
+    }
+    mirror = ImageMirror{};
+    mirror.usage = usage;
+    mirror.owner = identity.watch();
+    mirror.format = imageFormat;
+    mirror.compressed = compressed;
+    mirror.dim = dim;
+    mirror.extent = extent;
+    mirror.levels = levels;
+    auto info = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+    info.imageType = dim == Dim::D3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = levelExtent(dim, extent, 0);
+    info.mipLevels = levels;
+    info.arrayLayers = layers;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    auto image = VkImage{};
+    check(vkCreateImage(device.handle, &info, nullptr, &image), "vkCreateImage");
+    mirror.image = DeviceObject<VkImage>{device.handle, image, vkDestroyImage};
+    auto requirements = VkMemoryRequirements{};
+    vkGetImageMemoryRequirements(device.handle, image, &requirements);
+    mirror.memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    check(vkBindImageMemory(device.handle, image, mirror.memory.get(), 0), "vkBindImageMemory");
+    mirror.view = createView(mirror, 0, levels);
+    // Nothing used the new image before, so this is its only barrier.
+    auto barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers};
+    vkCmdPipelineBarrier(recording(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+}
+
+bool VulkanDevice::doCreateImage(ImageCreation const &request) {
+    collectGarbage();
+    allocateImage(images[request.identity->key()], *request.identity, request.format, request.compressed, request.dim,
+                  request.extent, request.levels);
+    return false;
+}
+
+void VulkanDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
+    auto const buffer = buffers.find(copy.buffer->key());
+    if (buffer == buffers.end() or buffer->second.size < copy.offset + copy.bytes) {
+        throw DeviceError{"copyBufferToImage: the buffer was never uploaded to this device (or changed size)"};
+    }
+    auto const &mirror = images.at(copy.image->key());
+    auto region = VkBufferImageCopy{};
+    region.bufferOffset = copy.offset;
+    if (copy.dim == Dim::D3) {
+        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, copy.level, 0, 1};
+        region.imageOffset = VkOffset3D{0, 0, static_cast<std::int32_t>(copy.firstLayer)};
+        region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(copy.extent.x),
+                                        static_cast<std::uint32_t>(copy.extent.y), copy.layers};
+    } else {
+        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, copy.level, copy.firstLayer, copy.layers};
+        region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(copy.extent.x),
+                                        static_cast<std::uint32_t>(copy.extent.y), 1};
+    }
+    auto const cmd = commandFor({detail::ResourceAccess{copy.buffer->key(), copy.offset, copy.bytes, true, false},
+                                 detail::ResourceAccess{copy.image->key(), 0, 0, false, true}});
+    vkCmdCopyBufferToImage(cmd, buffer->second.handle(), mirror.image.get(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+}
+
+void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
+    collectGarbage();
+    auto &mirror = images[transfer.identity->key()];
+    auto const isNew = mirror.image.get() == VK_NULL_HANDLE or not(mirror.format == transfer.format)
+                    or not(mirror.extent == transfer.extent) or mirror.levels != transfer.levels;
+    if (isNew) {
+        allocateImage(mirror, *transfer.identity, transfer.format, std::nullopt, transfer.dim, transfer.extent,
+                      transfer.levels);
     }
     auto const first = isNew ? 0u : transfer.firstLevel; // a new image starts with every level
     auto const count = isNew ? transfer.levels : transfer.levelCount;
@@ -1357,22 +1445,8 @@ void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
         transfer.writeTexels(level, ByteSpan{slice.mapped + offset, levelBytes(transfer, level)});
         regions.push_back(imageCopy(transfer, level, slice.offset + offset));
     }
-    auto const image = mirror.image.get();
     auto const cmd = commandFor({detail::ResourceAccess{transfer.identity->key(), 0, 0, false, true}});
-    if (isNew) {
-        auto barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
-        barrier.srcAccessMask = 0;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = image;
-        barrier.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, transfer.levels, 0, layers};
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                             nullptr, 1, &barrier);
-    }
-    vkCmdCopyBufferToImage(cmd, slice.buffer, image, VK_IMAGE_LAYOUT_GENERAL,
+    vkCmdCopyBufferToImage(cmd, slice.buffer, mirror.image.get(), VK_IMAGE_LAYOUT_GENERAL,
                            static_cast<std::uint32_t>(regions.size()), regions.data());
 }
 
@@ -1382,41 +1456,12 @@ void VulkanDevice::doUploadCompressed(CompressedTransfer const &transfer) {
         throw DeviceError{std::string{"uploadImage: "} + properties.deviceName + " does not sample "
                           + compressedFormatInfo(transfer.format).name + " textures"};
     }
-    auto const format = vkCompressedFormat(transfer.format);
-    auto const extent3 = ivec3{transfer.extent, 1};
+    auto const extent3 = ivec3{transfer.extent, static_cast<std::int32_t>(transfer.layers)};
     auto &mirror = images[transfer.identity->key()];
     auto const isNew = mirror.image.get() == VK_NULL_HANDLE or mirror.compressed != transfer.format
-                    or not(mirror.extent == extent3) or mirror.levels != transfer.levels;
+                    or mirror.dim != transfer.dim or not(mirror.extent == extent3) or mirror.levels != transfer.levels;
     if (isNew) {
-        if (mirror.image.get() != VK_NULL_HANDLE) {
-            bury(std::move(mirror));
-        }
-        mirror = ImageMirror{};
-        mirror.owner = transfer.identity->watch();
-        mirror.compressed = transfer.format;
-        mirror.dim = Dim::D2;
-        mirror.extent = extent3;
-        mirror.levels = transfer.levels;
-        mirror.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        auto info = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
-        info.imageType = VK_IMAGE_TYPE_2D;
-        info.format = format;
-        info.extent = VkExtent3D{static_cast<std::uint32_t>(transfer.extent.x), static_cast<std::uint32_t>(transfer.extent.y), 1};
-        info.mipLevels = transfer.levels;
-        info.arrayLayers = 1;
-        info.samples = VK_SAMPLE_COUNT_1_BIT;
-        info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        info.usage = mirror.usage;
-        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        auto image = VkImage{};
-        check(vkCreateImage(device.handle, &info, nullptr, &image), "vkCreateImage");
-        mirror.image = DeviceObject<VkImage>{device.handle, image, vkDestroyImage};
-        auto requirements = VkMemoryRequirements{};
-        vkGetImageMemoryRequirements(device.handle, image, &requirements);
-        mirror.memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        check(vkBindImageMemory(device.handle, image, mirror.memory.get(), 0), "vkBindImageMemory");
-        mirror.view = createView(mirror, 0, transfer.levels);
+        allocateImage(mirror, *transfer.identity, ImageFormat{}, transfer.format, transfer.dim, extent3, transfer.levels);
     }
     auto total = VkDeviceSize{0};
     for (std::uint32_t level = 0; level < transfer.levels; ++level) {
@@ -1431,24 +1476,12 @@ void VulkanDevice::doUploadCompressed(CompressedTransfer const &transfer) {
         auto const size = transfer.image->extent(level);
         auto region = VkBufferImageCopy{};
         region.bufferOffset = slice.offset + offset;
-        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, level, 0, transfer.layers};
         region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(size.x), static_cast<std::uint32_t>(size.y), 1};
         regions.push_back(region);
         offset += (blocks.size() + 15) / 16 * 16;
     }
     auto const cmd = commandFor({detail::ResourceAccess{transfer.identity->key(), 0, 0, false, true}});
-    if (isNew) {
-        auto barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = mirror.image.get();
-        barrier.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, transfer.levels, 0, 1};
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                             nullptr, 1, &barrier);
-    }
     vkCmdCopyBufferToImage(cmd, slice.buffer, mirror.image.get(), VK_IMAGE_LAYOUT_GENERAL,
                            static_cast<std::uint32_t>(regions.size()), regions.data());
 }
@@ -1662,7 +1695,7 @@ void VulkanDevice::doBindImage(ImageBindRequest const &request) {
 
 void VulkanDevice::doBindTexture(TextureBindRequest const &request) {
     auto const it = images.find(request.identity->key());
-    auto const matches = it != images.end()
+    auto const matches = it != images.end() and it->second.dim == request.dim
                      and (request.compressed ? it->second.compressed == request.compressed
                                              : not it->second.compressed and it->second.format == request.format);
     if (not matches) {

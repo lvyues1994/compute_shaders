@@ -59,6 +59,7 @@ inline constexpr GLenum kGpuDisjoint = 0x8FBB;
     X(PFNGLTEXSUBIMAGE2DPROC, glTexSubImage2D)                                                                         \
     X(PFNGLTEXSUBIMAGE3DPROC, glTexSubImage3D)                                                                         \
     X(PFNGLCOMPRESSEDTEXSUBIMAGE2DPROC, glCompressedTexSubImage2D)                                                     \
+    X(PFNGLCOMPRESSEDTEXSUBIMAGE3DPROC, glCompressedTexSubImage3D)                                                     \
     X(PFNGLPIXELSTOREIPROC, glPixelStorei)                                                                             \
     X(PFNGLBINDIMAGETEXTUREPROC, glBindImageTexture)                                                                   \
     X(PFNGLDISPATCHCOMPUTEPROC, glDispatchCompute)                                                                     \

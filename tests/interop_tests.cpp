@@ -60,13 +60,13 @@ TEST_P(Equivalence, SyncFenceRoundTrip) {
         device->bindBuffer(kernel.in);
         device->bindBuffer(kernel.out);
         device->execute(kernel, uvec3{1u, 1u, 1u});
-        auto fence = device->submitWithFence();
+        auto fence = device->submitWithFence().fence;
         fence.wait();
         EXPECT_TRUE(fence.isSignaled());
         EXPECT_EQ(first[0], vec4{64.0f}) << device->info().backend << ": mapped results after the fence";
 
         device->execute(kernel, uvec3{1u, 1u, 1u});
-        auto again = device->submitWithFence();
+        auto again = device->submitWithFence().fence;
         device->waitFor(std::move(again)); // device-side wait where the API can import sync files
         kernel.in.attach(first);
         kernel.out.attach(second);
@@ -111,7 +111,7 @@ TEST(SyncFence, CrossesApis) {
         producer.bindBuffer(kernel.out);
         producer.setUniform(kernel.factor);
         producer.execute(kernel, uvec3{1u, 1u, 1u});
-        auto fence = producer.submitWithFence();
+        auto fence = producer.submitWithFence().fence;
         EXPECT_FALSE(fence.empty() and not fence.isSignaled());
         consumer.waitFor(std::move(fence));
         consumer.finish();
@@ -177,14 +177,14 @@ std::vector<std::uint8_t> renderFrames(Device &device, ivec2 const size) {
     device.setUniform(kernel.time);
     auto const groups = uvec3{(static_cast<uint>(size.x) + 15u) / 16u, (static_cast<uint>(size.y) + 15u) / 16u, 1u};
     device.execute(kernel, groups);
-    auto acquire = device.submitWithFence(); // what ASurfaceTransaction_setBuffer would get
-    acquire.wait();                          // the compositor reads the frame...
-    auto release = std::move(acquire);       // ...and gives it back with a release fence
+    auto acquire = device.submitWithFence().fence; // what ASurfaceTransaction_setBuffer would get
+    acquire.wait();                                // the compositor reads the frame...
+    auto release = std::move(acquire);             // ...and gives it back with a release fence
     device.waitFor(std::move(release));
     kernel.time = 0.75f;
     device.setUniform(kernel.time);
     device.execute(kernel, groups);
-    device.submitWithFence().wait();
+    device.submitWithFence().fence.wait();
     return readFrame(buffer.get(), size);
 }
 

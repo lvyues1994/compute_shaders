@@ -61,29 +61,4 @@ private:
     ResourceIdentity id;
 };
 
-namespace detail {
-
-// What an image or texture binding is attached to: one resource (a single
-// level) or a mip chain, and for images the level kernels access.
-template <class P, Dim D>
-struct ImageAttachment {
-    BufferResource<P, D> *single = nullptr;
-    MipChain<P, D> *chain = nullptr;
-    std::uint32_t level = 0;
-
-    bool attached() const noexcept { return single != nullptr or chain != nullptr; }
-    std::uint32_t levels() const noexcept { return chain != nullptr ? chain->levels() : 1u; }
-    BufferResource<P, D> *resource(std::uint32_t const index) const noexcept {
-        if (chain != nullptr) {
-            return index < chain->levels() ? &chain->level(index) : nullptr;
-        }
-        return index == 0 ? single : nullptr;
-    }
-    ResourceIdentity const *identity() const noexcept {
-        return chain != nullptr ? &chain->identity() : single != nullptr ? &single->identity() : nullptr;
-    }
-};
-
-} // namespace detail
-
 } // namespace tc

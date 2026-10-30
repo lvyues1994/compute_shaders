@@ -6,6 +6,7 @@
 #include <type_traits>
 
 #include <tc/buffer.hpp>
+#include <tc/device_image.hpp>
 #include <tc/dim.hpp>
 #include <tc/gpu_format.hpp>
 #include <tc/mip_chain.hpp>
@@ -60,9 +61,14 @@ struct TextureBinding {
 
     void attach(Resource &resource_) noexcept { target = detail::ImageAttachment<P, D>{&resource_, nullptr, 0}; }
     void attach(Chain &chain_) noexcept { target = detail::ImageAttachment<P, D>{nullptr, &chain_, 0}; }
+    void attach(DeviceImage<G, D, P> const &image) noexcept {
+        assert(image);
+        target = detail::ImageAttachment<P, D>{nullptr, nullptr, 0, image.shared()};
+    }
 
-    // Level 0.
+    // Level 0; nullptr for a device image on a GPU device.
     Resource *attachedResource() const noexcept { return target.resource(0); }
+    bool isDeviceImage() const noexcept { return target.device != nullptr; }
     std::uint32_t levelCount() const noexcept { return target.levels(); }
     Resource *levelResource(std::uint32_t const index) const noexcept { return target.resource(index); }
     ResourceIdentity const *identity() const noexcept { return target.identity(); }

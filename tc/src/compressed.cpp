@@ -86,26 +86,26 @@ Texels decodeBlock(CompressedFormat const format, std::uint8_t const *block) {
     }
 }
 
-void decodeBlocks(CompressedImage const &image, std::uint32_t const level, BufferResource<cpu::RGBA32F, Dim::D2> &out) {
-    auto const size = image.extent(level);
-    auto const blocks = image.blockCount(level);
-    auto const bytes = compressedFormatInfo(image.format()).blockBytes;
-    auto const &data = image.blocks(level);
+void decodeBlocks(CompressedFormat const format, ivec2 const size, std::uint8_t const *data, cpu::RGBA32F *out) {
+    auto const blocks = compressedBlockCount(format, size, 0);
+    auto const bytes = compressedFormatInfo(format).blockBytes;
     for (int by = 0; by < blocks.y; ++by) {
         for (int bx = 0; bx < blocks.x; ++bx) {
-            auto const texels = decodeBlock(image.format(), data.data() + (static_cast<std::size_t>(by) * blocks.x + bx) * bytes);
+            auto const texels = decodeBlock(format, data + (static_cast<std::size_t>(by) * blocks.x + bx) * bytes);
             for (int y = 0; y < 4 and 4 * by + y < size.y; ++y) {
                 for (int x = 0; x < 4 and 4 * bx + x < size.x; ++x) {
                     auto const &texel = texels[static_cast<std::size_t>(4 * y + x)];
-                    out[ivec2{4 * bx + x, 4 * by + y}] = cpu::RGBA32F{{texel.x, texel.y, texel.z, texel.w}};
+                    out[static_cast<std::size_t>(4 * by + y) * static_cast<std::size_t>(size.x) + 4 * bx + x] =
+                        cpu::RGBA32F{{texel.x, texel.y, texel.z, texel.w}};
                 }
             }
         }
     }
 }
 
-void decodeAstc(CompressedImage const &image, std::uint32_t const level, BufferResource<cpu::RGBA32F, Dim::D2> &out) {
-    auto const block = compressedFormatInfo(image.format()).block;
+void decodeAstc(CompressedFormat const format, ivec2 const size, std::uint8_t const *data, std::size_t const bytes,
+                cpu::RGBA32F *out) {
+    auto const block = compressedFormatInfo(format).block;
     auto config = astcenc_config{};
     auto status = astcenc_config_init(ASTCENC_PRF_LDR, static_cast<unsigned>(block.x), static_cast<unsigned>(block.y), 1,
                                       ASTCENC_PRE_FASTEST, ASTCENC_FLG_DECOMPRESS_ONLY, &config);
@@ -116,8 +116,7 @@ void decodeAstc(CompressedImage const &image, std::uint32_t const level, BufferR
     if (status != ASTCENC_SUCCESS) {
         throw std::runtime_error{std::string{"astcenc: "} + astcenc_get_error_string(status)};
     }
-    auto const size = image.extent(level);
-    void *slices[] = {out.data()};
+    void *slices[] = {out};
     auto decoded = astcenc_image{};
     decoded.dim_x = static_cast<unsigned>(size.x);
     decoded.dim_y = static_cast<unsigned>(size.y);
@@ -125,8 +124,7 @@ void decodeAstc(CompressedImage const &image, std::uint32_t const level, BufferR
     decoded.data_type = ASTCENC_TYPE_F32;
     decoded.data = slices;
     auto const swizzle = astcenc_swizzle{ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
-    auto const &data = image.blocks(level);
-    status = astcenc_decompress_image(context, data.data(), data.size(), &decoded, &swizzle, 0);
+    status = astcenc_decompress_image(context, data, bytes, &decoded, &swizzle, 0);
     astcenc_context_free(context);
     if (status != ASTCENC_SUCCESS) {
         throw std::runtime_error{std::string{"astcenc: "} + astcenc_get_error_string(status)};
@@ -135,26 +133,51 @@ void decodeAstc(CompressedImage const &image, std::uint32_t const level, BufferR
 
 } // namespace
 
-CompressedImage::CompressedImage(CompressedFormat const format, ivec2 const extent, std::uint32_t const levels)
-    : formatValue(format), extentValue(extent), id(ResourceIdentity::create()) {
-    auto const full = fullMipLevels(Dim::D2, ivec3{extent, 1});
-    if (extent.x <= 0 or extent.y <= 0 or levels == 0 or levels > full) {
-        throw std::invalid_argument{"CompressedImage: bad extent or level count"};
+ivec2 compressedBlockCount(CompressedFormat const format, ivec2 const extent, std::uint32_t const level) noexcept {
+    auto const size = mipExtent(Dim::D2, ivec3{extent, 1}, level);
+    auto const block = compressedFormatInfo(format).block;
+    return ivec2{(size.x + block.x - 1) / block.x, (size.y + block.y - 1) / block.y};
+}
+
+std::size_t compressedLayerBytes(CompressedFormat const format, ivec2 const extent, std::uint32_t const level) noexcept {
+    auto const blocks = compressedBlockCount(format, extent, level);
+    return static_cast<std::size_t>(blocks.x) * static_cast<std::size_t>(blocks.y) * compressedFormatInfo(format).blockBytes;
+}
+
+void decodeCompressed(CompressedFormat const format, ivec2 const size, std::uint8_t const *blocks,
+                      std::size_t const bytes, cpu::RGBA32F *texels) {
+    if (bytes != compressedLayerBytes(format, size, 0)) {
+        throw std::invalid_argument{"decodeCompressed: the blocks do not cover the image"};
+    }
+    if (isAstc(format)) {
+        decodeAstc(format, size, blocks, bytes, texels);
+    } else {
+        decodeBlocks(format, size, blocks, texels);
+    }
+}
+
+CompressedImage::CompressedImage(CompressedFormat const format, ivec2 const extent, std::uint32_t const levels,
+                                 std::uint32_t const layers)
+    : formatValue(format), extentValue(extent), layerCount(layers), id(ResourceIdentity::create()) {
+    auto const full = extent.x > 0 and extent.y > 0 ? fullMipLevels(Dim::D2, ivec3{extent, 1}) : 0u;
+    if (levels == 0 or levels > full or layers == 0) {
+        throw std::invalid_argument{"CompressedImage: bad extent, level or layer count"};
     }
     data.resize(levels);
     for (std::uint32_t level = 0; level < levels; ++level) {
-        auto const blocks = blockCount(level);
-        data[level].resize(static_cast<std::size_t>(blocks.x) * blocks.y * compressedFormatInfo(format).blockBytes);
+        data[level].resize(layerBytes(level) * layers);
     }
 }
 
 CompressedImage::CompressedImage(CompressedImage const &other)
-    : formatValue(other.formatValue), extentValue(other.extentValue), data(other.data), id(ResourceIdentity::create()) {}
+    : formatValue(other.formatValue), extentValue(other.extentValue), layerCount(other.layerCount), data(other.data),
+      id(ResourceIdentity::create()) {}
 
 CompressedImage &CompressedImage::operator=(CompressedImage const &other) {
     if (this != &other) {
         formatValue = other.formatValue;
         extentValue = other.extentValue;
+        layerCount = other.layerCount;
         data = other.data;
         id = ResourceIdentity::create();
         decodedChain.reset();
@@ -162,19 +185,14 @@ CompressedImage &CompressedImage::operator=(CompressedImage const &other) {
     return *this;
 }
 
-ivec2 CompressedImage::blockCount(std::uint32_t const level) const noexcept {
-    auto const size = extent(level);
-    auto const block = compressedFormatInfo(formatValue).block;
-    return ivec2{(size.x + block.x - 1) / block.x, (size.y + block.y - 1) / block.y};
-}
-
 void CompressedImage::decode() {
-    auto chain = std::make_shared<MipChain<cpu::RGBA32F, Dim::D2>>(extentValue, levels());
+    auto chain = std::make_shared<DecodedChain>(ivec3{extentValue, static_cast<std::int32_t>(layerCount)}, levels());
     for (std::uint32_t level = 0; level < levels(); ++level) {
-        if (isAstc(formatValue)) {
-            decodeAstc(*this, level, chain->level(level));
-        } else {
-            decodeBlocks(*this, level, chain->level(level));
+        auto const size = extent(level);
+        auto const bytes = layerBytes(level);
+        for (std::uint32_t layer = 0; layer < layerCount; ++layer) {
+            auto *texels = chain->level(level).data() + static_cast<std::size_t>(layer) * size.x * size.y;
+            decodeCompressed(formatValue, size, data[level].data() + layer * bytes, bytes, texels);
         }
     }
     decodedChain = std::move(chain);

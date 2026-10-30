@@ -106,6 +106,65 @@ struct TC_KERNEL HalfFloats {
     }
 };
 
+// Writes one layer of an array image from packed RGBA8 texels: how an
+// engine fills a slot of a texture pool from a staging buffer.
+struct TC_KERNEL CopyIntoLayer {
+    static constexpr char fileLocation[] = "copy_into_layer";
+    uvec3 local_size{8, 8, 1};
+
+    BufferBinding<uint, 0> texels;
+    ImageBinding<gpu::RGBA8, Dim::D2Array, cpu::RGBA8, 1> pool;
+    Uniform<int, 0> layer{};
+
+    void main() {
+        ivec2 p = ivec2(gl_GlobalInvocationID.xy());
+        ivec3 size = imageSize(pool);
+        if (p.x >= size.x or p.y >= size.y) {
+            return;
+        }
+        imageStore(pool, ivec3(p.x, p.y, layer.value), unpackUnorm4x8(texels[uint(p.y * size.x + p.x)]));
+    }
+};
+
+// Packed RGBA8 texels computed on the device.
+struct TC_KERNEL MakeTexels {
+    static constexpr char fileLocation[] = "make_texels";
+    uvec3 local_size{64, 1, 1};
+
+    BufferBinding<uint, 0> texels;
+    Uniform<uint, 0> seed{};
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= uint(texels.length())) {
+            return;
+        }
+        texels[i] = (i * 2654435761u) ^ seed.value;
+    }
+};
+
+// Every texel of every layer of one level, fetched and filtered.
+struct TC_KERNEL ReadPool {
+    static constexpr char fileLocation[] = "read_pool";
+    uvec3 local_size{8, 4, 1};
+
+    TextureBinding<gpu::RGBA8, Dim::D2Array, cpu::RGBA8, 0, Filter::Linear, Wrap::Repeat, Mip::Nearest> pool;
+    BufferBinding<vec4, 1> out;
+    Uniform<int, 0> level{};
+
+    void main() {
+        ivec3 size = textureSize(pool, level.value);
+        ivec3 p = ivec3(gl_GlobalInvocationID);
+        if (p.x >= size.x or p.y >= size.y or p.z >= size.z) {
+            return;
+        }
+        uint i = uint((p.z * size.y + p.y) * size.x + p.x);
+        vec2 uv = (vec2(p.xy()) + vec2(0.25f)) / vec2(size.xy());
+        out[i * 2u] = texelFetch(pool, p, level.value);
+        out[i * 2u + 1u] = textureLod(pool, vec3(uv.x, uv.y, float(p.z)), float(level.value));
+    }
+};
+
 // Every texel of one level of a compressed texture, and a filtered lookup.
 struct TC_KERNEL CompressedSampling {
     static constexpr char fileLocation[] = "compressed_sampling";
@@ -125,6 +184,29 @@ struct TC_KERNEL CompressedSampling {
         uint i = uint(p.y * size.x + p.x);
         out[i * 2u] = texelFetch(blocks, p, level.value);
         out[i * 2u + 1u] = texture(filtered, (vec2(p) + vec2(0.25f)) / vec2(size));
+    }
+};
+
+// The same for every layer of a compressed array texture.
+struct TC_KERNEL CompressedArraySampling {
+    static constexpr char fileLocation[] = "compressed_array_sampling";
+    uvec3 local_size{8, 8, 1};
+
+    CompressedTextureBinding<0, Filter::Nearest, Wrap::ClampToEdge, Mip::Nearest, Dim::D2Array> blocks;
+    CompressedTextureBinding<1, Filter::Linear, Wrap::Repeat, Mip::None, Dim::D2Array> filtered;
+    BufferBinding<vec4, 2> out;
+    Uniform<int, 0> level{};
+
+    void main() {
+        ivec3 size = textureSize(blocks, level.value);
+        ivec3 p = ivec3(gl_GlobalInvocationID);
+        if (p.x >= size.x or p.y >= size.y or p.z >= size.z) {
+            return;
+        }
+        uint i = uint((p.z * size.y + p.y) * size.x + p.x);
+        vec2 uv = (vec2(p.xy()) + vec2(0.25f)) / vec2(size.xy());
+        out[i * 2u] = texelFetch(blocks, p, level.value);
+        out[i * 2u + 1u] = texture(filtered, vec3(uv.x, uv.y, float(p.z)));
     }
 };
 

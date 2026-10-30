@@ -60,7 +60,7 @@ kernel 头文件 (C++17)
 
 | 目录 | 内容 |
 |---|---|
-| `tc/` | 头文件 DSL：`vec`/swizzle、`mat`、GLSL 内建函数（含 pack/unpack、位操作、原子操作、子组操作）、`BufferResource`/`BufferBinding`、`TableResource`/`TableBinding` 与布局 `Aos`/`Soa<P>`、`Encoded` 与编码器、像素与图像格式、`half`、`ImageBinding`、`TextureBinding`、`MipChain`、`CompressedImage`、`ExternalImage`、`Shared`/`barrier()`、`Uniform`、`Device` 抽象（含 `Submission`、`SyncFence`、`DeviceLimits`）、`ProgramRegistry` |
+| `tc/` | 头文件 DSL：`vec`/swizzle、`mat`、GLSL 内建函数（含 pack/unpack、位操作、原子操作、子组操作）、`BufferResource`/`BufferBinding`、`TableResource`/`TableBinding` 与布局 `Aos`/`Soa<P>`、`Encoded` 与编码器、像素与图像格式、`half`、`ImageBinding`、`TextureBinding`、`MipChain`、`CompressedImage`、`DeviceImage`、`DeviceCompressedImage`、`ExternalImage`、`Shared`/`barrier()`、`Uniform`、`Device` 抽象（含 `Submission`、`SyncFence`、`DeviceLimits`）、`ProgramRegistry` |
 | `backends/cpu` `opengl` `vulkan` | 各后端，各自一个工厂函数 `tc::<backend>::createDevice(config)` |
 | `backends/devices` | 按名字创建后端：`tc::createDevice({"vulkan", "llvmpipe"})` |
 | `transpiler/` | `tc-transpile` 主机工具 |
@@ -77,9 +77,9 @@ kernel 是带 `TC_KERNEL` 标注的 struct，必须有 `fileLocation`、`local_s
 
 - `BufferBinding<T, binding>`：SSBO，`A[i]` 读写，`A.length()`。`T` 可以是标量、`vec`、或只含这些成员的结构体，C++ 布局必须和 std430 一致（由转译器检查）。
 - `TableBinding<T, binding, Layout = Aos>`：表，元素按紧凑字流存放，结构体可以按自然的写法定义，可以切换 AOS / SOA 布局，字段可以带编码，见下文"表"。
-- `ImageBinding<GpuFormat, Dim, CpuPixel, binding>`：存储图像，配合 `imageLoad` / `imageStore` / `imageSize`。GPU 内部格式和主机像素格式可以不同（例如主机用 `cpu::R8UI`，GPU 用 `gpu::R32UI`），上传/下载时自动转换；CPU 后端读写同样经过 GPU 格式，结果与 GPU 一致。可以 attach 一个 `BufferResource`，或 `MipChain` 的某一层（见下文"纹理"）。
+- `ImageBinding<GpuFormat, Dim, CpuPixel, binding>`：存储图像，配合 `imageLoad` / `imageStore` / `imageSize`。GPU 内部格式和主机像素格式可以不同（例如主机用 `cpu::R8UI`，GPU 用 `gpu::R32UI`），上传/下载时自动转换；CPU 后端读写同样经过 GPU 格式，结果与 GPU 一致。可以 attach 一个 `BufferResource`，或 `MipChain` / `DeviceImage` 的某一层（见下文"纹理"）。
 - `TextureBinding<GpuFormat, Dim, CpuPixel, binding, Filter, Wrap, Mip>`：采样纹理（`sampler2D` 等），配合 `texelFetch` / `texture` / `textureLod` / `textureSize`。过滤（`Nearest`/`Linear`）、寻址（`ClampToEdge`/`Repeat`/`MirroredRepeat`）和层级选择（`Mip::None`/`Nearest`/`Linear`）是类型的一部分，CPU 后端按 GL 规则实现双线性与三线性采样。纹理用 `uploadImage` 上传，用 `bindTexture` 绑定。
-- `CompressedTextureBinding<binding, Filter, Wrap, Mip>`：BC、ETC2/EAC、ASTC 压缩纹理，用法同上，见下文"纹理"。
+- `CompressedTextureBinding<binding, Filter, Wrap, Mip, Dim>`：BC、ETC2/EAC、ASTC 压缩纹理，`Dim` 默认是 `Dim::D2`，压缩纹理数组用 `Dim::D2Array`，用法同上，见下文"纹理"。
 - `ExternalTextureBinding<binding>`：外部帧（见下文"零拷贝"），配合 `texture` / `textureSize`，结果是 RGB，YUV 由驱动或 CPU 转换。
 - `ExternalImageBinding<GpuFormat, binding>`：把 RGBA 外部帧当作存储图像直接写入，见下文"零拷贝"。
 - `Shared<T>`：工作组共享内存（GLSL `shared`），`T` 可以是标量、`vec`、`mat` 或 `std::array`。用到 `barrier()` 的 kernel 必须声明 `static constexpr bool usesBarrier = true;`，否则转译时报错。用到子组操作的 kernel 同样要声明 `usesSubgroups`（见下文"子组与 64 位整数"）。
@@ -212,6 +212,31 @@ if (device->info().limits.compressedFormats & tc::compressedBit(CompressedFormat
 
 支持 BC1/3/4/5/7、ETC2 RGB8/RGB8A1/RGBA8、EAC R11/RG11、ASTC 4x4 到 12x12（都是 LDR、非 sRGB）。GPU 后端把压缩块直接交给驱动，设备不支持的格式在 `uploadImage` 时报 `DeviceError`。CPU 后端在上传时解码成 RGBA32F 的 mip 链再采样，解码器为 [bcdec](https://github.com/iOrange/bcdec)、[etcdec](https://github.com/iOrange/etcdec) 和 [astc-encoder](https://github.com/ARM-software/astc-encoder)，构建时通过 `FetchContent` 下载并校验哈希。
 
+压缩纹理也可以是数组：`CompressedImage{format, extent, levels, layers}` 的每层 mip 依次存放各数组层的块（与 KTX2 文件的顺序相同），binding 写成 `CompressedTextureBinding<binding, Filter, Wrap, Mip, Dim::D2Array>`，在 GLSL 里是 `sampler2DArray`，坐标与未压缩的纹理数组一样。能做成数组的格式见 `DeviceLimits::compressedArrayFormats`：OpenGL ES 没有查询接口，GL 后端在创建设备时逐个格式试建一个数组纹理。Adreno 830 的 GLES 上，BC4 和 BC5 只能是 2D 纹理，其余格式（以及该机 Vulkan 上的全部 16 种）都可以是数组。
+
+### 只在设备上的图像
+
+`MipChain` 和 `CompressedImage` 在主机上各有一份完整数据，GPU 后端另有一份，纹理池因此占用两倍内存。`device->createImage(...)` 创建只驻留在设备上的图像，相当于没有主机映射的 `createBuffer`：
+
+```cpp
+// 1024 x 1024、256 层的 RGBA8 纹理池，完整 mip 链（levels = 0）
+auto pool = device->createImage<gpu::RGBA8, Dim::D2Array>(ivec3{1024, 1024, 256}, 0);
+copyKernel.target.attach(pool, level);  // ImageBinding：kernel 写入一层 mip
+shadeKernel.textures.attach(pool);      // TextureBinding：采样整条链
+device->copyBufferToImage(staging, offset, pool, level, firstLayer, layers);  // 从 buffer 拷贝，不经过主机
+
+// 压缩纹理池：kernel 不能写压缩格式，只能从 buffer 拷贝压缩块
+auto atlas = device->createImage<Dim::D2Array>(CompressedFormat::Astc6x6, ivec3{1024, 1024, 256}, 0);
+std::memcpy(ring.data() + offset / 4, blocks, atlas.layerBytes(level));   // ring 来自 createBuffer
+device->copyBufferToImage(ring, offset, atlas, level, slot);              // 与前后的 dispatch 按顺序执行
+material.albedo.attach(atlas);                                            // CompressedTextureBinding<..., Dim::D2Array>
+```
+
+- `DeviceImage` 和 `DeviceCompressedImage` 没有主机端的数据：对它们调用 `uploadImage` / `downloadImage` 会报 `DeviceError`。它们的复制品指向同一张图像，最后一份释放、设备也不再使用时图像才释放。初始内容未定义。
+- `copyBufferToImage` 在设备的时间线上执行，与前后的 dispatch 之间照常按需插入屏障：先用 kernel 生成 buffer，再拷进图像，结果是正确的。buffer 里按 GPU 存储格式逐行、逐层紧密排列（压缩格式按块），起始偏移必须是 4 和一个像素（或一个块）字节数的倍数。Vulkan 用 `vkCmdCopyBufferToImage`，GL 用 pixel unpack buffer 加 `glTexSubImage` / `glCompressedTexSubImage`，CPU 后端直接拷贝（压缩块同时解码）。
+- GPU 后端在 `createImage` 时就分配图像，CPU 后端持有唯一一份数据（CPU 后端的"设备内存"就是主机内存）。
+- `DeviceLimits::imageDimension2D` / `imageDimension3D` / `imageArrayLayers` 给出图像尺寸和数组层数的上限（GLES 3.1 与 Vulkan 至少 2048 / 256 / 256），超出时 `createImage` 报 `DeviceError`。
+
 ## 子组与 64 位整数
 
 声明了 `static constexpr bool usesSubgroups = true;` 的 kernel 可以使用 `GL_KHR_shader_subgroup` 的 basic、vote、arithmetic、ballot、shuffle 和 relative shuffle 操作：`subgroupElect`、`subgroupAll` / `Any` / `AllEqual`、`subgroupAdd` / `Mul` / `Min` / `Max` / `And` / `Or` / `Xor` 以及对应的 `subgroupInclusive*` / `subgroupExclusive*` 扫描、`subgroupBallot` 系列、`subgroupBroadcast` / `BroadcastFirst`、`subgroupShuffle` / `ShuffleXor` / `ShuffleUp` / `ShuffleDown`，还有 `gl_SubgroupSize`、`gl_SubgroupInvocationID`、`gl_SubgroupEqMask` 等内建变量。没有声明就使用时，转译器报错。
@@ -274,7 +299,7 @@ device->executeIndirect(shade, args);                               // 读 args[
 | Adreno 830，`vulkan` | 有 | 有 / 有 | BC、ETC2/EAC、ASTC | 有 |
 | `cpu` | 有（可配置） | 有 / 有 | 全部 | 不需要 |
 
-**异步提交**：`device->submit()` 把目前排队的工作交给设备，不等待完成，返回一个 `Submission`；`isComplete()` 查询，`wait()` 等待，任何线程都可以使用，并且可以比设备活得更久。设备执行这一帧时，主机可以准备下一帧，只要不写还在被读的内存即可：对 `createBuffer` 分配的内存，每一帧在途时用环形缓冲区的不同一段。`Submission` 完成后，`createBuffer` 内存里就是结果，所以它也是异步读回的方式；`downloadBuffer` / `downloadImage` 总是会等待。Vulkan 后端每次提交都有自己的命令缓冲区、暂存内存和 fence，GL 后端用 EGL fence sync。
+**异步提交**：`device->submit()` 把目前排队的工作交给设备，不等待完成，返回一个 `Submission`；`isComplete()` 查询，`wait()` 等待，任何线程都可以使用，并且可以比设备活得更久。设备执行这一帧时，主机可以准备下一帧，只要不写还在被读的内存即可：对 `createBuffer` 分配的内存，每一帧在途时用环形缓冲区的不同一段。`Submission` 完成后，`createBuffer` 内存里就是结果，所以它也是异步读回的方式；`downloadBuffer` / `downloadImage` 总是会等待。Vulkan 后端每次提交都有自己的命令缓冲区、暂存内存和 fence，GL 后端用 EGL fence sync。`submission.sequence()` 是这次提交在设备上的序号（从 1 开始），计时结果按它归属到提交（见下文"性能测量"）。
 
 **按需屏障**：后端记录每次 dispatch 和传输读写了哪些资源的哪段字节，只在真正有读后写、写后读或写后写冲突时才插入屏障（Vulkan 的 pipeline barrier，GL 的 `glMemoryBarrier`）。互不相关的连续 dispatch 之间没有屏障，可以重叠执行。
 
@@ -293,7 +318,24 @@ GPU 设备在下一次 `useKernel` 时改用新程序。只有接口不变的程
 
 ## 性能测量
 
-`device->enableTimers(true)` 之后，每次 `execute()` 都在设备上计时：Vulkan 用时间戳查询，桌面 GL 用 `GL_TIME_ELAPSED`，GLES 用 `GL_EXT_disjoint_timer_query`，CPU 后端用主机时钟。`device->takeTimings()` 等待已提交的工作完成，按执行顺序返回每次 dispatch 的耗时；GLES 报告时钟不连续时，对应的结果为空。`DeviceInfo::timers` 表示设备是否支持计时。
+`device->enableTimers(true)` 之后，每次 `execute()` 都在设备上计时：Vulkan 用时间戳查询，桌面 GL 用 `GL_TIME_ELAPSED`，GLES 用 `GL_EXT_disjoint_timer_query`，CPU 后端用主机时钟。GLES 报告时钟不连续时，对应的结果为空。`DeviceInfo::timers` 表示设备是否支持计时。
+
+取结果有两种方式：
+
+- `device->takeTimings(submission)` 只等待这一次提交，返回它以及更早的提交中还没取走的 dispatch 耗时；之后提交的、正在录制的工作都不受影响，不会被等待，也不会被提前提交。多帧在途时，在复用一帧的槽位之前取这一帧的计时即可，计时器和帧重叠可以同时使用。每个 `KernelTiming::submission` 记录它属于哪次提交。
+- `device->takeTimings()` 等待所有工作（包括还没提交的）完成，返回全部剩余的计时，适合测试和 `tc_bench` 这类一次性的测量。
+
+```cpp
+auto frames = std::array<tc::Submission, 3>{};
+for (int f = 0;; ++f) {
+    auto &slot = frames[f % 3];
+    profiler.record(device->takeTimings(slot));   // 第 f - 3 帧，早已完成
+    recordFrame(f);
+    slot = device->submitWithFence().submission;  // submitWithFence() 同时给出 Submission 和 SyncFence
+}
+```
+
+计时期间，每个计时的 dispatch 前都会插入完整屏障，这样一对时间戳只包住这一个 dispatch；因此开着计时器时，dispatch 之间在 GPU 上不会重叠，得到的是每个 dispatch 单独执行的耗时。
 
 `tc_bench` 在所有可用后端上跑一组用例，先预热，再按时间预算决定迭代次数，报告 GPU 时间中位数、最小值、墙钟时间和有效带宽：
 
@@ -345,7 +387,7 @@ device->waitFor(std::move(releaseFence));        // 合成器还给我们的 rel
 device->useKernel(kernel);
 device->bindExternalImage(kernel.target);
 device->execute(kernel, groups);
-tc::SyncFence done = device->submitWithFence();  // 交给 ASurfaceTransaction_setBuffer 作为 acquire fence
+auto done = device->submitWithFence();           // done.fence 交给 ASurfaceTransaction_setBuffer 作为 acquire fence
 ```
 
 | 后端 | 写入外部帧 | `waitFor` / `submitWithFence` |
@@ -354,7 +396,7 @@ tc::SyncFence done = device->submitWithFence();  // 交给 ASurfaceTransaction_s
 | `vulkan` | 以 `STORAGE` 用途导入 `AHardwareBuffer`，在 foreign 队列族之间转移所有权 | `VK_KHR_external_semaphore_fd` 的 sync fd 导入与导出 |
 | `cpu` | 绑定时读一份快照，每次 `execute()` 后写回 | 在主机上等待；返回空 fence |
 
-`DeviceInfo::syncFiles` 为假时，`waitFor` 在主机上等待，`submitWithFence` 等工作完成后返回空 fence。`SyncFence` 只是 Linux / Android 的 sync file 描述符，桌面 Linux 上同样可用（NVIDIA 的三种 API 都支持导入和导出）。
+`submitWithFence()` 返回的 `FencedSubmission` 里还有这次提交的 `Submission`，主机用它等待或取计时。`DeviceInfo::syncFiles` 为假时，`waitFor` 在主机上等待，`submitWithFence` 等工作完成后返回空 fence。`SyncFence` 只是 Linux / Android 的 sync file 描述符，桌面 Linux 上同样可用（NVIDIA 的三种 API 都支持导入和导出）。
 
 ## 构建（Linux）
 
@@ -394,7 +436,7 @@ adb shell /data/local/tmp/tc_compute/game_of_life --backend gles
 adb shell rm -rf /data/local/tmp/tc_compute
 ```
 
-`android-arm64` 预设同时构建测试（GoogleTest 通过 `FetchContent` 下载），`build/android-arm64/tests/` 下的 `tc_core_tests` 和 `tc_equivalence_tests` 用同样的方式推到设备上运行。在 Adreno 830 上，`tc_core_tests` 35 项通过（含 aarch64 纤程上的 barrier 和子组），`tc_equivalence_tests` 的 GLES 与 Vulkan 用例 105 项通过。按设计跳过的有：llvmpipe 设备、GLES 上读写非 r32 图像、GLES 上的子组与 64 位整数，以及需要构建目录的重新加载测试。
+`android-arm64` 预设同时构建测试（GoogleTest 通过 `FetchContent` 下载），`build/android-arm64/tests/` 下的 `tc_core_tests` 和 `tc_equivalence_tests` 用同样的方式推到设备上运行。在 Adreno 830 上，`tc_core_tests` 35 项通过（含 aarch64 纤程上的 barrier 和子组），`tc_equivalence_tests` 的 GLES 与 Vulkan 用例 115 项通过。按设计跳过的有：llvmpipe 设备、GLES 上读写非 r32 图像、GLES 上的子组与 64 位整数，以及需要构建目录的重新加载测试。
 
 在 App 里使用时，把 `tc`、`tc_cpu`、`tc_opengl`、`tc_vulkan` 作为子项目加入 Android Studio 的 CMake 工程，`tc_add_kernels` 通过 `TC_TRANSPILER_EXECUTABLE` 使用主机上的转译器。
 
@@ -407,7 +449,7 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 一次转译产出三种方言和 SPIR-V；Vulkan 的 uniform 自动放进 push constant 块，偏移由转译器计算并写入反射数据。
 - 增加了 std430 布局检查和 binding 读写推断。
 - 增加了表（紧凑字流、AOS/SOA、字段编码），思路来自上文提到的知乎文章；布局和编码器写成普通 C++，由转译器照常转译。
-- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理、子组与 64 位整数、中等精度、异步提交与按需屏障、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
+- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
 
 ## 已知限制
 
@@ -430,3 +472,5 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 重新加载只接受函数体的改动，接口变化必须重新编译。
 - Vulkan 第一次以存储图像使用一个新导入的外部帧时，按 `UNDEFINED` 布局取得，规范允许驱动丢弃帧里原有的内容，所以第一次写入时 kernel 应写满整帧。
 - 不支持显式的 fp16 运算（`float16_t`），只有整个 kernel 的中等精度。
+- 压缩纹理只能是 2D 或 2D 数组，不能是 3D 或立方体贴图；也不能作为存储图像写入，只能用 `copyBufferToImage` 填充。
+- 只在设备上的图像没有读回主机的接口；需要检查内容时，用 kernel 把它采样到 buffer 里。

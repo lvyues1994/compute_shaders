@@ -155,6 +155,115 @@ TEST(Submission, DefaultIsComplete) {
     auto const done = Submission{};
     EXPECT_TRUE(done.isComplete());
     done.wait();
+    EXPECT_EQ(done.sequence(), 0u);
+}
+
+// One device, one dispatch of ScaleRange over `values`.
+struct TimedScale {
+    explicit TimedScale(Device &device_) : device(device_), values(device_.createBuffer<vec4>(kSlice)) {
+        device.uploadBuffer(values);
+        kernel.in.attach(values);
+        kernel.out.attach(values);
+        kernel.factor = 1.0f;
+        device.useKernel(kernel);
+        device.bindBuffer(kernel.in);
+        device.bindBuffer(kernel.out);
+        device.setUniform(kernel.factor);
+    }
+    void execute(uint const groups) { device.execute(kernel, uvec3{groups, 1u, 1u}); }
+
+    Device &device;
+    BufferResource<vec4> values;
+    tests::ScaleRange kernel;
+};
+
+// Each call takes the timings of one submission (and earlier ones not
+// taken), never those of later or unsubmitted work.
+TEST_P(Equivalence, TimingsPerSubmission) {
+    for (auto *device : {cpu.get(), gpu.get()}) {
+        if (not device->info().timers) {
+            continue;
+        }
+        auto const name = device->info().backend;
+        auto scale = TimedScale{*device};
+        device->enableTimers(true);
+        scale.execute(1);
+        auto const first = device->submit();
+        scale.execute(2);
+        scale.execute(3);
+        auto const second = device->submit();
+        scale.execute(4); // recorded, not submitted
+        EXPECT_EQ(second.sequence(), first.sequence() + 1) << name;
+
+        auto const one = device->takeTimings(first);
+        ASSERT_EQ(one.size(), 1u) << name;
+        EXPECT_EQ(one[0].workGroups, (uvec3{1u, 1u, 1u})) << name;
+        EXPECT_EQ(one[0].submission, first.sequence()) << name;
+        EXPECT_TRUE(device->takeTimings(first).empty()) << name << ": taken already";
+
+        auto const two = device->takeTimings(second);
+        ASSERT_EQ(two.size(), 2u) << name;
+        EXPECT_EQ(two[0].workGroups.x, 2u) << name;
+        EXPECT_EQ(two[1].workGroups.x, 3u) << name;
+        EXPECT_EQ(two[1].submission, second.sequence()) << name;
+
+        auto const fenced = device->submitWithFence();
+        fenced.fence.wait();
+        EXPECT_EQ(fenced.submission.sequence(), second.sequence() + 1) << name;
+        auto const three = device->takeTimings(fenced.submission);
+        ASSERT_EQ(three.size(), 1u) << name << ": the dispatch recorded before submitWithFence";
+        EXPECT_EQ(three[0].workGroups.x, 4u) << name;
+
+        scale.execute(5);
+        auto const a = device->submit();
+        scale.execute(6);
+        auto const b = device->submit();
+        auto const both = device->takeTimings(b);
+        ASSERT_EQ(both.size(), 2u) << name << ": a later submission includes earlier ones";
+        EXPECT_EQ(both[0].submission, a.sequence()) << name;
+        EXPECT_TRUE(device->takeTimings(a).empty()) << name;
+
+        scale.execute(7);
+        EXPECT_EQ(device->takeTimings().size(), 1u) << name << ": takeTimings() still takes unsubmitted work";
+        device->enableTimers(false);
+    }
+}
+
+// The engine's frame loop with timers: each frame's timings are taken when
+// its slot is reused, while the next frames are in flight.
+TEST_P(Equivalence, TimedFramesInFlight) {
+    for (auto *device : {cpu.get(), gpu.get()}) {
+        if (not device->info().timers) {
+            continue;
+        }
+        auto const name = device->info().backend;
+        auto scale = TimedScale{*device};
+        device->enableTimers(true);
+        auto tickets = std::array<Submission, kInFlight>{};
+        auto taken = 0;
+        for (int frame = 0; frame < kFrames + kInFlight; ++frame) {
+            auto const slot = frame % kInFlight;
+            auto const timings = device->takeTimings(tickets[slot]);
+            if (frame >= kInFlight) {
+                ASSERT_EQ(timings.size(), 2u) << name << " frame " << frame - kInFlight;
+                EXPECT_EQ(timings[0].workGroups.x, static_cast<uint>(frame - kInFlight + 1)) << name;
+                EXPECT_EQ(timings[1].submission, tickets[slot].sequence()) << name;
+                taken += 2;
+            } else {
+                EXPECT_TRUE(timings.empty()) << name;
+            }
+            if (frame < kFrames) {
+                scale.execute(static_cast<uint>(frame + 1));
+                scale.execute(1);
+                tickets[slot] = device->submit();
+            } else {
+                tickets[slot] = Submission{};
+            }
+        }
+        EXPECT_EQ(taken, 2 * kFrames) << name;
+        EXPECT_TRUE(device->takeTimings().empty()) << name;
+        device->enableTimers(false);
+    }
 }
 
 } // namespace

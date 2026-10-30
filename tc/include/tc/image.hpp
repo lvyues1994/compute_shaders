@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include <tc/buffer.hpp>
+#include <tc/device_image.hpp>
 #include <tc/dim.hpp>
 #include <tc/gpu_format.hpp>
 #include <tc/mip_chain.hpp>
@@ -35,9 +36,14 @@ struct ImageBinding {
         assert(level < chain_.levels());
         target = detail::ImageAttachment<P, D>{nullptr, &chain_, level};
     }
+    void attach(DeviceImage<G, D, P> const &image, std::uint32_t const level = 0) noexcept {
+        assert(image and level < image.levels());
+        target = detail::ImageAttachment<P, D>{nullptr, nullptr, level, image.shared()};
+    }
 
-    // The level kernels access.
+    // The level kernels access; nullptr for a device image on a GPU device.
     Resource *attachedResource() const noexcept { return target.resource(target.level); }
+    bool isDeviceImage() const noexcept { return target.device != nullptr; }
     std::uint32_t level() const noexcept { return target.level; }
     // The whole attachment, for transfers.
     std::uint32_t levelCount() const noexcept { return target.levels(); }
