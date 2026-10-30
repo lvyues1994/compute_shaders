@@ -18,6 +18,9 @@ llvm::StringRef rootNamespace(clang::Decl const *decl);
 // Is `decl` declared inside namespace tc (at any depth)?
 bool isTcDecl(clang::Decl const *decl);
 
+// tc structs kernels use like their own (tc::DispatchIndirectCommand).
+bool isTcValueRecord(clang::RecordDecl const *record);
+
 // Specialisation of tc::<name> (e.g. "vec", "BufferBinding", "detail::VecFields").
 clang::ClassTemplateSpecializationDecl const *asTcSpecialization(clang::QualType type, llvm::StringRef name);
 clang::ClassTemplateSpecializationDecl const *asTcSpecialization(clang::RecordDecl const *record,

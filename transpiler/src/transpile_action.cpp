@@ -16,7 +16,7 @@ namespace tc::transpiler {
 
 namespace {
 
-KernelArtifact makeArtifact(KernelModel const &model, ShaderVariants const &shaders) {
+KernelArtifact makeArtifact(KernelModel const &model, GlslBody const &body, ShaderVariants const &shaders) {
     auto artifact = KernelArtifact{};
     artifact.name = model.programName;
     artifact.localSize = model.localSize;
@@ -25,6 +25,8 @@ KernelArtifact makeArtifact(KernelModel const &model, ShaderVariants const &shad
     artifact.glslVulkan = shaders.vulkan;
     artifact.esUnavailableReason = shaders.esUnavailableReason;
     artifact.pushConstantSize = model.pushConstantSize;
+    artifact.sharedBytes = model.sharedBytes;
+    artifact.features = body.features | (body.usesDouble ? static_cast<std::uint32_t>(tc::KernelFeature::Double) : 0u);
     for (auto const &buffer : model.buffers) {
         auto resource = ResourceArtifact{};
         resource.name = buffer.name;
@@ -54,7 +56,7 @@ KernelArtifact makeArtifact(KernelModel const &model, ShaderVariants const &shad
         auto resource = ResourceArtifact{};
         resource.name = image.name;
         resource.binding = image.binding;
-        resource.kind = tc::ResourceKind::StorageImage;
+        resource.kind = image.external ? tc::ResourceKind::ExternalImage : tc::ResourceKind::StorageImage;
         auto const used = image.usage.read or image.usage.written;
         resource.access = used ? accessOf(image.usage) : tc::Access::ReadOnly;
         resource.dim = image.dim;
@@ -71,6 +73,7 @@ KernelArtifact makeArtifact(KernelModel const &model, ShaderVariants const &shad
         resource.format = texture.format;
         resource.filter = texture.filter;
         resource.wrap = texture.wrap;
+        resource.mip = texture.mip;
         artifact.resources.push_back(resource);
     }
     for (auto const &texture : model.externalTextures) {
@@ -129,8 +132,15 @@ private:
         if (not body or not checkBufferLayouts(*model, context, diags)) {
             return;
         }
+        for (auto const &other : result.kernels) {
+            if (other.name == model->programName) {
+                diags.error(record->getLocation(), "program name '" + model->programName
+                                                       + "' is used by two kernels in this header");
+                return;
+            }
+        }
         auto const shaders = assembleShaders(*model, *body, sourceName);
-        result.kernels.push_back(makeArtifact(*model, shaders));
+        result.kernels.push_back(makeArtifact(*model, *body, shaders));
     }
 
     TranspileResult &result;

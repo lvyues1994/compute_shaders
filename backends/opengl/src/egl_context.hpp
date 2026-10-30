@@ -1,6 +1,7 @@
 #pragma once
 
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 
 #include <memory>
 #include <string>
@@ -10,6 +11,21 @@
 #include "gl_api.hpp"
 
 namespace tc::opengl {
+
+// EGL sync objects: fences any thread can wait on without a current
+// context (EGL_KHR_fence_sync), GPU-side waits (EGL_KHR_wait_sync) and
+// Android sync file descriptors (EGL_ANDROID_native_fence_sync).
+struct EglSyncApi {
+    PFNEGLCREATESYNCKHRPROC create = nullptr;
+    PFNEGLDESTROYSYNCKHRPROC destroy = nullptr;
+    PFNEGLCLIENTWAITSYNCKHRPROC clientWait = nullptr;
+    PFNEGLGETSYNCATTRIBKHRPROC getAttribute = nullptr;
+    PFNEGLWAITSYNCKHRPROC serverWait = nullptr;
+    PFNEGLDUPNATIVEFENCEFDANDROIDPROC dupNativeFence = nullptr;
+    bool fences = false;
+    bool serverWaits = false;
+    bool nativeFences = false;
+};
 
 // A headless EGL display + context made current on the creating thread,
 // together with the GL entry points loaded for it.
@@ -24,6 +40,7 @@ struct EglContext {
 
     void makeCurrent() const;
     EGLDisplay eglDisplay() const noexcept { return display; }
+    EglSyncApi const &sync() const noexcept { return syncApi; }
     GlApi const &api() const noexcept { return gl; }
     std::string const &renderer() const noexcept { return rendererName; }
 
@@ -34,6 +51,7 @@ private:
     EGLContext context = EGL_NO_CONTEXT;
     EGLSurface surface = EGL_NO_SURFACE;
     GlApi gl;
+    EglSyncApi syncApi;
     std::string rendererName;
 };
 

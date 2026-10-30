@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <clang/AST/APValue.h>
+#include <llvm/ADT/APSInt.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/RecordLayout.h>
@@ -92,6 +93,43 @@ std::string formatFloat(double const value, bool const isDouble) {
         text += ".0";
     }
     return isDouble ? text + "lf" : text;
+}
+
+// GLSL suffix of an integer literal of type `glslType`.
+std::string integerSuffix(std::string const &glslType) {
+    return glslType == "uint" ? "u" : glslType == "uint64_t" ? "ul" : glslType == "int64_t" ? "l" : "";
+}
+
+std::string integerLiteral(llvm::APSInt const &value, std::string const &glslType) {
+    auto const isUnsigned = glslType == "uint" or glslType == "uint64_t";
+    return (isUnsigned ? std::to_string(value.getZExtValue()) : std::to_string(value.getSExtValue()))
+         + integerSuffix(glslType);
+}
+
+// The GL_KHR_shader_subgroup_* extension of a subgroup built-in.
+std::uint32_t subgroupExtensionOf(llvm::StringRef const name) {
+    if (name.starts_with("gl_Subgroup") and name.ends_with("Mask")) {
+        return kSubgroupBallot;
+    }
+    if (name.starts_with("gl_")) {
+        return kSubgroupBasic;
+    }
+    if (name == "subgroupAll" or name == "subgroupAny" or name == "subgroupAllEqual") {
+        return kSubgroupVote;
+    }
+    if (name.starts_with("subgroupBallot") or name.starts_with("subgroupBroadcast") or name == "subgroupInverseBallot") {
+        return kSubgroupBallot;
+    }
+    if (name == "subgroupShuffle" or name == "subgroupShuffleXor") {
+        return kSubgroupShuffle;
+    }
+    if (name == "subgroupShuffleUp" or name == "subgroupShuffleDown") {
+        return kSubgroupShuffleRelative;
+    }
+    if (name == "subgroupBarrier" or name == "subgroupElect" or name.starts_with("subgroupMemoryBarrier")) {
+        return kSubgroupBasic;
+    }
+    return kSubgroupArithmetic;
 }
 
 bool isNonConstLValueRef(clang::QualType const type) {
@@ -247,6 +285,14 @@ private:
     void unsupported(clang::SourceLocation loc, std::string const &what) {
         diags.error(loc, what + " is not supported in GPU kernels");
     }
+    void useSubgroups(llvm::StringRef const name, clang::SourceLocation const loc) {
+        if (not kernel.usesSubgroups) {
+            diags.error(loc, "kernels that use subgroup operations must declare 'static constexpr bool usesSubgroups = "
+                             "true;' so the CPU backend runs their invocations together");
+        }
+        out.features |= static_cast<std::uint32_t>(tc::KernelFeature::Subgroups);
+        out.subgroupExtensions |= kSubgroupBasic | subgroupExtensionOf(name);
+    }
 
     KernelModel &kernel;
     clang::ASTContext &context;
@@ -292,12 +338,18 @@ std::string Writer::typeName(clang::QualType const original, clang::SourceLocati
             return "bool";
         case clang::BuiltinType::Int:
         case clang::BuiltinType::Long:
-        case clang::BuiltinType::LongLong:
             return "int";
         case clang::BuiltinType::UInt:
         case clang::BuiltinType::ULong:
-        case clang::BuiltinType::ULongLong:
             return "uint";
+        // tc::i64 and tc::u64: 64-bit on the GPU (std::int64_t is `long`,
+        // which, like std::size_t, stays 32-bit).
+        case clang::BuiltinType::LongLong:
+            out.features |= static_cast<std::uint32_t>(tc::KernelFeature::Int64);
+            return "int64_t";
+        case clang::BuiltinType::ULongLong:
+            out.features |= static_cast<std::uint32_t>(tc::KernelFeature::Int64);
+            return "uint64_t";
         case clang::BuiltinType::Float:
             return "float";
         case clang::BuiltinType::Double:
@@ -337,7 +389,7 @@ std::string Writer::typeName(clang::QualType const original, clang::SourceLocati
         return typeName(templateTypeArg(encoded, 0), loc); // only tables store the encoding
     }
     if (auto const *record = type->getAsCXXRecordDecl()) {
-        if (isTcDecl(record)) {
+        if (isTcDecl(record) and not isTcValueRecord(record)) {
             diags.error(loc, "'" + original.getAsString() + "' cannot be used as a value inside a kernel");
             return "int";
         }
@@ -426,7 +478,7 @@ std::string Writer::zeroValue(clang::QualType const original, clang::SourceLocat
         return "false";
     }
     if (type->isIntegerType() or type->isEnumeralType()) {
-        return typeName(type, loc) == "uint" ? "0u" : "0";
+        return "0" + integerSuffix(typeName(type, loc));
     }
     if (type->isRealFloatingType()) {
         return typeName(type, loc) == "double" ? "0.0lf" : "0.0";
@@ -478,7 +530,7 @@ std::string Writer::constantValue(clang::APValue const &value, clang::QualType c
     if (type->isIntegerType() or type->isEnumeralType()) {
         auto const name = typeName(type, loc);
         auto const &integer = value.getInt();
-        return name == "uint" ? std::to_string(integer.getZExtValue()) + "u" : std::to_string(integer.getSExtValue());
+        return integerLiteral(integer, name);
     }
     if (type->isRealFloatingType()) {
         auto const isDouble = typeName(type, loc) == "double";
@@ -1045,8 +1097,12 @@ std::string Writer::varDecl(clang::VarDecl const *var) {
     }
     auto const *typedefType = type->getAs<clang::TypedefType>();
     auto const isSizeType = typedefType != nullptr and typedefType->getDecl()->getName().contains("size_t");
-    if (bareType(type)->isIntegerType() and context.getTypeSize(bareType(type)) == 64 and not isSizeType) {
-        diags.warning(var->getLocation(), "64-bit integer '" + var->getName().str() + "' becomes 32-bit on the GPU");
+    auto const *builtin = bareType(type)->getAs<clang::BuiltinType>();
+    auto const isLong = builtin != nullptr
+                    and (builtin->getKind() == clang::BuiltinType::Long or builtin->getKind() == clang::BuiltinType::ULong);
+    if (isLong and context.getTypeSize(bareType(type)) == 64 and not isSizeType) {
+        diags.warning(var->getLocation(), "64-bit integer '" + var->getName().str()
+                                              + "' becomes 32-bit on the GPU; use tc::i64 or tc::u64 for 64 bits");
     }
     auto const isConstant = var->isConstexpr() or (type.isConstQualified() and var->getInit() != nullptr
                                                    and var->getInit()->isCXX11ConstantExpr(context));
@@ -1099,9 +1155,8 @@ std::string Writer::expr(clang::Expr const *e) {
     auto const inherited = std::exchange(role, Role::Read);
     auto const loc = e->getBeginLoc();
     if (auto const *literal = llvm::dyn_cast<clang::IntegerLiteral>(e)) {
-        auto const isUnsigned = typeName(literal->getType(), loc) == "uint";
-        auto const &value = literal->getValue();
-        return isUnsigned ? std::to_string(value.getZExtValue()) + "u" : std::to_string(value.getSExtValue());
+        return integerLiteral(llvm::APSInt{literal->getValue(), not literal->getType()->isSignedIntegerType()},
+                              typeName(literal->getType(), loc));
     }
     if (auto const *literal = llvm::dyn_cast<clang::FloatingLiteral>(e)) {
         auto const isDouble = typeName(literal->getType(), loc) == "double";
@@ -1327,6 +1382,9 @@ std::string Writer::declRef(clang::DeclRefExpr const *ref, Role const inherited)
             if (inherited != Role::Read) {
                 diags.error(loc, "'" + var->getName().str() + "' is a read-only GLSL input");
             }
+            if (var->getName().starts_with("gl_Subgroup") or var->getName() == "gl_NumSubgroups") {
+                useSubgroups(var->getName(), loc);
+            }
             return var->getName().str();
         }
         if (inherited != Role::Read) {
@@ -1335,9 +1393,7 @@ std::string Writer::declRef(clang::DeclRefExpr const *ref, Role const inherited)
         return requireGlobalConstant(var, loc);
     }
     if (auto const *enumerator = llvm::dyn_cast<clang::EnumConstantDecl>(decl)) {
-        auto const isUnsigned = typeName(ref->getType(), loc) == "uint";
-        auto const &value = enumerator->getInitVal();
-        return isUnsigned ? std::to_string(value.getZExtValue()) + "u" : std::to_string(value.getSExtValue());
+        return integerLiteral(enumerator->getInitVal(), typeName(ref->getType(), loc));
     }
     unsupported(loc, "reference to '" + decl->getNameAsString() + "'");
     return "0";
@@ -1414,7 +1470,7 @@ std::string Writer::member(clang::MemberExpr const *me, Role const inherited) {
     if (asTcSpecialization(field->getParent(), "detail::VecFields") != nullptr) {
         return object + "." + field->getName().str();
     }
-    if (isTcDecl(field->getParent())) {
+    if (isTcDecl(field->getParent()) and not isTcValueRecord(field->getParent())) {
         unsupported(loc, "access to '" + field->getName().str() + "'");
         return "0";
     }
@@ -1659,6 +1715,12 @@ std::string Writer::call(clang::CallExpr const *c) {
         } else if (name.starts_with("atomic") and c->getNumArgs() > 0 and not isAtomicTarget(c->getArg(0))) {
             diags.error(c->getArg(0)->getBeginLoc(),
                         name.str() + " needs a buffer element or a Shared variable as its first argument");
+        } else if (name.starts_with("subgroup")) {
+            useSubgroups(name, loc);
+        }
+        if (name.starts_with("atomic") and c->getNumArgs() > 0
+            and context.getTypeSize(bareType(c->getArg(0)->getType())) == 64) {
+            out.features |= static_cast<std::uint32_t>(tc::KernelFeature::Int64Atomics);
         }
         return glslNameOfTcFunction(name) + "(" + arguments(callee, args) + ")";
     }
@@ -1694,7 +1756,7 @@ std::string Writer::construct(clang::CXXConstructExpr const *ctor, Role const in
         return typeName(type, loc) + "(" + join(parts, ", ") + ")";
     }
     auto const *record = bareType(type)->getAsCXXRecordDecl();
-    if (ctor->getNumArgs() == 0 and record != nullptr and not isTcDecl(record)) {
+    if (ctor->getNumArgs() == 0 and record != nullptr and (not isTcDecl(record) or isTcValueRecord(record))) {
         return zeroValue(type, loc);
     }
     unsupported(loc, "constructing '" + type.getAsString() + "'");

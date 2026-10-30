@@ -3,12 +3,17 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
+
+#include <tc/detail/hazards.hpp>
 
 #include "vk_handles.hpp"
 
@@ -65,6 +70,9 @@ VkFormat vkFormatOf(ImageFormat const &format) {
         {"r32f", VK_FORMAT_R32_SFLOAT},
         {"rg32f", VK_FORMAT_R32G32_SFLOAT},
         {"rgba32f", VK_FORMAT_R32G32B32A32_SFLOAT},
+        {"r16f", VK_FORMAT_R16_SFLOAT},
+        {"rg16f", VK_FORMAT_R16G16_SFLOAT},
+        {"rgba16f", VK_FORMAT_R16G16B16A16_SFLOAT},
     };
     auto const qualifier = glslFormatQualifier(format);
     for (auto const &entry : table) {
@@ -73,6 +81,28 @@ VkFormat vkFormatOf(ImageFormat const &format) {
         }
     }
     throw DeviceError{"image format " + qualifier + " is not supported by the Vulkan backend"};
+}
+
+VkFormat vkCompressedFormat(CompressedFormat const format) {
+    switch (format) {
+    case CompressedFormat::Bc1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case CompressedFormat::Bc3: return VK_FORMAT_BC3_UNORM_BLOCK;
+    case CompressedFormat::Bc4: return VK_FORMAT_BC4_UNORM_BLOCK;
+    case CompressedFormat::Bc5: return VK_FORMAT_BC5_UNORM_BLOCK;
+    case CompressedFormat::Bc7: return VK_FORMAT_BC7_UNORM_BLOCK;
+    case CompressedFormat::Etc2Rgb8: return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+    case CompressedFormat::Etc2Rgb8A1: return VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK;
+    case CompressedFormat::Etc2Rgba8: return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+    case CompressedFormat::EacR11: return VK_FORMAT_EAC_R11_UNORM_BLOCK;
+    case CompressedFormat::EacRg11: return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+    case CompressedFormat::Astc4x4: return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    case CompressedFormat::Astc5x5: return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+    case CompressedFormat::Astc6x6: return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+    case CompressedFormat::Astc8x8: return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+    case CompressedFormat::Astc10x10: return VK_FORMAT_ASTC_10x10_UNORM_BLOCK;
+    case CompressedFormat::Astc12x12: return VK_FORMAT_ASTC_12x12_UNORM_BLOCK;
+    }
+    return VK_FORMAT_UNDEFINED;
 }
 
 int deviceTypeRank(VkPhysicalDeviceType const type) {
@@ -111,6 +141,11 @@ std::uint32_t timestampValidBits(VkPhysicalDevice const physical, std::uint32_t 
     return family < count ? families[family].timestampValidBits : 0;
 }
 
+// Every buffer may be a storage buffer, a transfer source or target, and
+// hold the arguments of an indirect dispatch.
+constexpr VkBufferUsageFlags kBufferUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                          | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+
 // Makes every earlier write on the queue visible to every later access.
 void fullBarrier(VkCommandBuffer const cmd) {
     auto barrier = vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
@@ -144,6 +179,15 @@ struct VulkanContext {
     InstanceOwner instance;
     std::uint32_t apiVersion = VK_API_VERSION_1_0;
     bool externalImages = false; // AHardwareBuffer import with sampler YCbCr conversion
+    bool float64 = false;
+    bool syncFdImport = false; // VK_KHR_external_semaphore_fd with sync files
+    bool syncFdExport = false;
+    bool int64 = false;
+    bool int64Atomics = false;
+    bool bc = false; // texture compression families enabled on the device
+    bool etc2 = false;
+    bool astc = false;
+    std::uint32_t subgroupSize = 0; // with every GL_KHR_shader_subgroup operation in compute shaders; else 0
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
@@ -174,17 +218,56 @@ struct ImageMirror {
     std::weak_ptr<void const> owner;
     DeviceObject<VkDeviceMemory> memory;
     DeviceObject<VkImage> image;
-    DeviceObject<VkImageView> view;
+    DeviceObject<VkImageView> view; // every level: sampled textures
+    std::map<std::uint32_t, DeviceObject<VkImageView>> levelViews; // one level: storage images
     ImageFormat format;
     Dim dim = Dim::D2;
     ivec3 extent{};
+    std::uint32_t levels = 1;
     VkImageUsageFlags usage = 0;
+    std::optional<CompressedFormat> compressed; // a block-compressed texture: `format` is unused
 };
+
+std::uint32_t layerCount(Dim const dim, ivec3 const extent) {
+    return dim == Dim::D2Array ? static_cast<std::uint32_t>(extent.z) : 1u;
+}
+
+// Texel extent of one level as Vulkan counts it: array layers are not depth.
+VkExtent3D levelExtent(Dim const dim, ivec3 const extent, std::uint32_t const level) {
+    auto const size = mipExtent(dim, extent, level);
+    return VkExtent3D{static_cast<std::uint32_t>(size.x), static_cast<std::uint32_t>(size.y),
+                      dim == Dim::D3 ? static_cast<std::uint32_t>(size.z) : 1u};
+}
+
+std::size_t levelBytes(ImageTransfer const &transfer, std::uint32_t const level) {
+    auto const size = mipExtent(transfer.dim, transfer.extent, level);
+    return static_cast<std::size_t>(size.x) * size.y * size.z * transfer.format.bytesPerTexel();
+}
+
+VkBufferImageCopy imageCopy(ImageTransfer const &transfer, std::uint32_t const level, VkDeviceSize const offset) {
+    auto region = VkBufferImageCopy{};
+    region.bufferOffset = offset;
+    region.imageSubresource =
+        VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, level, 0, layerCount(transfer.dim, transfer.extent)};
+    region.imageExtent = levelExtent(transfer.dim, transfer.extent, level);
+    return region;
+}
 
 struct BoundTexture {
     void const *key = nullptr;
     Filter filter = Filter::Nearest;
     Wrap wrap = Wrap::ClampToEdge;
+    Mip mip = Mip::None;
+};
+
+struct BoundImage {
+    void const *key = nullptr;
+    std::uint32_t level = 0;
+};
+
+struct BoundBuffer {
+    void const *key = nullptr;
+    std::optional<ByteRange> range;
 };
 
 // A platform frame imported into Vulkan. The memory import holds its own
@@ -197,6 +280,34 @@ struct ExternalMirror {
     DeviceObject<VkImageView> view;
     DeviceObject<VkSampler> sampler;
 };
+
+// A platform frame imported as a storage image.
+struct ExternalImageMirror {
+    std::weak_ptr<void const> owner;
+    DeviceObject<VkDeviceMemory> memory;
+    DeviceObject<VkImage> image;
+    DeviceObject<VkImageView> view;
+    bool acquired = false; // after the first use: in GENERAL layout
+};
+
+// Passes a storage frame between the foreign queue family (compositor,
+// camera, CPU) and ours in GENERAL layout, which keeps its contents. A
+// newly imported image starts from UNDEFINED.
+void transferForeignImage(VkCommandBuffer const cmd, VkImage const image, std::uint32_t const queueFamily,
+                          bool const acquire, VkImageLayout const oldLayout = VK_IMAGE_LAYOUT_GENERAL) {
+    auto barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+    barrier.srcAccessMask = acquire ? 0 : VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = acquire ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT : 0;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = acquire ? VK_QUEUE_FAMILY_FOREIGN_EXT : queueFamily;
+    barrier.dstQueueFamilyIndex = acquire ? queueFamily : VK_QUEUE_FAMILY_FOREIGN_EXT;
+    barrier.image = image;
+    barrier.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, acquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         acquire ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &barrier);
+}
 
 template <class H>
 std::uint64_t handleKey(H const handle) noexcept {
@@ -240,6 +351,7 @@ VkDescriptorType descriptorType(ResourceKind const kind) {
     case ResourceKind::StorageBuffer:
         return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     case ResourceKind::StorageImage:
+    case ResourceKind::ExternalImage:
         return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     case ResourceKind::SampledTexture:
     case ResourceKind::ExternalTexture:
@@ -254,6 +366,85 @@ struct PipelineObject {
     DeviceObject<VkDescriptorSetLayout> setLayout;
     DeviceObject<VkPipelineLayout> layout;
     DeviceObject<VkPipeline> pipeline;
+};
+
+// Host-visible memory for copies to and from device-local resources.
+struct StagingChunk {
+    DeviceObject<VkDeviceMemory> memory; // declared before the buffer: freed after it
+    DeviceObject<VkBuffer> buffer;
+    std::byte *mapped = nullptr;
+    VkDeviceSize capacity = 0;
+    VkDeviceSize used = 0;
+};
+
+// Staging bytes a command reads or writes.
+struct StagingSlice {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::byte *mapped = nullptr; // the host address of `offset`
+};
+
+// The fence of one submitted batch. It keeps the Vulkan device alive, so a
+// Submission may outlive the VulkanDevice. Fences are never reset, so any
+// thread may query or wait.
+struct FenceCompletion final : Submission::Completion {
+    FenceCompletion(std::shared_ptr<VulkanContext> context_, DeviceObject<VkFence> fence_) noexcept
+        : context(std::move(context_)), fence(std::move(fence_)) {}
+
+    bool isComplete() const override {
+        if (signaled.load(std::memory_order_acquire)) {
+            return true;
+        }
+        auto const status = vkGetFenceStatus(context->device.handle, fence.get());
+        if (status == VK_NOT_READY) {
+            return false;
+        }
+        check(status, "vkGetFenceStatus");
+        signaled.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void wait() const override {
+        if (signaled.load(std::memory_order_acquire)) {
+            return;
+        }
+        auto const handle = fence.get();
+        check(vkWaitForFences(context->device.handle, 1, &handle, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        signaled.store(true, std::memory_order_release);
+    }
+
+    std::shared_ptr<VulkanContext> context; // declared first: destroyed after the fence
+    DeviceObject<VkFence> fence;
+    mutable std::atomic<bool> signaled{false};
+};
+
+struct PendingTiming {
+    std::string program;
+    uvec3 workGroups{};
+    std::uint32_t firstQuery = 0; // start and end timestamps
+    bool indirect = false;
+};
+
+// Everything one command buffer of work uses on the device: reused once
+// the device has finished it, so the host records the next batch while the
+// device runs earlier ones.
+struct Batch {
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE; // from the device's command pool
+    std::vector<DeviceObject<VkDescriptorPool>> descriptorPools;
+    std::size_t descriptorPool = 0; // the pool new sets come from
+    std::vector<StagingChunk> staging;
+    DeviceObject<VkQueryPool> queryPool;
+    std::uint32_t queriesUsed = 0;
+    std::vector<PendingTiming> pendingTimings;
+    std::vector<DeviceObject<VkSemaphore>> semaphores; // waited on or signalled by the submission
+    std::uint64_t serial = 0;                    // submission order
+    std::shared_ptr<FenceCompletion> completion; // set while in flight
+};
+
+// A device object released while queued work may still use it.
+struct Grave {
+    std::uint64_t serial = 0; // destroyed once this batch has completed
+    std::shared_ptr<void> object;
 };
 
 struct VulkanDevice final : Device {
@@ -276,50 +467,99 @@ struct VulkanDevice final : Device {
         result.unifiedMemory =
             (memoryProperties.memoryTypes[memory].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
         result.timers = timestampBits > 0 and properties.limits.timestampPeriod > 0.0f;
+        result.syncFiles = context->syncFdImport and context->syncFdExport;
+        auto const &supported = properties.limits;
+        auto &limits = result.limits;
+        limits.storageBuffers = supported.maxPerStageDescriptorStorageBuffers;
+        limits.storageImages = supported.maxPerStageDescriptorStorageImages;
+        limits.sampledTextures = std::min(supported.maxPerStageDescriptorSampledImages, supported.maxPerStageDescriptorSamplers);
+        limits.storageBufferBytes = supported.maxStorageBufferRange;
+        limits.sharedBytes = supported.maxComputeSharedMemorySize;
+        limits.workGroupInvocations = supported.maxComputeWorkGroupInvocations;
+        limits.workGroupSize =
+            uvec3{supported.maxComputeWorkGroupSize[0], supported.maxComputeWorkGroupSize[1], supported.maxComputeWorkGroupSize[2]};
+        limits.workGroupCount = uvec3{supported.maxComputeWorkGroupCount[0], supported.maxComputeWorkGroupCount[1],
+                                      supported.maxComputeWorkGroupCount[2]};
+        limits.pushConstantBytes = supported.maxPushConstantsSize;
+        limits.storageBufferOffsetAlignment = static_cast<std::uint32_t>(supported.minStorageBufferOffsetAlignment);
+        limits.features = (context->float64 ? static_cast<std::uint32_t>(KernelFeature::Double) : 0u)
+                        | (context->subgroupSize != 0 ? static_cast<std::uint32_t>(KernelFeature::Subgroups) : 0u)
+                        | (context->int64 ? static_cast<std::uint32_t>(KernelFeature::Int64) : 0u)
+                        | (context->int64Atomics ? static_cast<std::uint32_t>(KernelFeature::Int64Atomics) : 0u);
+        limits.subgroupSize = context->subgroupSize;
+        for (std::uint32_t i = 0; i < kCompressedFormatCount; ++i) {
+            auto const format = static_cast<CompressedFormat>(i);
+            auto const family = i <= static_cast<std::uint32_t>(CompressedFormat::Bc7)      ? context->bc
+                              : i <= static_cast<std::uint32_t>(CompressedFormat::EacRg11) ? context->etc2
+                                                                                          : context->astc;
+            if (family and (formatFeatures(vkCompressedFormat(format)) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0) {
+                limits.compressedFormats |= compressedBit(format);
+            }
+        }
         return result;
     }
 
 protected:
     std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes) override;
-    void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes) override;
-    void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes) override;
+    void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes, ByteRange range) override;
+    void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes, ByteRange range) override;
+    std::optional<std::string> doCheckKernel(KernelProgram const &program) const override {
+        if (program.spirv.empty()) {
+            return "kernel '" + std::string{program.name} + "' has no SPIR-V";
+        }
+        return std::nullopt;
+    }
     void doUploadImage(ImageTransfer const &transfer) override;
+    void doUploadCompressed(CompressedTransfer const &transfer) override;
     void doDownloadImage(ImageTransfer const &transfer) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
     void doBindTexture(TextureBindRequest const &request) override;
     void doBindExternalTexture(ExternalTextureBindRequest const &request) override;
+#if defined(__ANDROID__)
+    void doBindExternalImage(ExternalImageBindRequest const &request) override;
+#endif
+    void doWaitFor(SyncFence fence) override;
+    SyncFence doSubmitWithFence() override;
     void doSetUniform(UniformWrite const &write) override;
     void doExecute(Dispatch const &dispatch) override;
+    Submission doSubmit() override { return submitBatch(); }
     void doFinish() override { flush(); }
     std::vector<KernelTiming> doTakeTimings() override { return std::exchange(timings, {}); }
 
 private:
-    struct PendingTiming {
-        std::string program;
-        uvec3 workGroups{};
-        std::uint32_t firstQuery = 0; // start and end timestamps
-    };
     static constexpr std::uint32_t kQueryCapacity = 256;
 
     VkFormatFeatureFlags formatFeatures(VkFormat format) const;
-    VkSampler samplerFor(Filter filter, Wrap wrap);
+    VkSampler samplerFor(Filter filter, Wrap wrap, Mip mip);
+    DeviceObject<VkImageView> createView(ImageMirror const &mirror, std::uint32_t first, std::uint32_t count) const;
+    VkImageView levelView(ImageMirror &mirror, std::uint32_t level);
     void createInstance(VulkanDeviceConfig const &config);
     void pickPhysicalDevice(VulkanDeviceConfig const &config);
     void createLogicalDevice();
     std::uint32_t memoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
     std::uint32_t sharedMemoryType() const;
     DeviceObject<VkDeviceMemory> allocate(VkMemoryRequirements const &requirements, VkMemoryPropertyFlags flags);
-    void ensureStaging(VkDeviceSize size);
-    // Commands are batched in one command buffer until flush() submits it and
-    // waits; recording() starts the batch on first use.
-    VkCommandBuffer recording();
+    // Commands go into the recording batch, begun on first use, until
+    // submitBatch() sends it; flush() also waits for every batch.
+    Batch &recordingBatch();
+    VkCommandBuffer recording() { return recordingBatch().commandBuffer; }
+    // The command buffer for a command with `accesses`, after a barrier when
+    // an earlier command conflicts with them.
+    VkCommandBuffer commandFor(std::vector<detail::ResourceAccess> const &accesses);
+    Submission submitBatch(DeviceObject<VkSemaphore> signal = {});
+    DeviceObject<VkSemaphore> makeSemaphore(bool exportable);
     void flush();
-    VkDeviceSize stagingSlice(VkDeviceSize size);
-    // Query indices of a start and an end timestamp in the current batch.
+    void retireCompleted();
+    template <class T>
+    void bury(T &&object);
+    StagingSlice stagingSlice(VkDeviceSize size);
+    StagingChunk makeStaging(VkDeviceSize capacity);
+    DeviceObject<VkDescriptorPool> makeDescriptorPool();
+    // Query indices of a start and an end timestamp in the recording batch.
     std::uint32_t reserveTimestamps(VkCommandBuffer cmd);
-    void readTimestamps();
+    void readTimestamps(Batch &batch);
     VkDescriptorSet allocateSet(VkDescriptorSetLayout layout);
     void collectGarbage();
     KernelProgram const &programFor(std::string_view name);
@@ -329,6 +569,7 @@ private:
     }
 #if defined(__ANDROID__)
     void importFrame(ExternalMirror &mirror, ExternalImage const &image);
+    void importStorageFrame(ExternalImageMirror &mirror, ExternalImage const &image, ImageFormat const &format);
 #endif
 
     // Declared first: the context (instance and device) is destroyed after
@@ -341,35 +582,35 @@ private:
     std::uint32_t &queueFamily = context->queueFamily;
     DeviceOwner &device = context->device;
     VkQueue &queue = context->queue;
-    DeviceObject<VkCommandPool> commandPool;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    bool isRecording = false;
-    DeviceObject<VkFence> fence;
-    DeviceObject<VkDescriptorPool> descriptorPool;
-    DeviceObject<VkDeviceMemory> stagingMemory;
-    DeviceObject<VkBuffer> staging;
-    std::byte *stagingMapped = nullptr;
-    VkDeviceSize stagingCapacity = 0;
-    VkDeviceSize stagingUsed = 0; // bytes handed out to the current batch
+    DeviceObject<VkCommandPool> commandPool; // declared before the batches: frees their command buffers after them
+    std::unique_ptr<Batch> recordingNow;     // recorded, not yet submitted
+    std::deque<std::unique_ptr<Batch>> inFlight; // submitted, oldest first
+    std::vector<std::unique_ptr<Batch>> idleBatches;
+    std::uint64_t nextSerial = 1;
+    std::uint64_t completedSerial = 0; // every batch up to this one has completed
+    std::vector<Grave> graveyard;
+    detail::HazardTracker hazards;
+    std::vector<DeviceObject<VkSemaphore>> pendingWaits; // for the next submission
+    PFN_vkGetSemaphoreFdKHR getSemaphoreFd = nullptr;
+    PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
     std::unordered_map<void const *, BufferMirror> buffers;
     std::unordered_map<void const *, ImageMirror> images;
     std::unordered_map<void const *, ExternalMirror> externals;
+    std::unordered_map<void const *, ExternalImageMirror> externalImages;
     std::unordered_map<std::string, KernelProgram> programs;
     std::unordered_map<std::string, PipelineObject> pipelines;
-    std::map<std::pair<Filter, Wrap>, DeviceObject<VkSampler>> samplers;
+    std::map<std::tuple<Filter, Wrap, Mip>, DeviceObject<VkSampler>> samplers;
 
     KernelProgram const *current = nullptr;
-    std::map<std::uint32_t, void const *> boundBuffers;
-    std::map<std::uint32_t, void const *> boundImages;
+    std::map<std::uint32_t, BoundBuffer> boundBuffers;
+    std::map<std::uint32_t, BoundImage> boundImages;
     std::map<std::uint32_t, BoundTexture> boundTextures;
     std::map<std::uint32_t, void const *> boundExternals;
+    std::map<std::uint32_t, void const *> boundExternalImages;
     std::map<std::uint32_t, bool> uniformsSet;
     std::array<std::byte, 256> pushConstants{};
 
     std::uint32_t timestampBits = 0; // of the compute queue family; 0: no timestamps
-    DeviceObject<VkQueryPool> queryPool;
-    std::uint32_t queriesUsed = 0; // by the current batch
-    std::vector<PendingTiming> pendingTimings;
     std::vector<KernelTiming> timings;
 };
 
@@ -384,28 +625,6 @@ VulkanDevice::VulkanDevice(VulkanDeviceConfig const &config) {
     auto pool = VkCommandPool{};
     check(vkCreateCommandPool(device.handle, &poolInfo, nullptr, &pool), "vkCreateCommandPool");
     commandPool = DeviceObject<VkCommandPool>{device.handle, pool, vkDestroyCommandPool};
-
-    auto allocInfo = vkStruct<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
-    allocInfo.commandPool = pool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    check(vkAllocateCommandBuffers(device.handle, &allocInfo, &commandBuffer), "vkAllocateCommandBuffers");
-
-    auto fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
-    auto rawFence = VkFence{};
-    check(vkCreateFence(device.handle, &fenceInfo, nullptr, &rawFence), "vkCreateFence");
-    fence = DeviceObject<VkFence>{device.handle, rawFence, vkDestroyFence};
-
-    VkDescriptorPoolSize const sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512},
-                                          {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512},
-                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512}};
-    auto descriptorInfo = vkStruct<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
-    descriptorInfo.maxSets = 128;
-    descriptorInfo.poolSizeCount = 3;
-    descriptorInfo.pPoolSizes = sizes;
-    auto rawPool = VkDescriptorPool{};
-    check(vkCreateDescriptorPool(device.handle, &descriptorInfo, nullptr, &rawPool), "vkCreateDescriptorPool");
-    descriptorPool = DeviceObject<VkDescriptorPool>{device.handle, rawPool, vkDestroyDescriptorPool};
 }
 
 void VulkanDevice::createInstance(VulkanDeviceConfig const &config) {
@@ -481,6 +700,15 @@ void VulkanDevice::createLogicalDevice() {
     vkGetPhysicalDeviceFeatures(physical, &supported);
     auto features = VkPhysicalDeviceFeatures{};
     features.shaderFloat64 = supported.shaderFloat64;
+    context->float64 = supported.shaderFloat64 == VK_TRUE;
+    features.shaderInt64 = supported.shaderInt64;
+    context->int64 = supported.shaderInt64 == VK_TRUE;
+    features.textureCompressionBC = supported.textureCompressionBC;
+    features.textureCompressionETC2 = supported.textureCompressionETC2;
+    features.textureCompressionASTC_LDR = supported.textureCompressionASTC_LDR;
+    context->bc = supported.textureCompressionBC == VK_TRUE;
+    context->etc2 = supported.textureCompressionETC2 == VK_TRUE;
+    context->astc = supported.textureCompressionASTC_LDR == VK_TRUE;
     features.shaderStorageImageExtendedFormats = supported.shaderStorageImageExtendedFormats;
 
     auto const priority = 1.0f;
@@ -494,6 +722,40 @@ void VulkanDevice::createLogicalDevice() {
         extensions.push_back("VK_KHR_portability_subset");
     }
     auto info = vkStruct<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+    auto const vulkan11 = context->apiVersion >= VK_API_VERSION_1_1 and properties.apiVersion >= VK_API_VERSION_1_1;
+    // Subgroup operations need Vulkan 1.1 (SPIR-V 1.3) and every operation
+    // class tc exposes, in compute shaders.
+    if (vulkan11) {
+        auto subgroups = vkStruct<VkPhysicalDeviceSubgroupProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES);
+        auto properties2 = vkStruct<VkPhysicalDeviceProperties2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
+        properties2.pNext = &subgroups;
+        vkGetPhysicalDeviceProperties2(physical, &properties2);
+        auto constexpr needed = VkSubgroupFeatureFlags{
+            VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
+            | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT};
+        if ((subgroups.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0
+            and (subgroups.supportedOperations & needed) == needed) {
+            context->subgroupSize = subgroups.subgroupSize;
+        }
+    }
+    // 64-bit atomics on buffer elements (core in Vulkan 1.2, an extension
+    // for the 1.1 API tc asks for).
+    auto atomicInt64 =
+        vkStruct<VkPhysicalDeviceShaderAtomicInt64Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES);
+    void *chain = nullptr;
+    if (vulkan11 and context->int64 and hasDeviceExtension(physical, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
+        auto features2 = vkStruct<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+        features2.pNext = &atomicInt64;
+        vkGetPhysicalDeviceFeatures2(physical, &features2);
+        if (atomicInt64.shaderBufferInt64Atomics == VK_TRUE) {
+            atomicInt64.shaderSharedInt64Atomics = VK_FALSE;
+            atomicInt64.pNext = nullptr;
+            chain = &atomicInt64;
+            extensions.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+            context->int64Atomics = true;
+        }
+    }
+    info.pNext = chain;
 #if defined(__ANDROID__)
     auto ycbcr = vkStruct<VkPhysicalDeviceSamplerYcbcrConversionFeatures>(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES);
@@ -508,12 +770,28 @@ void VulkanDevice::createLogicalDevice() {
         if (ycbcr.samplerYcbcrConversion == VK_TRUE) {
             extensions.push_back(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
             extensions.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
-            ycbcr.pNext = nullptr;
+            ycbcr.pNext = chain;
             info.pNext = &ycbcr;
             context->externalImages = true;
         }
     }
 #endif
+    // Sync files: waits on fences of other APIs and processes, and fences
+    // for them (Vulkan 1.1 external semaphores).
+    if (context->apiVersion >= VK_API_VERSION_1_1 and properties.apiVersion >= VK_API_VERSION_1_1
+        and hasDeviceExtension(physical, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
+        auto semaphoreInfo =
+            vkStruct<VkPhysicalDeviceExternalSemaphoreInfo>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO);
+        semaphoreInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        auto semaphoreProperties = vkStruct<VkExternalSemaphoreProperties>(VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES);
+        vkGetPhysicalDeviceExternalSemaphoreProperties(physical, &semaphoreInfo, &semaphoreProperties);
+        auto const features = semaphoreProperties.externalSemaphoreFeatures;
+        context->syncFdImport = (features & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+        context->syncFdExport = (features & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
+        if (context->syncFdImport or context->syncFdExport) {
+            extensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+        }
+    }
     info.queueCreateInfoCount = 1;
     info.pQueueCreateInfos = &queueInfo;
     info.pEnabledFeatures = &features;
@@ -521,6 +799,13 @@ void VulkanDevice::createLogicalDevice() {
     info.ppEnabledExtensionNames = extensions.data();
     check(vkCreateDevice(physical, &info, nullptr, &device.handle), "vkCreateDevice");
     vkGetDeviceQueue(device.handle, queueFamily, 0, &queue);
+    if (context->syncFdImport or context->syncFdExport) {
+        getSemaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device.handle, "vkGetSemaphoreFdKHR"));
+        importSemaphoreFd =
+            reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(vkGetDeviceProcAddr(device.handle, "vkImportSemaphoreFdKHR"));
+        context->syncFdImport = context->syncFdImport and importSemaphoreFd != nullptr;
+        context->syncFdExport = context->syncFdExport and getSemaphoreFd != nullptr;
+    }
 }
 
 std::uint32_t VulkanDevice::memoryType(std::uint32_t const typeBits, VkMemoryPropertyFlags const required) const {
@@ -587,7 +872,7 @@ std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity co
     allocation->context = context;
     auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     info.size = bytes;
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.usage = kBufferUsage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     auto buffer = VkBuffer{};
     check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
@@ -619,140 +904,311 @@ std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity co
     return ExternalMemory{allocation->mapped, bytes, allocation};
 }
 
-void VulkanDevice::ensureStaging(VkDeviceSize const size) {
-    if (stagingCapacity >= size) {
-        return;
-    }
-    auto const capacity = std::max<VkDeviceSize>(size, 1u << 20);
-    staging = DeviceObject<VkBuffer>{};
-    stagingMemory = DeviceObject<VkDeviceMemory>{};
+StagingChunk VulkanDevice::makeStaging(VkDeviceSize const capacity) {
+    auto chunk = StagingChunk{};
     auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     info.size = capacity;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     auto buffer = VkBuffer{};
     check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
-    staging = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
+    chunk.buffer = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
     auto requirements = VkMemoryRequirements{};
     vkGetBufferMemoryRequirements(device.handle, buffer, &requirements);
-    stagingMemory = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    check(vkBindBufferMemory(device.handle, buffer, stagingMemory.get(), 0), "vkBindBufferMemory");
+    chunk.memory = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    check(vkBindBufferMemory(device.handle, buffer, chunk.memory.get(), 0), "vkBindBufferMemory");
     void *mapped = nullptr;
-    check(vkMapMemory(device.handle, stagingMemory.get(), 0, capacity, 0, &mapped), "vkMapMemory");
-    stagingMapped = static_cast<std::byte *>(mapped);
-    stagingCapacity = capacity;
+    check(vkMapMemory(device.handle, chunk.memory.get(), 0, capacity, 0, &mapped), "vkMapMemory");
+    chunk.mapped = static_cast<std::byte *>(mapped);
+    chunk.capacity = capacity;
+    return chunk;
 }
 
-// The batch's command buffer, begun on first use. Every command is preceded
-// by a full barrier, so it waits for and sees all earlier commands.
-VkCommandBuffer VulkanDevice::recording() {
-    if (not isRecording) {
-        check(vkResetCommandBuffer(commandBuffer, 0), "vkResetCommandBuffer");
-        auto begin = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        check(vkBeginCommandBuffer(commandBuffer, &begin), "vkBeginCommandBuffer");
-        isRecording = true;
+DeviceObject<VkDescriptorPool> VulkanDevice::makeDescriptorPool() {
+    VkDescriptorPoolSize const sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512},
+                                          {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512},
+                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512}};
+    auto info = vkStruct<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
+    info.maxSets = 128;
+    info.poolSizeCount = 3;
+    info.pPoolSizes = sizes;
+    auto pool = VkDescriptorPool{};
+    check(vkCreateDescriptorPool(device.handle, &info, nullptr, &pool), "vkCreateDescriptorPool");
+    return DeviceObject<VkDescriptorPool>{device.handle, pool, vkDestroyDescriptorPool};
+}
+
+Batch &VulkanDevice::recordingBatch() {
+    if (recordingNow != nullptr) {
+        return *recordingNow;
     }
-    fullBarrier(commandBuffer);
-    return commandBuffer;
+    retireCompleted();
+    if (idleBatches.empty()) {
+        auto batch = std::make_unique<Batch>();
+        auto info = vkStruct<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
+        info.commandPool = commandPool.get();
+        info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        info.commandBufferCount = 1;
+        check(vkAllocateCommandBuffers(device.handle, &info, &batch->commandBuffer), "vkAllocateCommandBuffers");
+        idleBatches.push_back(std::move(batch));
+    }
+    recordingNow = std::move(idleBatches.back());
+    idleBatches.pop_back();
+    recordingNow->serial = nextSerial++;
+    check(vkResetCommandBuffer(recordingNow->commandBuffer, 0), "vkResetCommandBuffer");
+    auto begin = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(recordingNow->commandBuffer, &begin), "vkBeginCommandBuffer");
+    return *recordingNow;
+}
+
+VkCommandBuffer VulkanDevice::commandFor(std::vector<detail::ResourceAccess> const &accesses) {
+    auto const cmd = recording();
+    if (hazards.needsBarrier(accesses)) {
+        fullBarrier(cmd);
+    }
+    return cmd;
+}
+
+// Sends the recording batch with a fence of its own. The hazard tracker
+// carries over: a barrier in a later batch also orders earlier batches.
+Submission VulkanDevice::submitBatch(DeviceObject<VkSemaphore> signal) {
+    auto const signalHandle = signal.get();
+    if (recordingNow == nullptr) {
+        if (pendingWaits.empty() and signalHandle == VK_NULL_HANDLE) {
+            return inFlight.empty() ? Submission{} : Submission{inFlight.back()->completion};
+        }
+        recordingBatch(); // an empty batch carries the semaphores
+    }
+    auto &batch = *recordingNow;
+    hostVisibleBarrier(batch.commandBuffer);
+    check(vkEndCommandBuffer(batch.commandBuffer), "vkEndCommandBuffer");
+    auto fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
+    auto rawFence = VkFence{};
+    check(vkCreateFence(device.handle, &fenceInfo, nullptr, &rawFence), "vkCreateFence");
+    auto fence = DeviceObject<VkFence>{device.handle, rawFence, vkDestroyFence};
+    auto waits = std::vector<VkSemaphore>{};
+    for (auto const &semaphore : pendingWaits) {
+        waits.push_back(semaphore.get());
+    }
+    auto const stages = std::vector<VkPipelineStageFlags>(waits.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    auto info = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+    info.waitSemaphoreCount = static_cast<std::uint32_t>(waits.size());
+    info.pWaitSemaphores = waits.data();
+    info.pWaitDstStageMask = stages.data();
+    info.commandBufferCount = 1;
+    info.pCommandBuffers = &batch.commandBuffer;
+    info.signalSemaphoreCount = signalHandle != VK_NULL_HANDLE ? 1 : 0;
+    info.pSignalSemaphores = &signalHandle;
+    check(vkQueueSubmit(queue, 1, &info, rawFence), "vkQueueSubmit");
+    for (auto &semaphore : pendingWaits) {
+        batch.semaphores.push_back(std::move(semaphore));
+    }
+    pendingWaits.clear();
+    if (signalHandle != VK_NULL_HANDLE) {
+        batch.semaphores.push_back(std::move(signal));
+    }
+    batch.completion = std::make_shared<FenceCompletion>(context, std::move(fence));
+    auto submission = Submission{batch.completion};
+    inFlight.push_back(std::move(recordingNow));
+    return submission;
 }
 
 void VulkanDevice::flush() {
-    if (not isRecording) {
+    submitBatch();
+    for (auto const &batch : inFlight) {
+        batch->completion->wait();
+    }
+    retireCompleted();
+}
+
+// Recycles the batches the device has finished, in order, and destroys what
+// only they still used.
+void VulkanDevice::retireCompleted() {
+    while (not inFlight.empty() and inFlight.front()->completion->isComplete()) {
+        auto &batch = *inFlight.front();
+        readTimestamps(batch);
+        for (auto &pool : batch.descriptorPools) {
+            check(vkResetDescriptorPool(device.handle, pool.get(), 0), "vkResetDescriptorPool");
+        }
+        batch.descriptorPool = 0;
+        for (auto &chunk : batch.staging) {
+            chunk.used = 0;
+        }
+        batch.semaphores.clear();
+        completedSerial = batch.serial;
+        batch.completion.reset();
+        idleBatches.push_back(std::move(inFlight.front()));
+        inFlight.pop_front();
+    }
+    auto const done = std::remove_if(graveyard.begin(), graveyard.end(),
+                                     [&](Grave const &grave) { return grave.serial <= completedSerial; });
+    graveyard.erase(done, graveyard.end());
+}
+
+// Keeps `object` until every batch that may use it has completed.
+template <class T>
+void VulkanDevice::bury(T &&object) {
+    auto const serial = recordingNow != nullptr ? recordingNow->serial : nextSerial - 1;
+    if (serial > completedSerial) {
+        graveyard.push_back(Grave{serial, std::make_shared<std::decay_t<T>>(std::forward<T>(object))});
+    }
+}
+
+DeviceObject<VkSemaphore> VulkanDevice::makeSemaphore(bool const exportable) {
+    auto exportInfo = vkStruct<VkExportSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO);
+    exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    auto info = vkStruct<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
+    info.pNext = exportable ? &exportInfo : nullptr;
+    auto semaphore = VkSemaphore{};
+    check(vkCreateSemaphore(device.handle, &info, nullptr, &semaphore), "vkCreateSemaphore");
+    return DeviceObject<VkSemaphore>{device.handle, semaphore, vkDestroySemaphore};
+}
+
+// The queue waits for the sync file before the next submission; work
+// queued before this call is submitted first, so it does not wait.
+void VulkanDevice::doWaitFor(SyncFence fence) {
+    if (fence.empty()) {
         return;
     }
-    isRecording = false;
-    hostVisibleBarrier(commandBuffer);
-    check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
-    auto info = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
-    info.commandBufferCount = 1;
-    info.pCommandBuffers = &commandBuffer;
-    auto const rawFence = fence.get();
-    check(vkQueueSubmit(queue, 1, &info, rawFence), "vkQueueSubmit");
-    check(vkWaitForFences(device.handle, 1, &rawFence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-    check(vkResetFences(device.handle, 1, &rawFence), "vkResetFences");
-    stagingUsed = 0;
-    check(vkResetDescriptorPool(device.handle, descriptorPool.get(), 0), "vkResetDescriptorPool");
-    readTimestamps();
-    collectGarbage();
+    if (not context->syncFdImport) {
+        fence.wait();
+        return;
+    }
+    submitBatch();
+    auto semaphore = makeSemaphore(false);
+    auto import = vkStruct<VkImportSemaphoreFdInfoKHR>(VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR);
+    import.semaphore = semaphore.get();
+    import.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+    import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    import.fd = fence.get();
+    if (importSemaphoreFd(device.handle, &import) != VK_SUCCESS) {
+        fence.wait();
+        return;
+    }
+    fence.release(); // Vulkan owns the descriptor now
+    pendingWaits.push_back(std::move(semaphore));
+}
+
+SyncFence VulkanDevice::doSubmitWithFence() {
+    if (not context->syncFdExport) {
+        flush();
+        return SyncFence{};
+    }
+    auto semaphore = makeSemaphore(true);
+    auto const handle = semaphore.get();
+    submitBatch(std::move(semaphore));
+    auto info = vkStruct<VkSemaphoreGetFdInfoKHR>(VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR);
+    info.semaphore = handle;
+    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    auto fd = -1;
+    check(getSemaphoreFd(device.handle, &info, &fd), "vkGetSemaphoreFdKHR");
+    return SyncFence{fd}; // -1 when the work has already finished
 }
 
 std::uint32_t VulkanDevice::reserveTimestamps(VkCommandBuffer const cmd) {
-    if (queryPool.get() == VK_NULL_HANDLE) {
+    auto &batch = recordingBatch();
+    if (batch.queryPool.get() == VK_NULL_HANDLE) {
         auto info = vkStruct<VkQueryPoolCreateInfo>(VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO);
         info.queryType = VK_QUERY_TYPE_TIMESTAMP;
         info.queryCount = kQueryCapacity;
         auto pool = VkQueryPool{};
         check(vkCreateQueryPool(device.handle, &info, nullptr, &pool), "vkCreateQueryPool");
-        queryPool = DeviceObject<VkQueryPool>{device.handle, pool, vkDestroyQueryPool};
+        batch.queryPool = DeviceObject<VkQueryPool>{device.handle, pool, vkDestroyQueryPool};
     }
-    if (queriesUsed == 0) {
-        vkCmdResetQueryPool(cmd, queryPool.get(), 0, kQueryCapacity);
+    if (batch.queriesUsed == 0) {
+        vkCmdResetQueryPool(cmd, batch.queryPool.get(), 0, kQueryCapacity);
     }
-    auto const first = queriesUsed;
-    queriesUsed += 2;
+    auto const first = batch.queriesUsed;
+    batch.queriesUsed += 2;
     return first;
 }
 
-// Converts the timestamps of the batch that just completed.
-void VulkanDevice::readTimestamps() {
-    if (queriesUsed == 0) {
+// Converts the timestamps of a batch that has completed.
+void VulkanDevice::readTimestamps(Batch &batch) {
+    if (batch.queriesUsed == 0) {
         return;
     }
-    auto ticks = std::vector<std::uint64_t>(queriesUsed);
-    check(vkGetQueryPoolResults(device.handle, queryPool.get(), 0, queriesUsed, ticks.size() * sizeof(std::uint64_t),
-                                ticks.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+    auto ticks = std::vector<std::uint64_t>(batch.queriesUsed);
+    check(vkGetQueryPoolResults(device.handle, batch.queryPool.get(), 0, batch.queriesUsed,
+                                ticks.size() * sizeof(std::uint64_t), ticks.data(), sizeof(std::uint64_t),
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
           "vkGetQueryPoolResults");
     auto const mask = timestampBits >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << timestampBits) - 1;
     auto const nanosecondsPerTick = static_cast<double>(properties.limits.timestampPeriod);
-    for (auto &pending : pendingTimings) {
+    for (auto &pending : batch.pendingTimings) {
         auto const elapsed = (ticks[pending.firstQuery + 1] - ticks[pending.firstQuery]) & mask;
         timings.push_back(KernelTiming{std::move(pending.program), pending.workGroups,
-                                       static_cast<double>(elapsed) * nanosecondsPerTick * 1e-6});
+                                       static_cast<double>(elapsed) * nanosecondsPerTick * 1e-6, pending.indirect});
     }
-    pendingTimings.clear();
-    queriesUsed = 0;
+    batch.pendingTimings.clear();
+    batch.queriesUsed = 0;
 }
 
-// Offset of `size` staging bytes no other command of this batch uses.
-VkDeviceSize VulkanDevice::stagingSlice(VkDeviceSize const size) {
-    auto const offset = (stagingUsed + 15) / 16 * 16;
-    if (offset + size <= stagingCapacity) {
-        stagingUsed = offset + size;
-        return offset;
+// `size` staging bytes no other command of the recording batch uses.
+StagingSlice VulkanDevice::stagingSlice(VkDeviceSize const size) {
+    auto &batch = recordingBatch();
+    for (auto &chunk : batch.staging) {
+        auto const offset = (chunk.used + 15) / 16 * 16;
+        if (offset + size <= chunk.capacity) {
+            chunk.used = offset + size;
+            return StagingSlice{chunk.buffer.get(), offset, chunk.mapped + offset};
+        }
     }
-    flush();
-    ensureStaging(size);
-    stagingUsed = size;
-    return 0;
+    auto const previous = batch.staging.empty() ? VkDeviceSize{0} : batch.staging.back().capacity;
+    batch.staging.push_back(makeStaging(std::max({size, VkDeviceSize{1} << 20, 2 * previous})));
+    auto &chunk = batch.staging.back();
+    chunk.used = size;
+    return StagingSlice{chunk.buffer.get(), 0, chunk.mapped};
 }
 
 VkDescriptorSet VulkanDevice::allocateSet(VkDescriptorSetLayout const layout) {
-    auto info = vkStruct<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
-    info.descriptorPool = descriptorPool.get();
-    info.descriptorSetCount = 1;
-    info.pSetLayouts = &layout;
-    auto set = VkDescriptorSet{};
-    auto const result = vkAllocateDescriptorSets(device.handle, &info, &set);
-    if (result == VK_ERROR_OUT_OF_POOL_MEMORY or result == VK_ERROR_FRAGMENTED_POOL) {
-        flush(); // resets the pool
-        check(vkAllocateDescriptorSets(device.handle, &info, &set), "vkAllocateDescriptorSets");
-    } else {
+    auto &batch = recordingBatch();
+    for (;;) {
+        if (batch.descriptorPool == batch.descriptorPools.size()) {
+            batch.descriptorPools.push_back(makeDescriptorPool());
+        }
+        auto info = vkStruct<VkDescriptorSetAllocateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
+        info.descriptorPool = batch.descriptorPools[batch.descriptorPool].get();
+        info.descriptorSetCount = 1;
+        info.pSetLayouts = &layout;
+        auto set = VkDescriptorSet{};
+        auto const result = vkAllocateDescriptorSets(device.handle, &info, &set);
+        if (result == VK_ERROR_OUT_OF_POOL_MEMORY or result == VK_ERROR_FRAGMENTED_POOL) {
+            ++batch.descriptorPool;
+            continue;
+        }
         check(result, "vkAllocateDescriptorSets");
+        return set;
     }
-    return set;
 }
 
-// Releases mirrors of destroyed host resources; only safe with no queued work.
+// Releases mirrors of destroyed host resources once queued work is done
+// with them.
 void VulkanDevice::collectGarbage() {
-    if (isRecording) {
-        return;
-    }
+    retireCompleted();
     for (auto it = buffers.begin(); it != buffers.end();) {
-        it = it->second.owner.expired() ? buffers.erase(it) : std::next(it);
+        if (it->second.owner.expired()) {
+            bury(std::move(it->second));
+            it = buffers.erase(it);
+        } else {
+            ++it;
+        }
     }
     for (auto it = images.begin(); it != images.end();) {
-        it = it->second.owner.expired() ? images.erase(it) : std::next(it);
+        if (it->second.owner.expired()) {
+            bury(std::move(it->second));
+            it = images.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = externalImages.begin(); it != externalImages.end();) {
+        if (it->second.owner.expired()) {
+            bury(std::move(it->second));
+            it = externalImages.erase(it);
+        } else {
+            ++it;
+        }
     }
     for (auto it = externals.begin(); it != externals.end();) {
         if (not it->second.owner.expired()) {
@@ -762,13 +1218,19 @@ void VulkanDevice::collectGarbage() {
         // Pipelines bake the frame's sampler into their layout; drop them too.
         auto const token = "|" + std::to_string(handleKey(it->second.sampler.get()));
         for (auto pipeline = pipelines.begin(); pipeline != pipelines.end();) {
-            pipeline = pipeline->first.find(token) != std::string::npos ? pipelines.erase(pipeline) : std::next(pipeline);
+            if (pipeline->first.find(token) != std::string::npos) {
+                bury(std::move(pipeline->second));
+                pipeline = pipelines.erase(pipeline);
+            } else {
+                ++pipeline;
+            }
         }
+        bury(std::move(it->second));
         it = externals.erase(it);
     }
 }
 
-void VulkanDevice::doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan const bytes) {
+void VulkanDevice::doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan const bytes, ByteRange range) {
     if (bytes.empty()) {
         throw DeviceError{"uploadBuffer: Vulkan buffers cannot be empty"};
     }
@@ -778,15 +1240,15 @@ void VulkanDevice::doUploadBuffer(ResourceIdentity const &identity, ConstByteSpa
         return; // createBuffer() memory: the device reads it in place
     }
     if (mirror.size != bytes.size()) {
+        range = ByteRange{0, bytes.size()}; // a new device buffer starts with the whole contents
         if (mirror.size != 0) {
-            flush(); // queued commands may still use the old buffer
+            bury(std::move(mirror)); // queued commands may still use the old buffer
         }
         mirror = BufferMirror{};
         mirror.owner = identity.watch();
         auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
         info.size = bytes.size();
-        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                   | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.usage = kBufferUsage;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         auto buffer = VkBuffer{};
         check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
@@ -797,13 +1259,17 @@ void VulkanDevice::doUploadBuffer(ResourceIdentity const &identity, ConstByteSpa
         check(vkBindBufferMemory(device.handle, buffer, mirror.memory.get(), 0), "vkBindBufferMemory");
         mirror.size = bytes.size();
     }
-    auto const offset = stagingSlice(bytes.size());
-    std::memcpy(stagingMapped + offset, bytes.data(), bytes.size());
-    auto const region = VkBufferCopy{offset, 0, bytes.size()};
-    vkCmdCopyBuffer(recording(), staging.get(), mirror.handle(), 1, &region);
+    if (range.size == 0) {
+        return;
+    }
+    auto const slice = stagingSlice(range.size);
+    std::memcpy(slice.mapped, bytes.data() + range.offset, range.size);
+    auto const region = VkBufferCopy{slice.offset, range.offset, range.size};
+    auto const cmd = commandFor({detail::ResourceAccess{identity.key(), range.offset, range.size, false, true}});
+    vkCmdCopyBuffer(cmd, slice.buffer, mirror.handle(), 1, &region);
 }
 
-void VulkanDevice::doDownloadBuffer(ResourceIdentity const &identity, ByteSpan const bytes) {
+void VulkanDevice::doDownloadBuffer(ResourceIdentity const &identity, ByteSpan const bytes, ByteRange const range) {
     auto const it = buffers.find(identity.key());
     if (it == buffers.end() or it->second.size != bytes.size()) {
         throw DeviceError{"downloadBuffer: the buffer was never uploaded to this device (or changed size)"};
@@ -812,13 +1278,16 @@ void VulkanDevice::doDownloadBuffer(ResourceIdentity const &identity, ByteSpan c
         flush(); // createBuffer() memory: GPU writes are visible once the batch completes
         return;
     }
-    auto const offset = stagingSlice(bytes.size());
-    auto const region = VkBufferCopy{0, offset, bytes.size()};
-    auto const cmd = recording();
-    vkCmdCopyBuffer(cmd, it->second.handle(), staging.get(), 1, &region);
+    if (range.size == 0) {
+        return;
+    }
+    auto const slice = stagingSlice(range.size);
+    auto const region = VkBufferCopy{range.offset, slice.offset, range.size};
+    auto const cmd = commandFor({detail::ResourceAccess{identity.key(), range.offset, range.size, true, false}});
+    vkCmdCopyBuffer(cmd, it->second.handle(), slice.buffer, 1, &region);
     hostReadBarrier(cmd);
-    flush();
-    std::memcpy(bytes.data(), stagingMapped + offset, bytes.size());
+    flush(); // the slice keeps its bytes until the next batch is recorded
+    std::memcpy(bytes.data() + range.offset, slice.mapped, range.size);
 }
 
 void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
@@ -826,7 +1295,8 @@ void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
     auto const format = vkFormatOf(transfer.format);
     auto &mirror = images[transfer.identity->key()];
     auto const isNew = mirror.image.get() == VK_NULL_HANDLE or not(mirror.format == transfer.format)
-                    or not(mirror.extent == transfer.extent);
+                    or not(mirror.extent == transfer.extent) or mirror.levels != transfer.levels;
+    auto const layers = layerCount(transfer.dim, transfer.extent);
     if (isNew) {
         // The same image may be written as a storage image and read as a
         // sampled texture later, so request every usage the format supports.
@@ -843,7 +1313,7 @@ void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
                               + " can be neither stored nor sampled on " + properties.deviceName};
         }
         if (mirror.image.get() != VK_NULL_HANDLE) {
-            flush(); // queued commands may still use the old image
+            bury(std::move(mirror)); // queued commands may still use the old image
         }
         mirror = ImageMirror{};
         mirror.usage = usage;
@@ -851,14 +1321,13 @@ void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
         mirror.format = transfer.format;
         mirror.dim = transfer.dim;
         mirror.extent = transfer.extent;
+        mirror.levels = transfer.levels;
         auto info = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
         info.imageType = transfer.dim == Dim::D3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         info.format = format;
-        info.extent = VkExtent3D{static_cast<std::uint32_t>(transfer.extent.x),
-                                 static_cast<std::uint32_t>(transfer.extent.y),
-                                 static_cast<std::uint32_t>(transfer.extent.z)};
-        info.mipLevels = 1;
-        info.arrayLayers = 1;
+        info.extent = levelExtent(transfer.dim, transfer.extent, 0);
+        info.mipLevels = transfer.levels;
+        info.arrayLayers = layers;
         info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.tiling = VK_IMAGE_TILING_OPTIMAL;
         info.usage = usage;
@@ -871,21 +1340,25 @@ void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
         vkGetImageMemoryRequirements(device.handle, image, &requirements);
         mirror.memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         check(vkBindImageMemory(device.handle, image, mirror.memory.get(), 0), "vkBindImageMemory");
-        auto viewInfo = vkStruct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
-        viewInfo.image = image;
-        viewInfo.viewType = transfer.dim == Dim::D3 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = format;
-        viewInfo.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        auto view = VkImageView{};
-        check(vkCreateImageView(device.handle, &viewInfo, nullptr, &view), "vkCreateImageView");
-        mirror.view = DeviceObject<VkImageView>{device.handle, view, vkDestroyImageView};
+        mirror.view = createView(mirror, 0, transfer.levels);
     }
-    auto const texelCount = static_cast<std::size_t>(transfer.extent.x) * transfer.extent.y * transfer.extent.z;
-    auto const size = texelCount * transfer.format.bytesPerTexel();
-    auto const offset = stagingSlice(size);
-    transfer.writeTexels(ByteSpan{stagingMapped + offset, size});
+    auto const first = isNew ? 0u : transfer.firstLevel; // a new image starts with every level
+    auto const count = isNew ? transfer.levels : transfer.levelCount;
+    auto offsets = std::vector<VkDeviceSize>{};
+    auto total = VkDeviceSize{0};
+    for (auto level = first; level < first + count; ++level) {
+        offsets.push_back(total);
+        total += (levelBytes(transfer, level) + 15) / 16 * 16;
+    }
+    auto const slice = stagingSlice(total);
+    auto regions = std::vector<VkBufferImageCopy>{};
+    for (auto level = first; level < first + count; ++level) {
+        auto const offset = offsets[level - first];
+        transfer.writeTexels(level, ByteSpan{slice.mapped + offset, levelBytes(transfer, level)});
+        regions.push_back(imageCopy(transfer, level, slice.offset + offset));
+    }
     auto const image = mirror.image.get();
-    auto const cmd = recording();
+    auto const cmd = commandFor({detail::ResourceAccess{transfer.identity->key(), 0, 0, false, true}});
     if (isNew) {
         auto barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
         barrier.srcAccessMask = 0;
@@ -895,46 +1368,166 @@ void VulkanDevice::doUploadImage(ImageTransfer const &transfer) {
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image;
-        barrier.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, transfer.levels, 0, layers};
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                              nullptr, 1, &barrier);
     }
-    auto region = VkBufferImageCopy{};
-    region.bufferOffset = offset;
-    region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(transfer.extent.x),
-                                    static_cast<std::uint32_t>(transfer.extent.y),
-                                    static_cast<std::uint32_t>(transfer.extent.z)};
-    vkCmdCopyBufferToImage(cmd, staging.get(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    vkCmdCopyBufferToImage(cmd, slice.buffer, image, VK_IMAGE_LAYOUT_GENERAL,
+                           static_cast<std::uint32_t>(regions.size()), regions.data());
+}
+
+void VulkanDevice::doUploadCompressed(CompressedTransfer const &transfer) {
+    collectGarbage();
+    if ((info().limits.compressedFormats & compressedBit(transfer.format)) == 0) {
+        throw DeviceError{std::string{"uploadImage: "} + properties.deviceName + " does not sample "
+                          + compressedFormatInfo(transfer.format).name + " textures"};
+    }
+    auto const format = vkCompressedFormat(transfer.format);
+    auto const extent3 = ivec3{transfer.extent, 1};
+    auto &mirror = images[transfer.identity->key()];
+    auto const isNew = mirror.image.get() == VK_NULL_HANDLE or mirror.compressed != transfer.format
+                    or not(mirror.extent == extent3) or mirror.levels != transfer.levels;
+    if (isNew) {
+        if (mirror.image.get() != VK_NULL_HANDLE) {
+            bury(std::move(mirror));
+        }
+        mirror = ImageMirror{};
+        mirror.owner = transfer.identity->watch();
+        mirror.compressed = transfer.format;
+        mirror.dim = Dim::D2;
+        mirror.extent = extent3;
+        mirror.levels = transfer.levels;
+        mirror.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        auto info = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = format;
+        info.extent = VkExtent3D{static_cast<std::uint32_t>(transfer.extent.x), static_cast<std::uint32_t>(transfer.extent.y), 1};
+        info.mipLevels = transfer.levels;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = mirror.usage;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        auto image = VkImage{};
+        check(vkCreateImage(device.handle, &info, nullptr, &image), "vkCreateImage");
+        mirror.image = DeviceObject<VkImage>{device.handle, image, vkDestroyImage};
+        auto requirements = VkMemoryRequirements{};
+        vkGetImageMemoryRequirements(device.handle, image, &requirements);
+        mirror.memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkBindImageMemory(device.handle, image, mirror.memory.get(), 0), "vkBindImageMemory");
+        mirror.view = createView(mirror, 0, transfer.levels);
+    }
+    auto total = VkDeviceSize{0};
+    for (std::uint32_t level = 0; level < transfer.levels; ++level) {
+        total += (transfer.image->blocks(level).size() + 15) / 16 * 16;
+    }
+    auto const slice = stagingSlice(total);
+    auto regions = std::vector<VkBufferImageCopy>{};
+    auto offset = VkDeviceSize{0};
+    for (std::uint32_t level = 0; level < transfer.levels; ++level) {
+        auto const &blocks = transfer.image->blocks(level);
+        std::memcpy(slice.mapped + offset, blocks.data(), blocks.size());
+        auto const size = transfer.image->extent(level);
+        auto region = VkBufferImageCopy{};
+        region.bufferOffset = slice.offset + offset;
+        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(size.x), static_cast<std::uint32_t>(size.y), 1};
+        regions.push_back(region);
+        offset += (blocks.size() + 15) / 16 * 16;
+    }
+    auto const cmd = commandFor({detail::ResourceAccess{transfer.identity->key(), 0, 0, false, true}});
+    if (isNew) {
+        auto barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = mirror.image.get();
+        barrier.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, transfer.levels, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &barrier);
+    }
+    vkCmdCopyBufferToImage(cmd, slice.buffer, mirror.image.get(), VK_IMAGE_LAYOUT_GENERAL,
+                           static_cast<std::uint32_t>(regions.size()), regions.data());
 }
 
 void VulkanDevice::doDownloadImage(ImageTransfer const &transfer) {
     auto const it = images.find(transfer.identity->key());
-    if (it == images.end() or not(it->second.format == transfer.format) or not(it->second.extent == transfer.extent)) {
+    if (it == images.end() or not(it->second.format == transfer.format) or not(it->second.extent == transfer.extent)
+        or it->second.levels != transfer.levels) {
         throw DeviceError{"downloadImage: the image was never uploaded to this device"};
     }
-    auto const texelCount = static_cast<std::size_t>(transfer.extent.x) * transfer.extent.y * transfer.extent.z;
-    auto const size = texelCount * transfer.format.bytesPerTexel();
-    auto const offset = stagingSlice(size);
-    auto region = VkBufferImageCopy{};
-    region.bufferOffset = offset;
-    region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(transfer.extent.x),
-                                    static_cast<std::uint32_t>(transfer.extent.y),
-                                    static_cast<std::uint32_t>(transfer.extent.z)};
-    auto const cmd = recording();
-    vkCmdCopyImageToBuffer(cmd, it->second.image.get(), VK_IMAGE_LAYOUT_GENERAL, staging.get(), 1, &region);
+    auto offsets = std::vector<VkDeviceSize>{};
+    auto total = VkDeviceSize{0};
+    auto const last = transfer.firstLevel + transfer.levelCount;
+    for (auto level = transfer.firstLevel; level < last; ++level) {
+        offsets.push_back(total);
+        total += (levelBytes(transfer, level) + 15) / 16 * 16;
+    }
+    auto const slice = stagingSlice(total);
+    auto regions = std::vector<VkBufferImageCopy>{};
+    for (auto level = transfer.firstLevel; level < last; ++level) {
+        regions.push_back(imageCopy(transfer, level, slice.offset + offsets[level - transfer.firstLevel]));
+    }
+    auto const cmd = commandFor({detail::ResourceAccess{transfer.identity->key(), 0, 0, true, false}});
+    vkCmdCopyImageToBuffer(cmd, it->second.image.get(), VK_IMAGE_LAYOUT_GENERAL, slice.buffer,
+                           static_cast<std::uint32_t>(regions.size()), regions.data());
     hostReadBarrier(cmd);
-    flush();
-    transfer.readTexels(ConstByteSpan{stagingMapped + offset, size});
+    flush(); // the slice keeps its bytes until the next batch is recorded
+    for (auto level = transfer.firstLevel; level < last; ++level) {
+        auto const offset = offsets[level - transfer.firstLevel];
+        transfer.readTexels(level, ConstByteSpan{slice.mapped + offset, levelBytes(transfer, level)});
+    }
+}
+
+// A view of levels [first, first + count) and every layer.
+DeviceObject<VkImageView> VulkanDevice::createView(ImageMirror const &mirror, std::uint32_t const first,
+                                                   std::uint32_t const count) const {
+    auto viewInfo = vkStruct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+    viewInfo.image = mirror.image.get();
+    viewInfo.viewType = mirror.dim == Dim::D3        ? VK_IMAGE_VIEW_TYPE_3D
+                      : mirror.dim == Dim::D2Array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                                   : VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = mirror.compressed ? vkCompressedFormat(*mirror.compressed) : vkFormatOf(mirror.format);
+    viewInfo.subresourceRange =
+        VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, first, count, 0, layerCount(mirror.dim, mirror.extent)};
+    auto view = VkImageView{};
+    check(vkCreateImageView(device.handle, &viewInfo, nullptr, &view), "vkCreateImageView");
+    return DeviceObject<VkImageView>{device.handle, view, vkDestroyImageView};
+}
+
+// What storage image bindings of mip level `level` use.
+VkImageView VulkanDevice::levelView(ImageMirror &mirror, std::uint32_t const level) {
+    if (mirror.levels == 1) {
+        return mirror.view.get();
+    }
+    auto &view = mirror.levelViews[level];
+    if (view.get() == VK_NULL_HANDLE) {
+        view = createView(mirror, level, 1);
+    }
+    return view.get();
 }
 
 KernelProgram const &VulkanDevice::programFor(std::string_view const name) {
     auto const key = std::string{name};
-    if (auto const it = programs.find(key); it != programs.end()) {
-        return it->second;
-    }
     auto const reflection = ProgramRegistry::instance().find(name);
+    if (auto const it = programs.find(key); it != programs.end()) {
+        if (not reflection or it->second.revision == reflection->revision) {
+            return it->second;
+        }
+        // Reloaded from disk: queued work may still run the old pipelines.
+        for (auto pipeline = pipelines.begin(); pipeline != pipelines.end();) {
+            if (pipeline->first == key or pipeline->first.rfind(key + "|", 0) == 0) {
+                bury(std::move(pipeline->second));
+                pipeline = pipelines.erase(pipeline);
+            } else {
+                ++pipeline;
+            }
+        }
+        programs.erase(it);
+    }
     if (not reflection) {
         throw DeviceError{"kernel '" + key + "' was not transpiled; add its header with tc_add_kernels()"};
     }
@@ -1010,6 +1603,9 @@ PipelineObject &VulkanDevice::pipelineFor(KernelProgram const &program, std::vec
 
 void VulkanDevice::doUseKernel(KernelUse const &use) {
     auto const &program = programFor(use.programName);
+    if (auto const reason = exceedsLimits(program, info().limits)) {
+        throw DeviceError{*reason};
+    }
     auto const &size = program.localSize;
     if (not(size == use.localSize)) {
         throw DeviceError{"kernel '" + std::string{use.programName}
@@ -1026,20 +1622,34 @@ void VulkanDevice::doUseKernel(KernelUse const &use) {
     boundImages.clear();
     boundTextures.clear();
     boundExternals.clear();
+    boundExternalImages.clear();
     uniformsSet.clear();
 }
 
 void VulkanDevice::doBindBuffer(BufferBindRequest const &request) {
-    if (buffers.count(request.identity->key()) == 0) {
+    auto const it = buffers.find(request.identity->key());
+    if (it == buffers.end()) {
         throw DeviceError{"bindBuffer: binding " + std::to_string(request.binding)
                           + " refers to a buffer that was never uploaded"};
     }
-    boundBuffers[request.binding] = request.identity->key();
+    if (request.range) {
+        auto const alignment = properties.limits.minStorageBufferOffsetAlignment;
+        if (request.range->offset % alignment != 0) {
+            throw DeviceError{"bindBuffer: binding " + std::to_string(request.binding) + " starts at byte "
+                              + std::to_string(request.range->offset) + ", not a multiple of " + std::to_string(alignment)
+                              + " (DeviceLimits::storageBufferOffsetAlignment)"};
+        }
+        if (request.range->offset + request.range->size > it->second.size) {
+            throw DeviceError{"bindBuffer: binding " + std::to_string(request.binding)
+                              + " extends past the device buffer"};
+        }
+    }
+    boundBuffers[request.binding] = BoundBuffer{request.identity->key(), request.range};
 }
 
 void VulkanDevice::doBindImage(ImageBindRequest const &request) {
     auto const it = images.find(request.identity->key());
-    if (it == images.end() or not(it->second.format == request.format)) {
+    if (it == images.end() or not(it->second.format == request.format) or request.level >= it->second.levels) {
         throw DeviceError{"bindImage: binding " + std::to_string(request.binding)
                           + " refers to an image that was never uploaded"};
     }
@@ -1047,12 +1657,15 @@ void VulkanDevice::doBindImage(ImageBindRequest const &request) {
         throw DeviceError{"bindImage: format " + glslFormatQualifier(request.format)
                           + " cannot be a storage image on " + properties.deviceName + "; read it as a texture"};
     }
-    boundImages[request.binding] = request.identity->key();
+    boundImages[request.binding] = BoundImage{request.identity->key(), request.level};
 }
 
 void VulkanDevice::doBindTexture(TextureBindRequest const &request) {
     auto const it = images.find(request.identity->key());
-    if (it == images.end() or not(it->second.format == request.format)) {
+    auto const matches = it != images.end()
+                     and (request.compressed ? it->second.compressed == request.compressed
+                                             : not it->second.compressed and it->second.format == request.format);
+    if (not matches) {
         throw DeviceError{"bindTexture: binding " + std::to_string(request.binding)
                           + " refers to a texture that was never uploaded"};
     }
@@ -1060,12 +1673,13 @@ void VulkanDevice::doBindTexture(TextureBindRequest const &request) {
         throw DeviceError{"bindTexture: format " + glslFormatQualifier(request.format) + " cannot be sampled on "
                           + properties.deviceName};
     }
-    auto const linearOk = (formatFeatures(vkFormatOf(request.format)) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
-    if (request.filter == Filter::Linear and not linearOk) {
+    auto const vkFormat = request.compressed ? vkCompressedFormat(*request.compressed) : vkFormatOf(request.format);
+    auto const linearOk = (formatFeatures(vkFormat) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    if ((request.filter == Filter::Linear or request.mip == Mip::Linear) and not linearOk) {
         throw DeviceError{"bindTexture: format " + glslFormatQualifier(request.format)
                           + " cannot be filtered linearly on " + properties.deviceName};
     }
-    boundTextures[request.binding] = BoundTexture{request.identity->key(), request.filter, request.wrap};
+    boundTextures[request.binding] = BoundTexture{request.identity->key(), request.filter, request.wrap, request.mip};
 }
 
 void VulkanDevice::doBindExternalTexture(ExternalTextureBindRequest const &request) {
@@ -1190,6 +1804,108 @@ void VulkanDevice::importFrame(ExternalMirror &mirror, ExternalImage const &imag
     check(vkCreateSampler(device.handle, &samplerInfo, nullptr, &sampler), "vkCreateSampler (hardware buffer)");
     mirror.sampler = DeviceObject<VkSampler>{device.handle, sampler, vkDestroySampler};
 }
+
+void VulkanDevice::doBindExternalImage(ExternalImageBindRequest const &request) {
+    if (not context->externalImages) {
+        throw DeviceError{"bindExternalImage: " + std::string{properties.deviceName}
+                          + " cannot import hardware buffers (needs Vulkan 1.1 and "
+                            "VK_ANDROID_external_memory_android_hardware_buffer)"};
+    }
+    collectGarbage();
+    auto const &identity = request.image->identity();
+    auto &mirror = externalImages[identity.key()];
+    if (mirror.image.get() == VK_NULL_HANDLE) {
+        mirror.owner = identity.watch();
+        importStorageFrame(mirror, *request.image, request.format);
+    }
+    boundExternalImages[request.binding] = identity.key();
+}
+
+// Imports an RGBA AHardwareBuffer as a storage image, if the driver says it
+// can write that buffer's memory that way.
+void VulkanDevice::importStorageFrame(ExternalImageMirror &mirror, ExternalImage const &image,
+                                      ImageFormat const &format) {
+    auto *const buffer = image.hardwareBuffer();
+    auto const vkFormat = vkFormatOf(format);
+    auto const usage = VkImageUsageFlags{VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+    auto externalInfo =
+        vkStruct<VkPhysicalDeviceExternalImageFormatInfo>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+    externalInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    auto formatInfo = vkStruct<VkPhysicalDeviceImageFormatInfo2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2);
+    formatInfo.pNext = &externalInfo;
+    formatInfo.format = vkFormat;
+    formatInfo.type = VK_IMAGE_TYPE_2D;
+    formatInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    formatInfo.usage = usage;
+    auto externalProperties = vkStruct<VkExternalImageFormatProperties>(VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+    auto formatProperties = vkStruct<VkImageFormatProperties2>(VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2);
+    formatProperties.pNext = &externalProperties;
+    auto const supported = vkGetPhysicalDeviceImageFormatProperties2(physical, &formatInfo, &formatProperties);
+    if (supported != VK_SUCCESS
+        or (externalProperties.externalMemoryProperties.externalMemoryFeatures
+            & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)
+               == 0) {
+        throw DeviceError{"bindExternalImage: " + std::string{properties.deviceName} + " cannot write "
+                          + glslFormatQualifier(format) + " hardware buffers as storage images"};
+    }
+
+    auto const getProperties = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+        vkGetDeviceProcAddr(device.handle, "vkGetAndroidHardwareBufferPropertiesANDROID"));
+    auto bufferFormat = vkStruct<VkAndroidHardwareBufferFormatPropertiesANDROID>(
+        VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID);
+    auto bufferProperties =
+        vkStruct<VkAndroidHardwareBufferPropertiesANDROID>(VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID);
+    bufferProperties.pNext = &bufferFormat;
+    check(getProperties(device.handle, buffer, &bufferProperties), "vkGetAndroidHardwareBufferPropertiesANDROID");
+    if (bufferFormat.format != vkFormat) {
+        throw DeviceError{"bindExternalImage: the hardware buffer's Vulkan format does not match "
+                          + glslFormatQualifier(format)};
+    }
+
+    auto desc = AHardwareBuffer_Desc{};
+    AHardwareBuffer_describe(buffer, &desc);
+    auto externalMemory = vkStruct<VkExternalMemoryImageCreateInfo>(VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+    externalMemory.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    auto imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+    imageInfo.pNext = &externalMemory;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = vkFormat;
+    imageInfo.extent = VkExtent3D{desc.width, desc.height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = usage;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    auto rawImage = VkImage{};
+    check(vkCreateImage(device.handle, &imageInfo, nullptr, &rawImage), "vkCreateImage (hardware buffer)");
+    mirror.image = DeviceObject<VkImage>{device.handle, rawImage, vkDestroyImage};
+
+    auto dedicated = vkStruct<VkMemoryDedicatedAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    dedicated.image = rawImage;
+    auto import = vkStruct<VkImportAndroidHardwareBufferInfoANDROID>(
+        VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID);
+    import.pNext = &dedicated;
+    import.buffer = buffer;
+    auto allocateInfo = vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+    allocateInfo.pNext = &import;
+    allocateInfo.allocationSize = bufferProperties.allocationSize;
+    allocateInfo.memoryTypeIndex = memoryType(bufferProperties.memoryTypeBits, 0);
+    auto memory = VkDeviceMemory{};
+    check(vkAllocateMemory(device.handle, &allocateInfo, nullptr, &memory), "vkAllocateMemory (hardware buffer)");
+    mirror.memory = DeviceObject<VkDeviceMemory>{device.handle, memory, vkFreeMemory};
+    check(vkBindImageMemory(device.handle, rawImage, memory, 0), "vkBindImageMemory (hardware buffer)");
+
+    auto viewInfo = vkStruct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
+    viewInfo.image = rawImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = vkFormat;
+    viewInfo.subresourceRange = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    auto view = VkImageView{};
+    check(vkCreateImageView(device.handle, &viewInfo, nullptr, &view), "vkCreateImageView (hardware buffer)");
+    mirror.view = DeviceObject<VkImageView>{device.handle, view, vkDestroyImageView};
+}
 #endif
 
 VkFormatFeatureFlags VulkanDevice::formatFeatures(VkFormat const format) const {
@@ -1198,18 +1914,18 @@ VkFormatFeatureFlags VulkanDevice::formatFeatures(VkFormat const format) const {
     return formatProperties.optimalTilingFeatures;
 }
 
-VkSampler VulkanDevice::samplerFor(Filter const filter, Wrap const wrap) {
-    auto const key = std::make_pair(filter, wrap);
+VkSampler VulkanDevice::samplerFor(Filter const filter, Wrap const wrap, Mip const mip) {
+    auto const key = std::make_tuple(filter, wrap, mip);
     auto it = samplers.find(key);
     if (it == samplers.end()) {
         auto info = vkStruct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
         info.magFilter = filter == Filter::Linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         info.minFilter = info.magFilter;
-        info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        info.mipmapMode = mip == Mip::Linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         info.addressModeU = addressMode(wrap);
         info.addressModeV = addressMode(wrap);
         info.addressModeW = addressMode(wrap);
-        info.maxLod = 0.0f;
+        info.maxLod = mip == Mip::None ? 0.0f : VK_LOD_CLAMP_NONE;
         auto sampler = VkSampler{};
         check(vkCreateSampler(device.handle, &info, nullptr, &sampler), "vkCreateSampler");
         it = samplers.emplace(key, DeviceObject<VkSampler>{device.handle, sampler, vkDestroySampler}).first;
@@ -1238,13 +1954,21 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
     }
     auto const &reflection = *current;
     auto const &limits = properties.limits;
-    for (int axis = 0; axis < 3; ++axis) {
+    for (int axis = 0; axis < 3 and not dispatch.indirect; ++axis) {
         if (dispatch.workGroups[axis] > limits.maxComputeWorkGroupCount[axis]) {
             throw DeviceError{"workgroup count exceeds the device limit"};
         }
     }
-    if (timersEnabled() and queriesUsed + 2 > kQueryCapacity) {
-        flush(); // before allocating the descriptor set: flush() resets the pool
+    auto indirectBuffer = VkBuffer{VK_NULL_HANDLE};
+    if (dispatch.indirect) {
+        auto const it = buffers.find(dispatch.indirect->identity->key());
+        if (it == buffers.end() or it->second.size < dispatch.indirect->offset + sizeof(DispatchIndirectCommand)) {
+            throw DeviceError{"executeIndirect: the argument buffer was never uploaded to this device"};
+        }
+        indirectBuffer = it->second.handle();
+    }
+    if (timersEnabled() and recordingBatch().queriesUsed + 2 > kQueryCapacity) {
+        submitBatch(); // before allocating the descriptor set, which belongs to the batch
     }
     for (auto const &slot : reflection.uniforms) {
         if (uniformsSet.count(slot.location) == 0) {
@@ -1274,6 +1998,20 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
     bufferInfos.reserve(reflection.resources.size());
     imageInfos.reserve(reflection.resources.size());
     auto writes = std::vector<VkWriteDescriptorSet>{};
+    auto accesses = std::vector<detail::ResourceAccess>{};
+    auto const access = [&](void const *const key, std::optional<ByteRange> const &range, Access const how) {
+        accesses.push_back(detail::ResourceAccess{key, range ? range->offset : 0, range ? range->size : 0,
+                                                  how != Access::WriteOnly, how != Access::ReadOnly});
+    };
+    if (dispatch.indirect) {
+        access(dispatch.indirect->identity->key(), ByteRange{dispatch.indirect->offset, sizeof(DispatchIndirectCommand)},
+               Access::ReadOnly);
+    }
+    struct StorageFrame {
+        VkImage image = VK_NULL_HANDLE;
+        bool wasAcquired = false;
+    };
+    auto storageFrames = std::vector<StorageFrame>{};
     for (auto const &slot : reflection.resources) {
         auto const name = std::string{slot.name} + "' (binding " + std::to_string(slot.binding) + ")";
         auto write = vkStruct<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
@@ -1285,7 +2023,11 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
             if (bound == boundBuffers.end()) {
                 throw DeviceError{"execute: buffer '" + name + " is not bound"};
             }
-            bufferInfos.push_back(VkDescriptorBufferInfo{buffers.at(bound->second).handle(), 0, VK_WHOLE_SIZE});
+            auto const &range = bound->second.range;
+            bufferInfos.push_back(VkDescriptorBufferInfo{buffers.at(bound->second.key).handle(),
+                                                         range ? range->offset : 0,
+                                                         range ? range->size : VK_WHOLE_SIZE});
+            access(bound->second.key, range, slot.access);
             write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             write.pBufferInfo = &bufferInfos.back();
         } else if (slot.kind == ResourceKind::SampledTexture) {
@@ -1294,14 +2036,28 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
                 throw DeviceError{"execute: texture '" + name + " is not bound"};
             }
             auto const &texture = bound->second;
-            imageInfos.push_back(VkDescriptorImageInfo{samplerFor(texture.filter, texture.wrap),
+            imageInfos.push_back(VkDescriptorImageInfo{samplerFor(texture.filter, texture.wrap, texture.mip),
                                                        images.at(texture.key).view.get(), VK_IMAGE_LAYOUT_GENERAL});
+            access(texture.key, std::nullopt, Access::ReadOnly);
             write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             write.pImageInfo = &imageInfos.back();
+        } else if (slot.kind == ResourceKind::ExternalImage) {
+            auto const bound = boundExternalImages.find(slot.binding);
+            if (bound == boundExternalImages.end()) {
+                throw DeviceError{"execute: external image '" + name + " is not bound"};
+            }
+            auto &frame = externalImages.at(bound->second);
+            imageInfos.push_back(VkDescriptorImageInfo{VK_NULL_HANDLE, frame.view.get(), VK_IMAGE_LAYOUT_GENERAL});
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            write.pImageInfo = &imageInfos.back();
+            storageFrames.push_back({frame.image.get(), frame.acquired});
+            frame.acquired = true;
+            access(bound->second, std::nullopt, slot.access);
         } else if (slot.kind == ResourceKind::ExternalTexture) {
             auto const &frame = externals.at(boundExternals.at(slot.binding));
             imageInfos.push_back(VkDescriptorImageInfo{frame.sampler.get(), frame.view.get(),
                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+            access(boundExternals.at(slot.binding), std::nullopt, Access::ReadOnly);
             write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             write.pImageInfo = &imageInfos.back();
         } else {
@@ -1309,8 +2065,9 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
             if (bound == boundImages.end()) {
                 throw DeviceError{"execute: image '" + name + " is not bound"};
             }
-            imageInfos.push_back(
-                VkDescriptorImageInfo{VK_NULL_HANDLE, images.at(bound->second).view.get(), VK_IMAGE_LAYOUT_GENERAL});
+            imageInfos.push_back(VkDescriptorImageInfo{VK_NULL_HANDLE, levelView(images.at(bound->second.key), bound->second.level),
+                                                       VK_IMAGE_LAYOUT_GENERAL});
+            access(bound->second.key, std::nullopt, slot.access);
             write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             write.pImageInfo = &imageInfos.back();
         }
@@ -1320,8 +2077,21 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
 
     auto const layout = pipeline.layout.get();
     auto const cmd = recording();
+    if (timersEnabled()) {
+        // Timed dispatches run one at a time, so each pair of timestamps
+        // brackets only its own dispatch.
+        fullBarrier(cmd);
+        hazards.barrierRecorded();
+    }
+    if (hazards.needsBarrier(accesses)) {
+        fullBarrier(cmd);
+    }
     for (auto const image : frames) {
         acquireForeignFrame(cmd, image);
+    }
+    for (auto const &frame : storageFrames) {
+        transferForeignImage(cmd, frame.image, queueFamily, true,
+                             frame.wasAcquired ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline.get());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
@@ -1329,17 +2099,34 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, reflection.pushConstantSize,
                            pushConstants.data());
     }
+    auto const record = [&] {
+        if (dispatch.indirect) {
+            vkCmdDispatchIndirect(cmd, indirectBuffer, dispatch.indirect->offset);
+        } else {
+            vkCmdDispatch(cmd, dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
+        }
+    };
+    auto const releaseFrames = [&] {
+        for (auto const &frame : storageFrames) {
+            transferForeignImage(cmd, frame.image, queueFamily, false);
+        }
+    };
     if (not timersEnabled()) {
-        vkCmdDispatch(cmd, dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
+        record();
+        releaseFrames();
         return;
     }
     // Bottom-of-pipe for both: each is written once every earlier command
     // has completed, so the pair brackets exactly this dispatch.
+    auto &batch = recordingBatch();
     auto const first = reserveTimestamps(cmd);
-    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool.get(), first);
-    vkCmdDispatch(cmd, dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
-    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool.get(), first + 1);
-    pendingTimings.push_back(PendingTiming{std::string{dispatch.programName}, dispatch.workGroups, first});
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, batch.queryPool.get(), first);
+    record();
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, batch.queryPool.get(), first + 1);
+    releaseFrames();
+    batch.pendingTimings.push_back(PendingTiming{std::string{dispatch.programName},
+                                                 dispatch.indirect ? uvec3{} : dispatch.workGroups, first,
+                                                 dispatch.indirect.has_value()});
 }
 
 } // namespace

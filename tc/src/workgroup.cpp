@@ -1,5 +1,8 @@
 #include <tc/workgroup.hpp>
 
+#include <tc/subgroup.hpp>
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -31,10 +34,45 @@ constexpr char kNotCooperative[] =
 constexpr char kDiverged[] =
     "barrier() was not reached by every invocation of a workgroup (some returned or branched around it); "
     "on a GPU this hangs or corrupts shared memory";
+constexpr char kNotSubgroupKernel[] =
+    "a subgroup operation was called by a kernel that does not declare `static constexpr bool usesSubgroups = true`";
+constexpr char kSubgroupDiverged[] =
+    "the active invocations of a subgroup reached different subgroup operations (or a barrier); the CPU backend "
+    "supports subgroup operations only in subgroup-uniform control flow";
 
 thread_local std::vector<TableFlush> pendingTableFlushes;
+thread_local std::uint32_t subgroupSize = 32;
 
 } // namespace
+
+std::uint32_t &subgroupSizeOnThisThread() noexcept {
+    return subgroupSize;
+}
+
+void enterSubgroup(std::uint32_t const index, std::uint32_t const invocations) noexcept {
+    auto const size = subgroupSize;
+    auto const lane = index % size;
+    gl_SubgroupSize = size;
+    gl_SubgroupInvocationID = lane;
+    gl_SubgroupID = index / size;
+    gl_NumSubgroups = (invocations + size - 1) / size;
+    // Bits [begin, end) of a 128-bit mask.
+    auto const range = [](std::uint32_t const begin, std::uint32_t const end) {
+        auto bits = uvec4{};
+        for (std::uint32_t word = 0; word < 4; ++word) {
+            auto const from = std::min(std::max(begin, word * 32), (word + 1) * 32) - word * 32;
+            auto const to = std::min(std::max(end, word * 32), (word + 1) * 32) - word * 32;
+            auto const below = [](std::uint32_t const n) { return n >= 32 ? ~0u : (1u << n) - 1u; };
+            bits[static_cast<int>(word)] = below(to) & ~below(from);
+        }
+        return bits;
+    };
+    gl_SubgroupEqMask = range(lane, lane + 1);
+    gl_SubgroupGeMask = range(lane, size);
+    gl_SubgroupGtMask = range(lane + 1, size);
+    gl_SubgroupLeMask = range(0, lane + 1);
+    gl_SubgroupLtMask = range(0, lane);
+}
 
 void registerTableFlush(TableFlush const flush) {
     pendingTableFlushes.push_back(flush);
@@ -176,11 +214,22 @@ private:
 
 struct Scheduler;
 
+enum class Wait : std::uint8_t {
+    None,     // runnable
+    Barrier,  // at barrier()
+    Subgroup, // at a subgroup operation
+};
+
 struct Fiber {
     void *sp = nullptr;
     bool done = false;
+    Wait wait = Wait::None;
     std::uint32_t index = 0;
     Scheduler *scheduler = nullptr;
+    // The subgroup operation it waits at.
+    void const *input = nullptr;
+    void *output = nullptr;
+    SubgroupResolve resolve = nullptr;
 };
 
 struct Scheduler {
@@ -230,6 +279,50 @@ void *initialFrame(std::byte *const top, Fiber *const fiber) {
     return frame;
 }
 
+// Resolves the subgroups whose active invocations all wait at one
+// subgroup operation; returns whether any did.
+bool resolveSubgroups(std::vector<Fiber> &fibers, std::uint32_t const size) {
+    auto progress = false;
+    auto const count = static_cast<std::uint32_t>(fibers.size());
+    for (std::uint32_t first = 0; first < count; first += size) {
+        auto lanes = SubgroupLanes{};
+        auto resolve = SubgroupResolve{nullptr};
+        auto others = false; // active invocations not at a subgroup operation
+        for (auto i = first; i < count and i < first + size; ++i) {
+            auto &fiber = fibers[i];
+            if (fiber.done) {
+                continue;
+            }
+            if (fiber.wait != Wait::Subgroup) {
+                others = true;
+                continue;
+            }
+            if (resolve != nullptr and fiber.resolve != resolve) {
+                fail(kSubgroupDiverged);
+            }
+            resolve = fiber.resolve;
+            lanes.lane[lanes.count] = i - first;
+            lanes.input[lanes.count] = fiber.input;
+            lanes.output[lanes.count] = fiber.output;
+            ++lanes.count;
+        }
+        if (lanes.count == 0) {
+            continue;
+        }
+        if (others) {
+            fail(kSubgroupDiverged);
+        }
+        resolve(lanes);
+        for (auto i = first; i < count and i < first + size; ++i) {
+            if (not fibers[i].done) {
+                fibers[i].wait = Wait::None;
+            }
+        }
+        progress = true;
+    }
+    return progress;
+}
+
 } // namespace
 
 void runCooperative(std::uint32_t const count, CooperativeGroup const &group) {
@@ -248,27 +341,35 @@ void runCooperative(std::uint32_t const count, CooperativeGroup const &group) {
         fibers[i].sp = initialFrame(stackPool[i].top(), &fibers[i]);
     }
     activeScheduler = &scheduler;
-    // Each round resumes every unfinished invocation until its next barrier
-    // or its end; a barrier is complete when the round has visited them all.
-    for (auto remaining = count; remaining > 0;) {
-        auto finished = 0u;
-        auto waiting = 0u;
+    // Each round resumes every runnable invocation until its next barrier,
+    // subgroup operation or end. Then subgroups whose active invocations all
+    // wait at an operation complete it, and a barrier completes once every
+    // unfinished invocation waits at it.
+    auto finished = 0u;
+    while (finished < count) {
         for (auto &fiber : fibers) {
-            if (fiber.done) {
+            if (fiber.done or fiber.wait != Wait::None) {
                 continue;
             }
             group.prepare(group.context, fiber.index);
             scheduler.current = &fiber;
             tc_fiber_switch(&scheduler.sp, fiber.sp);
-            if (fiber.done) {
-                ++finished;
-                --remaining;
-            } else {
-                ++waiting;
-            }
+            finished += fiber.done ? 1 : 0;
         }
-        if (finished != 0 and waiting != 0) {
+        auto atBarrier = 0u;
+        for (auto const &fiber : fibers) {
+            atBarrier += not fiber.done and fiber.wait == Wait::Barrier ? 1 : 0;
+        }
+        if (atBarrier != 0 and finished != 0) {
             fail(kDiverged);
+        }
+        if (resolveSubgroups(fibers, subgroupSize)) {
+            continue;
+        }
+        if (atBarrier != 0 and atBarrier == count - finished) {
+            for (auto &fiber : fibers) {
+                fiber.wait = Wait::None;
+            }
         }
     }
     activeScheduler = nullptr;
@@ -280,6 +381,20 @@ void workgroupBarrier() {
         fail(kNotCooperative);
     }
     auto *const fiber = scheduler->current;
+    fiber->wait = Wait::Barrier;
+    tc_fiber_switch(&fiber->sp, scheduler->sp);
+}
+
+void subgroupRendezvous(void const *const input, void *const output, SubgroupResolve const resolve) {
+    auto *const scheduler = activeScheduler;
+    if (scheduler == nullptr) {
+        fail(kNotSubgroupKernel);
+    }
+    auto *const fiber = scheduler->current;
+    fiber->wait = Wait::Subgroup;
+    fiber->input = input;
+    fiber->output = output;
+    fiber->resolve = resolve;
     tc_fiber_switch(&fiber->sp, scheduler->sp);
 }
 
@@ -344,6 +459,10 @@ void workgroupBarrier() {
         fail(kDiverged);
     }
     group->wake.wait(lock, [group, generation] { return group->generation != generation; });
+}
+
+void subgroupRendezvous(void const *, void *, SubgroupResolve) {
+    fail("subgroup operations on the CPU backend need fibers (Linux or Android on x86-64 or AArch64)");
 }
 
 #endif

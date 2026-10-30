@@ -33,7 +33,8 @@ llvm::StringSet<> const &reservedWords() {
         "packUnorm4x8", "unpackUnorm4x8", "packSnorm4x8", "unpackSnorm4x8", "packUnorm2x16", "unpackUnorm2x16",
         "packSnorm2x16", "unpackSnorm2x16", "packHalf2x16", "unpackHalf2x16", "texelFetch", "textureSize",
         "textureLod", "transpose", "determinant", "inverse", "matrixCompMult", "outerProduct", "sampler2DArray",
-        "usampler2D", "isampler2D", "usampler3D", "isampler3D", "samplerExternalOES"};
+        "usampler2D", "isampler2D", "usampler3D", "isampler3D", "samplerExternalOES", "image2DArray", "iimage2DArray",
+        "uimage2DArray", "isampler2DArray", "usampler2DArray", "half"};
     return words;
 }
 

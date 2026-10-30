@@ -10,6 +10,8 @@
 #include <clang/ASTMatchers/ASTMatchFinder.h>
 #include <clang/ASTMatchers/ASTMatchers.h>
 
+#include <tc/kernel.hpp>
+
 #include "glsl_names.hpp"
 #include "packed_layout.hpp"
 #include "tc_types.hpp"
@@ -31,11 +33,29 @@ bool hasKernelAnnotation(clang::Decl const *decl) {
 
 struct KernelMatchCollector final : MatchFinder::MatchCallback {
     std::vector<clang::CXXRecordDecl const *> kernels;
+    std::vector<clang::ClassTemplateDecl const *> templates;
+    std::vector<clang::ClassTemplateSpecializationDecl const *> instances;
 
     void run(MatchFinder::MatchResult const &result) override {
-        auto const *record = result.Nodes.getNodeAs<clang::CXXRecordDecl>("kernel");
-        if (record != nullptr and hasKernelAnnotation(record)) {
-            kernels.push_back(record);
+        if (auto const *record = result.Nodes.getNodeAs<clang::CXXRecordDecl>("kernel")) {
+            if (hasKernelAnnotation(record)) {
+                kernels.push_back(record);
+            }
+        }
+        if (auto const *pattern = result.Nodes.getNodeAs<clang::ClassTemplateDecl>("template")) {
+            if (hasKernelAnnotation(pattern->getTemplatedDecl())) {
+                templates.push_back(pattern);
+            }
+        }
+        // `template struct K<...>;` from TC_KERNEL_INSTANCE in this header.
+        if (auto const *spec = result.Nodes.getNodeAs<clang::ClassTemplateSpecializationDecl>("instance")) {
+            auto const &sources = *result.SourceManager;
+            if (spec->getSpecializationKind() == clang::TSK_ExplicitInstantiationDefinition
+                and hasKernelAnnotation(spec->getSpecializedTemplate()->getTemplatedDecl())
+                and sources.isInMainFile(sources.getExpansionLoc(spec->getTemplateKeywordLoc()))
+                and std::find(instances.begin(), instances.end(), spec) == instances.end()) {
+                instances.push_back(spec);
+            }
         }
     }
 };
@@ -66,20 +86,40 @@ std::optional<std::array<std::uint32_t, 3>> evaluateLocalSize(clang::FieldDecl c
     return size;
 }
 
+// The string a constexpr `char[]` or `char const *` evaluates to.
+std::optional<std::string> constantString(clang::VarDecl const *var) {
+    auto const *init = var->getInit();
+    if (init == nullptr or not var->isConstexpr()) {
+        return std::nullopt;
+    }
+    if (auto const *literal = llvm::dyn_cast<clang::StringLiteral>(init->IgnoreParenImpCasts())) {
+        return literal->getString().str();
+    }
+    auto const *value = var->evaluateValue();
+    if (value == nullptr or not value->isLValue() or not value->getLValueOffset().isZero()) {
+        return std::nullopt;
+    }
+    auto const *base = value->getLValueBase().dyn_cast<clang::Expr const *>();
+    auto const *literal = base != nullptr ? llvm::dyn_cast<clang::StringLiteral>(base->IgnoreParenImpCasts()) : nullptr;
+    if (literal == nullptr) {
+        return std::nullopt;
+    }
+    return literal->getString().str();
+}
+
 std::optional<std::string> programNameOf(clang::CXXRecordDecl const *record, Diagnostics &diags) {
     for (auto const *decl : record->decls()) {
         auto const *var = llvm::dyn_cast<clang::VarDecl>(decl);
         if (var == nullptr or var->getName() != "fileLocation") {
             continue;
         }
-        auto const *init = var->getInit();
-        auto const *literal =
-            init != nullptr ? llvm::dyn_cast<clang::StringLiteral>(init->IgnoreParenImpCasts()) : nullptr;
-        if (not var->isConstexpr() or literal == nullptr or literal->getString().empty()) {
-            diags.error(var->getLocation(), "fileLocation must be 'static constexpr char fileLocation[] = \"name\"'");
+        auto const name = constantString(var);
+        if (not name or name->empty()) {
+            diags.error(var->getLocation(), "fileLocation must be 'static constexpr char fileLocation[] = \"name\"' "
+                                            "(or tc::instanceName<K>() in kernel templates)");
             return std::nullopt;
         }
-        return literal->getString().str();
+        return name;
     }
     diags.error(record->getLocation(), "kernel struct needs 'static constexpr char fileLocation[] = \"name\"'");
     return std::nullopt;
@@ -223,6 +263,35 @@ bool classifyField(clang::FieldDecl const *field, KernelModel &model, clang::AST
         model.images.push_back(image);
         return true;
     }
+    if (auto const *spec = asTcSpecialization(field->getType(), "ExternalImageBinding")) {
+        auto const format = imageFormatOf(templateTypeArg(spec, 0), context);
+        if (not format) {
+            diags.error(field->getLocation(), "the first ExternalImageBinding argument must be a tc::gpu format");
+            return false;
+        }
+        auto image = ImageModel{};
+        image.name = name;
+        image.format = *format;
+        image.dim = tc::Dim::D2;
+        image.binding = static_cast<std::uint32_t>(templateIntArg(spec, 1));
+        image.external = true;
+        image.field = field;
+        model.images.push_back(image);
+        return true;
+    }
+    if (auto const *spec = asTcSpecialization(field->getType(), "CompressedTextureBinding")) {
+        auto texture = TextureModel{};
+        texture.name = name;
+        texture.format = tc::ImageFormat{}; // normalized RGBA: a float sampler2D
+        texture.dim = tc::Dim::D2;
+        texture.binding = static_cast<std::uint32_t>(templateIntArg(spec, 0));
+        texture.filter = static_cast<tc::Filter>(templateIntArg(spec, 1));
+        texture.wrap = static_cast<tc::Wrap>(templateIntArg(spec, 2));
+        texture.mip = static_cast<tc::Mip>(templateIntArg(spec, 3));
+        texture.field = field;
+        model.textures.push_back(texture);
+        return true;
+    }
     if (auto const *spec = asTcSpecialization(field->getType(), "TextureBinding")) {
         auto const format = imageFormatOf(templateTypeArg(spec, 0), context);
         if (not format) {
@@ -236,6 +305,7 @@ bool classifyField(clang::FieldDecl const *field, KernelModel &model, clang::AST
         texture.binding = static_cast<std::uint32_t>(templateIntArg(spec, 3));
         texture.filter = static_cast<tc::Filter>(templateIntArg(spec, 4));
         texture.wrap = static_cast<tc::Wrap>(templateIntArg(spec, 5));
+        texture.mip = static_cast<tc::Mip>(templateIntArg(spec, 6));
         texture.field = field;
         model.textures.push_back(texture);
         return true;
@@ -347,15 +417,26 @@ std::vector<clang::CXXRecordDecl const *> findKernels(clang::ASTContext &context
                                     unless(isTemplateInstantiation()))
                           .bind("kernel"),
                       &collector);
+    finder.addMatcher(classTemplateDecl(isExpansionInMainFile()).bind("template"), &collector);
+    finder.addMatcher(classTemplateSpecializationDecl(isDefinition()).bind("instance"), &collector);
     finder.matchAST(context);
     auto kernels = std::vector<clang::CXXRecordDecl const *>{};
     for (auto const *record : collector.kernels) {
-        if (record->getDescribedClassTemplate() != nullptr) {
-            diags.error(record->getLocation(), "kernel structs cannot be templates");
-            continue;
+        if (record->getDescribedClassTemplate() == nullptr) {
+            kernels.push_back(record);
         }
-        kernels.push_back(record);
     }
+    for (auto const *pattern : collector.templates) {
+        auto const instantiated = std::any_of(collector.instances.begin(), collector.instances.end(), [&](auto const *spec) {
+            return spec->getSpecializedTemplate()->getCanonicalDecl() == pattern->getCanonicalDecl();
+        });
+        if (not instantiated) {
+            diags.warning(pattern->getLocation(), "kernel template '" + pattern->getNameAsString()
+                                                      + "' has no TC_KERNEL_INSTANCE in this header; no program is "
+                                                        "generated for it");
+        }
+    }
+    kernels.insert(kernels.end(), collector.instances.begin(), collector.instances.end());
     return kernels;
 }
 
@@ -388,15 +469,22 @@ std::optional<KernelModel> collectKernel(clang::CXXRecordDecl const *record, cla
     }
     for (auto const *decl : record->decls()) {
         auto const *var = llvm::dyn_cast<clang::VarDecl>(decl);
-        if (var != nullptr and var->getName() == "usesBarrier") {
+        if (var != nullptr and var->getName() == "floatPrecision") {
             auto const *value = var->isConstexpr() ? var->evaluateValue() : nullptr;
-            model.usesBarrier = value != nullptr and value->isInt() and value->getInt().getBoolValue();
+            model.mediumFloats = value != nullptr and value->isInt()
+                             and value->getInt().getZExtValue() == static_cast<std::uint64_t>(tc::Precision::Medium);
+        }
+        if (var != nullptr and (var->getName() == "usesBarrier" or var->getName() == "usesSubgroups")) {
+            auto const *value = var->isConstexpr() ? var->evaluateValue() : nullptr;
+            auto const set = value != nullptr and value->isInt() and value->getInt().getBoolValue();
+            (var->getName() == "usesBarrier" ? model.usesBarrier : model.usesSubgroups) = set;
         }
     }
     auto sharedBytes = std::uint64_t{0};
     for (auto const &variable : model.shared) {
         sharedBytes += static_cast<std::uint64_t>(context.getTypeSizeInChars(variable.type).getQuantity());
     }
+    model.sharedBytes = static_cast<std::uint32_t>(sharedBytes);
     if (sharedBytes > 16384) {
         diags.warning(record->getLocation(), "kernel uses " + std::to_string(sharedBytes)
                                                  + " bytes of shared memory; OpenGL ES and Vulkan only guarantee 16384");

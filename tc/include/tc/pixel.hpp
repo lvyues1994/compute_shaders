@@ -8,6 +8,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <tc/half.hpp>
+
 namespace tc {
 
 enum class Channel : std::uint8_t {
@@ -28,12 +30,12 @@ enum class Encoding : std::uint8_t {
 template <Encoding E, class T>
 constexpr T channelDefault(Channel const c) noexcept {
     if (c != Channel::A) {
-        return T{0};
+        return T(0);
     }
     if constexpr (E == Encoding::Normalized) {
         return std::numeric_limits<T>::max();
     } else {
-        return T{1};
+        return T(1);
     }
 }
 
@@ -55,16 +57,17 @@ struct ChannelConverter<Encoding::Float, Src, Encoding::Float, Dst> {
 template <class Src, class Dst>
 struct ChannelConverter<Encoding::Normalized, Src, Encoding::Float, Dst> {
     static constexpr Dst apply(Src const v) noexcept {
-        return static_cast<Dst>(v) / static_cast<Dst>(std::numeric_limits<Src>::max());
+        using Wide = std::conditional_t<std::is_same_v<Dst, half>, float, Dst>;
+        return static_cast<Dst>(static_cast<Wide>(v) / static_cast<Wide>(std::numeric_limits<Src>::max()));
     }
 };
 
 template <class Src, class Dst>
 struct ChannelConverter<Encoding::Float, Src, Encoding::Normalized, Dst> {
     static Dst apply(Src const v) noexcept {
-        auto const clamped = v < Src{0} ? Src{0} : (v > Src{1} ? Src{1} : v);
-        auto const scaled = static_cast<double>(clamped) * std::numeric_limits<Dst>::max();
-        return static_cast<Dst>(std::lround(scaled));
+        auto const value = static_cast<double>(v);
+        auto const clamped = value < 0.0 ? 0.0 : (value > 1.0 ? 1.0 : value);
+        return static_cast<Dst>(std::lround(clamped * std::numeric_limits<Dst>::max()));
     }
 };
 
@@ -76,15 +79,22 @@ struct ChannelConverter<Encoding::Normalized, Src, Encoding::Normalized, Dst> {
     }
 };
 
+namespace detail {
+
+template <class T>
+inline constexpr bool isFloatChannel = std::is_floating_point_v<T> or std::is_same_v<T, half>;
+
+} // namespace detail
+
 namespace cpu {
 
 // A host pixel ("external format"): the listed channels stored in order as T.
 // Channels not listed read as channelDefault and ignore writes.
 template <Encoding E, class T, Channel... Cs>
 struct Pixel {
-    static_assert(std::is_arithmetic_v<T> and not std::is_same_v<T, bool>);
+    static_assert((std::is_arithmetic_v<T> and not std::is_same_v<T, bool>) or std::is_same_v<T, half>);
     static_assert(E != Encoding::Normalized or std::is_unsigned_v<T>, "normalized channels are unsigned integers");
-    static_assert(E != Encoding::Float or std::is_floating_point_v<T>);
+    static_assert(E != Encoding::Float or detail::isFloatChannel<T>);
     static_assert(E != Encoding::Integer or std::is_integral_v<T>);
 
     static constexpr Encoding encoding = E;
@@ -138,6 +148,9 @@ using RGBA32I = Pixel<Encoding::Integer, std::int32_t, Channel::R, Channel::G, C
 using R32F = Pixel<Encoding::Float, float, Channel::R>;
 using RGB32F = Pixel<Encoding::Float, float, Channel::R, Channel::G, Channel::B>;
 using RGBA32F = Pixel<Encoding::Float, float, Channel::R, Channel::G, Channel::B, Channel::A>;
+using R16F = Pixel<Encoding::Float, half, Channel::R>;
+using RG16F = Pixel<Encoding::Float, half, Channel::R, Channel::G>;
+using RGBA16F = Pixel<Encoding::Float, half, Channel::R, Channel::G, Channel::B, Channel::A>;
 
 } // namespace cpu
 

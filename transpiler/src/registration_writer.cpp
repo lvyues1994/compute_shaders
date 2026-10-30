@@ -45,6 +45,20 @@ char const *scalarName(tc::ScalarKind const scalar) {
     return "tc::ScalarKind::Float";
 }
 
+char const *dimName(tc::Dim const dim) {
+    switch (dim) {
+    case tc::Dim::D1:
+        return "tc::Dim::D1";
+    case tc::Dim::D2:
+        return "tc::Dim::D2";
+    case tc::Dim::D3:
+        return "tc::Dim::D3";
+    case tc::Dim::D2Array:
+        return "tc::Dim::D2Array";
+    }
+    return "tc::Dim::D2";
+}
+
 std::string rawString(std::string const &text) {
     return "R\"tc_glsl(" + text + ")tc_glsl\"";
 }
@@ -69,7 +83,8 @@ std::string resourceSlot(ResourceArtifact const &resource) {
     } else if (resource.kind != tc::ResourceKind::StorageBuffer) {
         auto const isTexture = resource.kind == tc::ResourceKind::SampledTexture;
         text += isTexture ? "        slot.kind = tc::ResourceKind::SampledTexture;\n"
-                          : "        slot.kind = tc::ResourceKind::StorageImage;\n";
+              : resource.kind == tc::ResourceKind::ExternalImage ? "        slot.kind = tc::ResourceKind::ExternalImage;\n"
+                                                                 : "        slot.kind = tc::ResourceKind::StorageImage;\n";
         if (isTexture) {
             text += std::string{"        slot.filter = "}
                   + (resource.filter == tc::Filter::Linear ? "tc::Filter::Linear" : "tc::Filter::Nearest") + ";\n";
@@ -78,8 +93,13 @@ std::string resourceSlot(ResourceArtifact const &resource) {
                      : resource.wrap == tc::Wrap::MirroredRepeat ? "tc::Wrap::MirroredRepeat"
                                                                  : "tc::Wrap::ClampToEdge")
                   + ";\n";
+            text += std::string{"        slot.mip = "}
+                  + (resource.mip == tc::Mip::Linear    ? "tc::Mip::Linear"
+                     : resource.mip == tc::Mip::Nearest ? "tc::Mip::Nearest"
+                                                        : "tc::Mip::None")
+                  + ";\n";
         }
-        text += "        slot.imageDim = tc::Dim::D" + std::to_string(static_cast<int>(resource.dim)) + ";\n";
+        text += std::string{"        slot.imageDim = "} + dimName(resource.dim) + ";\n";
         text += "        slot.imageFormat.encoding = " + std::string{encodingName(resource.format.encoding)} + ";\n";
         text += "        slot.imageFormat.isSigned = " + std::string{resource.format.isSigned ? "true" : "false"} + ";\n";
         text += "        slot.imageFormat.bitsPerChannel = " + std::to_string(resource.format.bitsPerChannel) + ";\n";
@@ -145,6 +165,8 @@ std::string kernelBlock(KernelArtifact const &kernel, std::size_t const index) {
               + ")};\n";
     }
     text += "    program.pushConstantSize = " + std::to_string(kernel.pushConstantSize) + ";\n";
+    text += "    program.sharedBytes = " + std::to_string(kernel.sharedBytes) + ";\n";
+    text += "    program.features = " + std::to_string(kernel.features) + "u;\n";
     text += "    return program;\n}()};\n\n";
     return text;
 }

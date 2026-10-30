@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 #include <tc/vec.hpp>
@@ -10,6 +11,7 @@ enum class Dim : std::uint8_t {
     D1 = 1,
     D2 = 2,
     D3 = 3,
+    D2Array = 4, // 2D layers: coordinates (x, y, layer)
 };
 
 // Maps an n-dimensional coordinate onto the flat storage of a resource. The
@@ -27,6 +29,7 @@ struct DimTraits<Dim::D1> {
         return coord >= 0 and coord < size;
     }
     static constexpr ivec3 toExtent3(IndexType const size) noexcept { return ivec3{size, 1, 1}; }
+    static constexpr IndexType fromExtent3(ivec3 const size) noexcept { return size.x; }
 };
 
 template <>
@@ -41,6 +44,7 @@ struct DimTraits<Dim::D2> {
         return coord.x >= 0 and coord.y >= 0 and coord.x < size.x and coord.y < size.y;
     }
     static constexpr ivec3 toExtent3(IndexType const size) noexcept { return ivec3{size, 1}; }
+    static constexpr IndexType fromExtent3(ivec3 const size) noexcept { return ivec2{size.x, size.y}; }
 };
 
 template <>
@@ -56,9 +60,34 @@ struct DimTraits<Dim::D3> {
             and coord.z < size.z;
     }
     static constexpr ivec3 toExtent3(IndexType const size) noexcept { return size; }
+    static constexpr IndexType fromExtent3(ivec3 const size) noexcept { return size; }
 };
+
+// Layers are stored one after another, like the z slices of a 3D image.
+template <>
+struct DimTraits<Dim::D2Array> : DimTraits<Dim::D3> {};
 
 template <Dim D>
 using tcVec = typename DimTraits<D>::IndexType;
+
+// Extent of mip level `level` of an image whose level 0 is `extent` (x, y, z
+// or layers): every axis halves, rounding down to 1, except array layers.
+constexpr ivec3 mipExtent(Dim const dim, ivec3 const extent, std::uint32_t const level) noexcept {
+    auto const halve = [level](std::int32_t const size) { return std::max(size >> level, 1); };
+    return ivec3{halve(extent.x), dim == Dim::D1 ? 1 : halve(extent.y),
+                 dim == Dim::D3 ? halve(extent.z) : extent.z};
+}
+
+// Levels of a full mip chain down to 1 x 1 (x 1).
+constexpr std::uint32_t fullMipLevels(Dim const dim, ivec3 const extent) noexcept {
+    auto largest = std::max(extent.x, dim == Dim::D1 ? 1 : extent.y);
+    largest = std::max(largest, dim == Dim::D3 ? extent.z : 1);
+    auto levels = std::uint32_t{1};
+    while (largest > 1) {
+        largest >>= 1;
+        ++levels;
+    }
+    return levels;
+}
 
 } // namespace tc

@@ -162,23 +162,55 @@ struct BufferBinding {
     using Resource = BufferResource<T, Dim::D1>;
     static constexpr std::uint32_t binding = Binding;
 
-    void attach(Resource &resource_) noexcept { resource = &resource_; }
+    void attach(Resource &resource_) noexcept {
+        resource = &resource_;
+        first = 0;
+        count = kWhole;
+    }
+
+    // The kernel sees only elements [first, first + count) of the resource,
+    // as element 0 onwards (glBindBufferRange). On GPU backends the byte
+    // offset must be a multiple of DeviceLimits::storageBufferOffsetAlignment.
+    void attach(Resource &resource_, std::size_t const first_, std::size_t const count_) noexcept {
+        assert(first_ + count_ <= resource_.size());
+        resource = &resource_;
+        first = first_;
+        count = count_;
+    }
+
     Resource *attachedResource() const noexcept { return resource; }
+    bool isRange() const noexcept { return count != kWhole; }
+    std::size_t firstElement() const noexcept { return first; }
+    std::size_t elementCount() const noexcept { return count == kWhole ? resource->size() : count; }
 
     template <class I, std::enable_if_t<std::is_integral_v<I>, int> = 0>
     T &operator[](I const index) const noexcept {
         assert(resource != nullptr and "BufferBinding used before attach()");
-        return (*resource)[static_cast<std::int32_t>(index)];
+        assert(static_cast<std::size_t>(index) < elementCount());
+        return (*resource)[static_cast<std::int32_t>(first + static_cast<std::size_t>(index))];
     }
 
     // GLSL `name.length()` on the runtime-sized array; returns int like GLSL.
     std::int32_t length() const noexcept {
         assert(resource != nullptr and "BufferBinding used before attach()");
-        return static_cast<std::int32_t>(resource->size());
+        return static_cast<std::int32_t>(elementCount());
     }
 
 private:
+    static constexpr std::size_t kWhole = ~std::size_t{0};
+
     Resource *resource = nullptr;
+    std::size_t first = 0;
+    std::size_t count = kWhole;
+};
+
+// Workgroup counts of an indirect dispatch (Device::executeIndirect), laid
+// out like VkDispatchIndirectCommand. Kernels fill them through a
+// BufferBinding<DispatchIndirectCommand, B>, e.g. with atomicAdd on `x`.
+struct DispatchIndirectCommand {
+    std::uint32_t x = 0;
+    std::uint32_t y = 1;
+    std::uint32_t z = 1;
 };
 
 } // namespace tc

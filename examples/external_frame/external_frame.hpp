@@ -28,4 +28,25 @@ struct TC_KERNEL ExternalFrameToRgba {
     }
 };
 
+// Renders straight into a platform frame (an RGBA8 AHardwareBuffer the
+// application then presents), here a gradient with a moving bar.
+struct TC_KERNEL RenderToFrame {
+    static constexpr char fileLocation[] = "render_to_frame";
+    uvec3 local_size{16, 16, 1};
+
+    ExternalImageBinding<gpu::RGBA8, 0> target;
+    Uniform<float, 0> time{};
+
+    void main() {
+        ivec2 p = ivec2(gl_GlobalInvocationID.xy());
+        ivec2 size = imageSize(target);
+        if (p.x >= size.x or p.y >= size.y) {
+            return;
+        }
+        vec2 uv = (vec2(p) + 0.5f) / vec2(size);
+        float bar = abs(uv.x - fract(time.value)) < 0.05f ? 1.0f : 0.0f;
+        imageStore(target, p, vec4(uv.x, uv.y, bar, 1.0f));
+    }
+};
+
 } // namespace examples

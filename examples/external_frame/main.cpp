@@ -137,6 +137,56 @@ Conversion convert(tc::Device &device, AHardwareBuffer *buffer, tc::ivec2 const 
     return result;
 }
 
+// The presentation direction: render into an RGBA8 frame a compositor could
+// show, hand it over with a fence, take it back with one and render again.
+void renderToFrame(tc::Device &device, tc::ivec2 const size) {
+    auto desc = AHardwareBuffer_Desc{};
+    desc.width = static_cast<std::uint32_t>(size.x);
+    desc.height = static_cast<std::uint32_t>(size.y);
+    desc.layers = 1;
+    desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER
+               | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
+    AHardwareBuffer *raw = nullptr;
+    if (AHardwareBuffer_allocate(&desc, &raw) != 0) {
+        throw tc::DeviceError{"AHardwareBuffer_allocate failed for the presentable frame"};
+    }
+    auto const buffer = HardwareBuffer{raw, AHardwareBuffer_release};
+    auto frame = tc::ExternalImage::fromHardwareBuffer(buffer.get());
+    auto kernel = examples::RenderToFrame{};
+    kernel.target.attach(frame);
+    device.useKernel(kernel);
+    device.bindExternalImage(kernel.target);
+    auto const groups = tc::uvec3{(static_cast<tc::uint>(size.x) + 15u) / 16u,
+                                  (static_cast<tc::uint>(size.y) + 15u) / 16u, 1u};
+    auto const start = std::chrono::steady_clock::now();
+    auto release = tc::SyncFence{};
+    for (int f = 0; f < 3; ++f) {
+        device.waitFor(std::move(release));
+        kernel.time = 0.25f * static_cast<float>(f + 1);
+        device.setUniform(kernel.time);
+        device.execute(kernel, groups);
+        release = device.submitWithFence(); // the compositor's acquire fence; here it comes straight back
+    }
+    release.wait();
+    auto const milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    void *data = nullptr;
+    AHardwareBuffer_describe(buffer.get(), &desc);
+    if (AHardwareBuffer_lock(buffer.get(), AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr, &data) != 0) {
+        throw tc::DeviceError{"cannot lock the presentable frame"};
+    }
+    auto const texel = [&](int const x, int const y) {
+        return static_cast<std::uint8_t const *>(data) + (static_cast<std::size_t>(y) * desc.stride + x) * 4;
+    };
+    auto const *bar = texel(size.x * 3 / 4, size.y / 2);
+    auto const *plain = texel(size.x / 4, size.y / 2);
+    std::cout << "render to frame: 3 frames in " << milliseconds << " ms, sync files "
+              << (device.info().syncFiles ? "on the device" : "on the host") << ", bar (" << int{bar[0]} << ","
+              << int{bar[1]} << "," << int{bar[2]} << ") plain (" << int{plain[0]} << "," << int{plain[1]} << ","
+              << int{plain[2]} << ")\n";
+    AHardwareBuffer_unlock(buffer.get(), nullptr);
+}
+
 void report(char const *label, Conversion const &conversion) {
     std::cout << label << ": " << conversion.milliseconds << " ms, mean error " << conversion.meanError
               << " / 255, bars" << conversion.barSamples << "\n";
@@ -161,6 +211,11 @@ int run(examples::CommandLine const &line) {
     report("RGBA (pass 1)", convert(*device, rgbaFrame.get(), size, "external_rgba_" + info.backend + ".ppm"));
     report("RGBA (pass 2)", convert(*device, rgbaFrame.get(), size, "external_rgba_" + info.backend + ".ppm"));
     report("YUV  (pass 2)", convert(*device, yuv.get(), size, "external_yuv_" + info.backend + ".ppm"));
+    try {
+        renderToFrame(*device, size);
+    } catch (tc::DeviceError const &error) {
+        std::cout << "render to frame: unavailable (" << error.what() << ")\n";
+    }
     return EXIT_SUCCESS;
 }
 

@@ -23,7 +23,7 @@ GLenum pixelFormatOf(ImageFormat const &format) {
 
 GLenum pixelTypeOf(ImageFormat const &format) {
     if (format.encoding == Encoding::Float) {
-        return format.bitsPerChannel == 32 ? GL_FLOAT : GL_NONE;
+        return format.bitsPerChannel == 32 ? GL_FLOAT : format.bitsPerChannel == 16 ? GL_HALF_FLOAT : GL_NONE;
     }
     switch (format.bitsPerChannel) {
     case 8:
@@ -47,7 +47,8 @@ GLenum internalFormatOf(ImageFormat const &format) {
         {"r8", GL_R8},           {"rg8", GL_RG8},         {"rgba8", GL_RGBA8},       {"r8ui", GL_R8UI},
         {"rgba8ui", GL_RGBA8UI}, {"rgba8i", GL_RGBA8I},   {"r32ui", GL_R32UI},       {"rg32ui", GL_RG32UI},
         {"rgba32ui", GL_RGBA32UI}, {"r32i", GL_R32I},     {"rgba32i", GL_RGBA32I},   {"r32f", GL_R32F},
-        {"rg32f", GL_RG32F},     {"rgba32f", GL_RGBA32F},
+        {"rg32f", GL_RG32F},     {"rgba32f", GL_RGBA32F}, {"r16f", GL_R16F},         {"rg16f", GL_RG16F},
+        {"rgba16f", GL_RGBA16F},
     };
     for (auto const &entry : table) {
         if (q == entry.qualifier) {
@@ -70,18 +71,20 @@ GlFormat glFormatOf(ImageFormat const &format) {
 std::string readbackShaderSource(ImageFormat const &format, Dim const dim, OpenGLApi const api) {
     auto const prefix = format.encoding != Encoding::Integer ? "" : format.isSigned ? "i" : "u";
     auto const scalar = format.encoding != Encoding::Integer ? "float" : format.isSigned ? "int" : "uint";
-    auto const is3d = dim == Dim::D3;
+    auto const layered = dim == Dim::D3 or dim == Dim::D2Array;
+    auto const sampler = dim == Dim::D3 ? "3D" : dim == Dim::D2Array ? "2DArray" : "2D";
     auto source = std::string{api == OpenGLApi::ES ? "#version 310 es\nprecision highp float;\nprecision highp int;\n"
                                                    : "#version 430\n"};
     source += "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n";
-    source += std::string{"layout(binding = 0) uniform highp "} + prefix + "sampler" + (is3d ? "3D" : "2D")
-            + " source;\n";
+    source += std::string{"layout(binding = 0) uniform highp "} + prefix + "sampler" + sampler + " source;\n";
+    source += "layout(location = 0) uniform int level;\n";
     source += std::string{"layout(std430, binding = 0) writeonly buffer Texels { "} + scalar + " texels[]; };\n";
     source += "void main() {\n";
-    source += is3d ? "    ivec3 size = textureSize(source, 0);\n" : "    ivec3 size = ivec3(textureSize(source, 0), 1);\n";
+    source += layered ? "    ivec3 size = textureSize(source, level);\n"
+                      : "    ivec3 size = ivec3(textureSize(source, level), 1);\n";
     source += "    ivec3 p = ivec3(gl_GlobalInvocationID);\n";
     source += "    if (any(greaterThanEqual(p, size))) { return; }\n";
-    source += std::string{"    "} + prefix + "vec4 v = texelFetch(source, " + (is3d ? "p" : "p.xy") + ", 0);\n";
+    source += std::string{"    "} + prefix + "vec4 v = texelFetch(source, " + (layered ? "p" : "p.xy") + ", level);\n";
     source += "    int base = ((p.z * size.y + p.y) * size.x + p.x) * 4;\n";
     source += "    texels[base] = v.x;\n    texels[base + 1] = v.y;\n";
     source += "    texels[base + 2] = v.z;\n    texels[base + 3] = v.w;\n}\n";
@@ -98,6 +101,10 @@ void encodeTexel(ImageFormat const &format, std::uint32_t const (&components)[4]
             auto const maxValue = static_cast<float>((1u << format.bitsPerChannel) - 1u);
             auto const clamped = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
             stored = static_cast<std::uint32_t>(std::lround(clamped * maxValue));
+        } else if (format.encoding == Encoding::Float and format.bitsPerChannel == 16) {
+            auto value = 0.0f;
+            std::memcpy(&value, &components[c], sizeof value);
+            stored = half{value}.bits;
         } else {
             stored = components[c];
         }

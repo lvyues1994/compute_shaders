@@ -12,18 +12,26 @@ namespace tc::opengl {
 namespace {
 
 using PfnEglImageTargetTexture2D = void(GL_APIENTRY *)(GLenum, void *);
+using PfnEglImageTargetTexStorage = void(GL_APIENTRY *)(GLenum, void *, GLint const *);
 
 struct AndroidExternalTexture final : ExternalTexture {
-    AndroidExternalTexture(EglContext const &egl_, ExternalImage const &image) : egl(egl_) {
+    // `storage`: a GL_TEXTURE_2D with immutable storage for image units,
+    // otherwise an external texture for samplerExternalOES.
+    AndroidExternalTexture(EglContext const &egl_, ExternalImage const &image, bool const storage) : egl(egl_) {
         auto const getClientBuffer = reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(
             eglGetProcAddress("eglGetNativeClientBufferANDROID"));
         auto const createImage = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
         destroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
         auto const targetTexture =
             reinterpret_cast<PfnEglImageTargetTexture2D>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+        auto const targetStorage =
+            reinterpret_cast<PfnEglImageTargetTexStorage>(eglGetProcAddress("glEGLImageTargetTexStorageEXT"));
         if (getClientBuffer == nullptr or createImage == nullptr or destroyImage == nullptr or targetTexture == nullptr) {
             throw DeviceError{"importing hardware buffers needs EGL_ANDROID_get_native_client_buffer and "
                               "GL_OES_EGL_image_external"};
+        }
+        if (storage and targetStorage == nullptr) {
+            throw DeviceError{"writing hardware buffers from OpenGL ES needs GL_EXT_EGL_image_storage"};
         }
         auto description = AHardwareBuffer_Desc{};
         AHardwareBuffer_describe(image.hardwareBuffer(), &description);
@@ -36,13 +44,18 @@ struct AndroidExternalTexture final : ExternalTexture {
         }
         auto const &gl = egl.api();
         gl.glGenTextures(1, &name);
-        gl.glBindTexture(kTextureExternalOes, name);
-        targetTexture(kTextureExternalOes, eglImage);
-        gl.glTexParameteri(kTextureExternalOes, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        gl.glTexParameteri(kTextureExternalOes, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        gl.glTexParameteri(kTextureExternalOes, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        gl.glTexParameteri(kTextureExternalOes, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        checkGl(gl, "importing a hardware buffer");
+        auto const target = storage ? GLenum{GL_TEXTURE_2D} : kTextureExternalOes;
+        gl.glBindTexture(target, name);
+        if (storage) {
+            targetStorage(target, eglImage, nullptr);
+        } else {
+            targetTexture(target, eglImage);
+        }
+        gl.glTexParameteri(target, GL_TEXTURE_MIN_FILTER, storage ? GL_NEAREST : GL_LINEAR);
+        gl.glTexParameteri(target, GL_TEXTURE_MAG_FILTER, storage ? GL_NEAREST : GL_LINEAR);
+        gl.glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        checkGl(gl, storage ? "importing a hardware buffer as image storage" : "importing a hardware buffer");
     }
 
     AndroidExternalTexture(AndroidExternalTexture const &) = delete;
@@ -67,7 +80,11 @@ private:
 } // namespace
 
 std::unique_ptr<ExternalTexture> importExternalTexture(EglContext const &egl, ExternalImage const &image) {
-    return std::make_unique<AndroidExternalTexture>(egl, image);
+    return std::make_unique<AndroidExternalTexture>(egl, image, false);
+}
+
+std::unique_ptr<ExternalTexture> importExternalStorage(EglContext const &egl, ExternalImage const &image) {
+    return std::make_unique<AndroidExternalTexture>(egl, image, true);
 }
 
 } // namespace tc::opengl
@@ -77,6 +94,10 @@ std::unique_ptr<ExternalTexture> importExternalTexture(EglContext const &egl, Ex
 namespace tc::opengl {
 
 std::unique_ptr<ExternalTexture> importExternalTexture(EglContext const &, ExternalImage const &) {
+    throw DeviceError{"external images are only available on Android"};
+}
+
+std::unique_ptr<ExternalTexture> importExternalStorage(EglContext const &, ExternalImage const &) {
     throw DeviceError{"external images are only available on Android"};
 }
 

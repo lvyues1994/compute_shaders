@@ -11,20 +11,41 @@ if(NOT GTest_FOUND)
     FetchContent_MakeAvailable(googletest)
 endif()
 
-add_executable(tc_core_tests core_tests.cpp)
+add_executable(tc_core_tests core_tests.cpp cpu_executor_tests.cpp hazard_tests.cpp)
 target_link_libraries(tc_core_tests PRIVATE tc tc_cpu GTest::gtest_main tc_warnings)
 add_test(NAME tc_core_tests COMMAND tc_core_tests)
 
-add_executable(tc_equivalence_tests equivalence_tests.cpp kernels/feature_kernels.hpp)
+add_executable(tc_equivalence_tests
+    equivalence.hpp
+    equivalence_tests.cpp
+    dispatch_tests.cpp
+    texture_tests.cpp
+    submission_tests.cpp
+    interop_tests.cpp
+    subgroup_tests.cpp
+    reload_tests.cpp
+    compressed_tests.cpp
+    kernels/feature_kernels.hpp
+    kernels/dispatch_kernels.hpp
+    kernels/texture_kernels.hpp
+    kernels/subgroup_kernels.hpp)
 target_include_directories(tc_equivalence_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/examples ${PROJECT_SOURCE_DIR}/examples/common/include)
-target_link_libraries(tc_equivalence_tests PRIVATE tc_devices tc_cpu GTest::gtest_main tc_warnings)
+target_link_libraries(tc_equivalence_tests PRIVATE tc_devices tc_cpu GTest::gtest_main tc_warnings
+    astcenc-none-static) # the compressor makes ASTC test data
 tc_add_kernels(tc_equivalence_tests HEADERS
     kernels/feature_kernels.hpp
+    kernels/dispatch_kernels.hpp
+    kernels/texture_kernels.hpp
+    kernels/subgroup_kernels.hpp
     ${PROJECT_SOURCE_DIR}/examples/game_of_life/game_of_life.hpp
     ${PROJECT_SOURCE_DIR}/examples/raytracer/raytracer.hpp
     ${PROJECT_SOURCE_DIR}/examples/nv12_to_rgba/nv12_to_rgba.hpp
     ${PROJECT_SOURCE_DIR}/examples/external_frame/external_frame.hpp)
+find_program(TC_GLSLANG_VALIDATOR glslangValidator)
+target_compile_definitions(tc_equivalence_tests PRIVATE
+    TC_TEST_GLSL_DIR="${CMAKE_CURRENT_BINARY_DIR}/tc_generated/tc_equivalence_tests/glsl"
+    TC_TEST_GLSLANG="${TC_GLSLANG_VALIDATOR}")
 add_test(NAME tc_equivalence_tests COMMAND tc_equivalence_tests)
 
 # Each transpiler/rejects_*.hpp starts with `// expect: <regex>`, the error

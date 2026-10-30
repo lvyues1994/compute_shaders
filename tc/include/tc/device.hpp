@@ -12,12 +12,15 @@
 
 #include <tc/buffer.hpp>
 #include <tc/builtins.hpp>
+#include <tc/compressed.hpp>
 #include <tc/external_image.hpp>
 #include <tc/image.hpp>
 #include <tc/kernel.hpp>
 #include <tc/mat.hpp>
 #include <tc/program.hpp>
 #include <tc/span.hpp>
+#include <tc/subgroup.hpp>
+#include <tc/sync_fence.hpp>
 #include <tc/table.hpp>
 #include <tc/texture.hpp>
 #include <tc/uniform.hpp>
@@ -31,6 +34,33 @@ struct DeviceError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// What one kernel may use on a device. Vulkan and OpenGL ES 3.1 guarantee at
+// least 4 storage buffers, 4 storage images, 16 sampled textures, 2^27-byte
+// storage buffers, 16 KiB of shared memory, 128 invocations per workgroup
+// and (Vulkan) 128 bytes of push constants; offsets of buffer ranges are
+// aligned to at most 256 bytes.
+struct DeviceLimits {
+    std::uint32_t storageBuffers = 0;  // buffers and tables of one kernel
+    std::uint32_t storageImages = 0;
+    std::uint32_t sampledTextures = 0; // textures and external textures
+    std::uint64_t storageBufferBytes = 0;
+    std::uint32_t sharedBytes = 0;
+    std::uint32_t workGroupInvocations = 0;
+    uvec3 workGroupSize{};
+    uvec3 workGroupCount{};
+    // Bytes of Uniform values; nullopt where uniforms are not push constants
+    // (OpenGL), so their size is not limited this way.
+    std::optional<std::uint32_t> pushConstantBytes;
+    // BufferBinding ranges must start at a multiple of this many bytes.
+    std::uint32_t storageBufferOffsetAlignment = 1;
+    // Optional features (tc::KernelFeature bits) kernels may use here.
+    std::uint32_t features = 0;
+    // Invocations of one subgroup; 0 without subgroup support.
+    std::uint32_t subgroupSize = 0;
+    // CompressedFormat bits (compressedBit) the device samples.
+    std::uint32_t compressedFormats = 0;
+};
+
 struct DeviceInfo {
     std::string backend;
     std::string deviceName;
@@ -40,15 +70,55 @@ struct DeviceInfo {
     // enableTimers() is available: GPU timestamp queries, or host time on
     // the CPU backend.
     bool timers = false;
+    // submitWithFence() exports sync files and waitFor() waits on the
+    // device; otherwise both wait on the host.
+    bool syncFiles = false;
+    DeviceLimits limits;
+};
+
+// Why `program` cannot run within `limits`, or nullopt when it fits.
+std::optional<std::string> exceedsLimits(KernelProgram const &program, DeviceLimits const &limits);
+
+// Part of a buffer, in bytes.
+struct ByteRange {
+    std::size_t offset = 0;
+    std::size_t size = 0;
+};
+
+// The completion of the work one Device::submit() sent to the device. A
+// value: copies refer to the same work, and it may outlive the device. Any
+// thread may query or wait.
+struct Submission {
+    // What a backend provides.
+    struct Completion {
+        virtual ~Completion() = default;
+        virtual bool isComplete() const = 0;
+        virtual void wait() const = 0;
+    };
+
+    Submission() = default; // already complete
+    explicit Submission(std::shared_ptr<Completion const> completion_) noexcept : completion(std::move(completion_)) {}
+
+    bool isComplete() const { return completion == nullptr or completion->isComplete(); }
+    void wait() const {
+        if (completion != nullptr) {
+            completion->wait();
+        }
+    }
+
+private:
+    std::shared_ptr<Completion const> completion;
 };
 
 // Device time of one execute() call.
 struct KernelTiming {
     std::string program;
+    // Zero for indirect dispatches on GPU backends: the counts live on the GPU.
     uvec3 workGroups{};
     // nullopt when the GPU reported a disjoint event (a clock or power state
     // change) that invalidates the measurement.
     std::optional<double> milliseconds;
+    bool indirect = false;
 };
 
 // Type-erased requests passed from the template API to a backend.
@@ -56,20 +126,25 @@ struct ImageTransfer {
     ResourceIdentity const *identity = nullptr;
     ImageFormat format{};
     Dim dim = Dim::D2;
-    ivec3 extent{};
-    std::function<void(ByteSpan)> writeTexels;     // upload: fill GPU-format texels
-    std::function<void(ConstByteSpan)> readTexels; // download: consume GPU-format texels
+    ivec3 extent{};               // of level 0; array layers in z
+    std::uint32_t levels = 1;     // mip levels of the image
+    std::uint32_t firstLevel = 0; // the levels this transfer moves
+    std::uint32_t levelCount = 1;
+    std::function<void(std::uint32_t level, ByteSpan)> writeTexels;     // upload: fill GPU-format texels
+    std::function<void(std::uint32_t level, ConstByteSpan)> readTexels; // download: consume GPU-format texels
 };
 
 struct BufferBindRequest {
     std::uint32_t binding = 0;
     ResourceIdentity const *identity = nullptr;
+    std::optional<ByteRange> range; // nullopt: the whole buffer
 };
 
 struct ImageBindRequest {
     std::uint32_t binding = 0;
     ResourceIdentity const *identity = nullptr;
     ImageFormat format{};
+    std::uint32_t level = 0; // the mip level kernels access
 };
 
 struct TextureBindRequest {
@@ -78,11 +153,27 @@ struct TextureBindRequest {
     ImageFormat format{};
     Filter filter = Filter::Nearest;
     Wrap wrap = Wrap::ClampToEdge;
+    Mip mip = Mip::None;
+    std::optional<CompressedFormat> compressed; // a CompressedTextureBinding
+};
+
+struct CompressedTransfer {
+    CompressedImage *image = nullptr; // its blocks per level
+    ResourceIdentity const *identity = nullptr;
+    CompressedFormat format{};
+    ivec2 extent{};
+    std::uint32_t levels = 1;
 };
 
 struct ExternalTextureBindRequest {
     std::uint32_t binding = 0;
     ExternalImage *image = nullptr;
+};
+
+struct ExternalImageBindRequest {
+    std::uint32_t binding = 0;
+    ExternalImage *image = nullptr;
+    ImageFormat format{};
 };
 
 // A scalar, vector or matrix value. `bytes` holds `columns` columns of
@@ -101,14 +192,23 @@ struct KernelUse {
     uvec3 localSize{};
 };
 
+// Where an indirect dispatch reads its DispatchIndirectCommand.
+struct IndirectArguments {
+    ResourceIdentity const *identity = nullptr;
+    std::size_t offset = 0;                        // bytes into the buffer
+    DispatchIndirectCommand const *host = nullptr; // the host copy, the CPU backend's working memory
+};
+
 struct Dispatch {
     std::string_view programName;
     uvec3 localSize{};
-    uvec3 workGroups{};
-    // Host execution: each worker thread calls makeWorker() once and gets a
-    // function that runs whole workgroups on its own copy of the kernel, so
-    // Shared variables of concurrently running workgroups stay apart.
-    std::function<std::function<void(uvec3)>()> makeWorker;
+    uvec3 workGroups{}; // unused when `indirect` is set
+    std::optional<IndirectArguments> indirect;
+    // Host execution: each worker thread calls makeWorker(workGroups) once and
+    // gets a function that runs whole workgroups on its own copy of the
+    // kernel, so Shared variables of concurrently running workgroups stay
+    // apart.
+    std::function<std::function<void(uvec3)>(uvec3 workGroups)> makeWorker;
 };
 
 namespace detail {
@@ -170,7 +270,7 @@ inline void enterInvocation(WorkGroupPosition const &position, uint const index)
 template <class K>
 void runWorkGroup(K &kernel, WorkGroupPosition const &position) {
     auto const count = position.localSize.x * position.localSize.y * position.localSize.z;
-    if constexpr (UsesBarrier<K>::value) {
+    if constexpr (UsesBarrier<K>::value or UsesSubgroups<K>::value) {
         struct Context {
             K *kernel;
             WorkGroupPosition position;
@@ -179,7 +279,11 @@ void runWorkGroup(K &kernel, WorkGroupPosition const &position) {
         auto group = CooperativeGroup{};
         group.context = &context;
         group.prepare = [](void *const c, std::uint32_t const index) {
-            enterInvocation(static_cast<Context *>(c)->position, index);
+            auto const &position = static_cast<Context *>(c)->position;
+            enterInvocation(position, index);
+            if constexpr (UsesSubgroups<K>::value) {
+                enterSubgroup(index, position.localSize.x * position.localSize.y * position.localSize.z);
+            }
         };
         group.run = [](void *const c, std::uint32_t) { static_cast<Context *>(c)->kernel->main(); };
         runCooperative(count, group);
@@ -232,12 +336,26 @@ struct Device {
 
     template <class T, Dim D>
     void uploadBuffer(BufferResource<T, D> const &resource) {
-        doUploadBuffer(resource.identity(), resource.bytes());
+        doUploadBuffer(resource.identity(), resource.bytes(), ByteRange{0, resource.bytes().size()});
+    }
+
+    // Uploads only elements [first, first + count). A buffer the device has
+    // never seen is uploaded whole.
+    template <class T, Dim D>
+    void uploadBuffer(BufferResource<T, D> const &resource, std::size_t const first, std::size_t const count) {
+        doUploadBuffer(resource.identity(), resource.bytes(), elementRange<T>(resource.size(), first, count, "upload"));
     }
 
     template <class T, Dim D>
     void downloadBuffer(BufferResource<T, D> &resource) {
-        doDownloadBuffer(resource.identity(), resource.bytes());
+        doDownloadBuffer(resource.identity(), resource.bytes(), ByteRange{0, resource.bytes().size()});
+    }
+
+    // Downloads only elements [first, first + count); the rest of the host
+    // copy keeps its contents.
+    template <class T, Dim D>
+    void downloadBuffer(BufferResource<T, D> &resource, std::size_t const first, std::size_t const count) {
+        doDownloadBuffer(resource.identity(), resource.bytes(), elementRange<T>(resource.size(), first, count, "download"));
     }
 
     // A table whose words live in createBuffer() memory.
@@ -252,26 +370,57 @@ struct Device {
         uploadBuffer(table.words());
     }
 
+    // Uploads the words of elements [first, first + count) (see
+    // TableResource::wordsOf); the element count must not have changed.
+    template <class T, class Layout>
+    void uploadTable(TableResource<T, Layout> const &table, std::size_t const first, std::size_t const count) {
+        auto const words = tableWords(table, first, count, "uploadTable");
+        uploadBuffer(table.words(), words.first, words.count);
+    }
+
     template <class T, class Layout>
     void downloadTable(TableResource<T, Layout> &table) {
         downloadBuffer(table.words());
     }
 
-    // Works for ImageBinding and TextureBinding: both describe the GPU format.
+    template <class T, class Layout>
+    void downloadTable(TableResource<T, Layout> &table, std::size_t const first, std::size_t const count) {
+        auto const words = tableWords(table, first, count, "downloadTable");
+        downloadBuffer(table.words(), words.first, words.count);
+    }
+
+    // Works for ImageBinding and TextureBinding: both describe the GPU
+    // format. Moves every mip level of an attached MipChain.
     template <class I, std::enable_if_t<detail::isImageLike<I>, int> = 0>
     void uploadImage(I const &image) {
-        auto &resource = detail::requireAttached(image);
-        auto transfer = imageTransfer<I>(resource);
-        transfer.writeTexels = [&resource](ByteSpan const texels) { writeStorageTexels<I>(resource, texels); };
-        doUploadImage(transfer);
+        uploadLevels(image, 0, imageLevels(image));
+    }
+
+    // Uploads one mip level; an image the device has never seen is
+    // uploaded whole.
+    template <class I, std::enable_if_t<detail::isImageLike<I>, int> = 0>
+    void uploadImage(I const &image, std::uint32_t const level) {
+        uploadLevels(image, level, 1);
+    }
+
+    // Compressed textures are uploaded whole and only sampled. Throws
+    // DeviceError when the device does not sample the format (see
+    // DeviceLimits::compressedFormats).
+    template <std::uint32_t B, Filter F, Wrap W, Mip M>
+    void uploadImage(CompressedTextureBinding<B, F, W, M> const &texture) {
+        auto *image = requireCompressed(texture);
+        doUploadCompressed(
+            CompressedTransfer{image, &image->identity(), image->format(), image->extent(), image->levels()});
     }
 
     template <class I, std::enable_if_t<detail::isImageLike<I>, int> = 0>
     void downloadImage(I const &image) {
-        auto &resource = detail::requireAttached(image);
-        auto transfer = imageTransfer<I>(resource);
-        transfer.readTexels = [&resource](ConstByteSpan const texels) { readStorageTexels<I>(resource, texels); };
-        doDownloadImage(transfer);
+        downloadLevels(image, 0, imageLevels(image));
+    }
+
+    template <class I, std::enable_if_t<detail::isImageLike<I>, int> = 0>
+    void downloadImage(I const &image, std::uint32_t const level) {
+        downloadLevels(image, level, 1);
     }
 
     template <class K>
@@ -283,11 +432,18 @@ struct Device {
         doUseKernel(use);
     }
 
+    // Binds the resource, or the range given to BufferBinding::attach.
     template <class T, std::uint32_t B>
     void bindBuffer(BufferBinding<T, B> const &binding) {
         auto request = BufferBindRequest{};
         request.binding = B;
         request.identity = &detail::requireAttached(binding).identity();
+        if (binding.isRange()) {
+            if (binding.elementCount() == 0) {
+                throw DeviceError{"bindBuffer: binding " + std::to_string(B) + " is an empty range"};
+            }
+            request.range = ByteRange{binding.firstElement() * sizeof(T), binding.elementCount() * sizeof(T)};
+        }
         doBindBuffer(request);
     }
 
@@ -301,21 +457,25 @@ struct Device {
 
     template <class I, std::enable_if_t<IsImageBinding<I>::value, int> = 0>
     void bindImage(I const &image) {
+        detail::requireAttached(image);
         auto request = ImageBindRequest{};
         request.binding = I::binding;
-        request.identity = &detail::requireAttached(image).identity();
+        request.identity = image.identity();
         request.format = I::Traits::format;
+        request.level = image.level();
         doBindImage(request);
     }
 
     template <class I, std::enable_if_t<IsTextureBinding<I>::value, int> = 0>
     void bindTexture(I const &texture) {
+        detail::requireAttached(texture);
         auto request = TextureBindRequest{};
         request.binding = I::binding;
-        request.identity = &detail::requireAttached(texture).identity();
+        request.identity = texture.identity();
         request.format = I::Traits::format;
         request.filter = I::filter;
         request.wrap = I::wrap;
+        request.mip = I::mip;
         doBindTexture(request);
     }
 
@@ -329,6 +489,47 @@ struct Device {
         }
         doBindExternalTexture(ExternalTextureBindRequest{B, image});
     }
+
+    template <std::uint32_t B, Filter F, Wrap W, Mip M>
+    void bindTexture(CompressedTextureBinding<B, F, W, M> const &texture) {
+        auto *image = requireCompressed(texture);
+        auto request = TextureBindRequest{};
+        request.binding = B;
+        request.identity = &image->identity();
+        request.filter = F;
+        request.wrap = W;
+        request.mip = M;
+        request.compressed = image->format();
+        doBindTexture(request);
+    }
+
+    // Binds an RGBA frame as a storage image. The frame's next user must
+    // wait for the work that writes it: pass it the fence of
+    // submitWithFence().
+    template <class G, std::uint32_t B>
+    void bindExternalImage(ExternalImageBinding<G, B> const &image) {
+        auto *frame = image.attachedImage();
+        if (frame == nullptr) {
+            throw DeviceError{"binding " + std::to_string(B) + " has no attached external image"};
+        }
+        auto const format = GPUFormatTraits<G>::format;
+        if (not frame->storageFormat() or not(*frame->storageFormat() == format)) {
+            throw DeviceError{"bindExternalImage: binding " + std::to_string(B) + " is " + glslFormatQualifier(format)
+                              + ", but the frame is not an " + glslFormatQualifier(format) + " RGBA frame"};
+        }
+        doBindExternalImage(ExternalImageBindRequest{B, frame, format});
+    }
+
+    // Work queued after this call waits on the device (or, where the device
+    // cannot, on the host) for `fence`: e.g. the release fence of a frame
+    // the compositor gives back (ASurfaceTransactionStats_getPreviousReleaseFenceFd).
+    void waitFor(SyncFence fence) { doWaitFor(std::move(fence)); }
+
+    // Submits the queued work like submit() and returns a fence the device
+    // signals when it is done, for the next user of the external images it
+    // writes (the acquire fence of ASurfaceTransaction_setBuffer). An empty
+    // fence means the device cannot export one; the work has then finished.
+    SyncFence submitWithFence() { return doSubmitWithFence(); }
 
     template <class T, std::uint32_t L>
     void setUniform(Uniform<T, L> const &uniform) {
@@ -345,10 +546,35 @@ struct Device {
         doSetUniform(write);
     }
 
+    // Why the transpiled kernel `programName` cannot run on this device
+    // (missing, over a limit, needing a feature or an API variant the device
+    // lacks), or nullopt when it can. Checking every program of
+    // ProgramRegistry::all() at startup finds problems before any work runs.
+    std::optional<std::string> checkKernel(std::string_view const programName) const {
+        auto const program = ProgramRegistry::instance().find(programName);
+        if (not program) {
+            return "kernel '" + std::string{programName} + "' was not transpiled; add its header with tc_add_kernels()";
+        }
+        if (auto reason = exceedsLimits(*program, info().limits)) {
+            return reason;
+        }
+        return doCheckKernel(*program);
+    }
+
+    // Sends the work queued so far to the device and returns without waiting;
+    // later work goes into the next submission. The host can prepare the
+    // next frame while the device runs this one, but must not write memory
+    // the submission still reads (createBuffer() memory: use one slice of a
+    // ring buffer per frame in flight). Once the submission is complete,
+    // createBuffer() memory holds its results, so it serves as asynchronous
+    // readback; downloadBuffer() and downloadImage() always wait.
+    Submission submit() { return doSubmit(); }
+
     // Waits until all queued work has finished and its results are visible
     // to the CPU. GPU backends queue execute() calls; downloads wait on their
-    // own, but reading createBuffer() memory in place needs finish() first,
-    // and so does writing such memory while queued work still reads it.
+    // own, but reading createBuffer() memory in place needs finish() (or a
+    // completed Submission) first, and so does writing such memory while
+    // queued work still reads it.
     void finish() { doFinish(); }
 
     // While enabled, every execute() is timed on the device. Throws
@@ -371,17 +597,25 @@ struct Device {
     // Queues `workGroups` workgroups of kernel.local_size invocations each.
     template <class K>
     void execute(K &kernel, uvec3 const workGroups) {
-        static_assert(isKernel<K>, "K must declare fileLocation, local_size and main()");
-        auto const localSize = uvec3{kernel.local_size};
-        auto dispatch = Dispatch{};
-        dispatch.programName = K::fileLocation;
-        dispatch.localSize = localSize;
+        auto dispatch = makeDispatch(kernel);
         dispatch.workGroups = workGroups;
-        dispatch.makeWorker = [&kernel, localSize, workGroups]() -> std::function<void(uvec3)> {
-            return [copy = kernel, localSize, workGroups](uvec3 const groupId) mutable {
-                detail::runWorkGroup(copy, detail::WorkGroupPosition{groupId, localSize, workGroups});
-            };
-        };
+        doExecute(dispatch);
+    }
+
+    // Queues the kernel with the workgroup counts arguments[index] holds when
+    // the device reaches this dispatch, typically written by an earlier
+    // kernel. The buffer must be on the device (uploadBuffer or
+    // createBuffer); counts above the device limits are undefined behaviour
+    // on GPU backends.
+    template <class K>
+    void executeIndirect(K &kernel, BufferResource<DispatchIndirectCommand> const &arguments,
+                         std::size_t const index = 0) {
+        if (index >= arguments.size()) {
+            throw DeviceError{"executeIndirect: argument " + std::to_string(index) + " is outside the buffer"};
+        }
+        auto dispatch = makeDispatch(kernel);
+        dispatch.indirect =
+            IndirectArguments{&arguments.identity(), index * sizeof(DispatchIndirectCommand), arguments.data() + index};
         doExecute(dispatch);
     }
 
@@ -389,8 +623,14 @@ protected:
     // Allocates `bytes` of device memory mapped for the CPU and registers it
     // as the device mirror of `identity`; nullopt when the device cannot.
     virtual std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes) = 0;
-    virtual void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes) = 0;
-    virtual void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes) = 0;
+    // `bytes` is the whole host buffer; only `range` of it moves.
+    virtual void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes, ByteRange range) = 0;
+    virtual void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes, ByteRange range) = 0;
+    // Reasons specific to the backend, after the limits passed.
+    virtual std::optional<std::string> doCheckKernel(KernelProgram const &program) const {
+        (void)program;
+        return std::nullopt;
+    }
     virtual void doUploadImage(ImageTransfer const &transfer) = 0;
     virtual void doDownloadImage(ImageTransfer const &transfer) = 0;
     virtual void doUseKernel(KernelUse const &use) = 0;
@@ -398,8 +638,22 @@ protected:
     virtual void doBindImage(ImageBindRequest const &request) = 0;
     virtual void doBindTexture(TextureBindRequest const &request) = 0;
     virtual void doBindExternalTexture(ExternalTextureBindRequest const &request) = 0;
+    virtual void doBindExternalImage(ExternalImageBindRequest const &request) {
+        (void)request;
+        throw DeviceError{"external images are only available on Android"};
+    }
+    virtual void doWaitFor(SyncFence fence) { fence.wait(); }
+    virtual void doUploadCompressed(CompressedTransfer const &transfer) {
+        throw DeviceError{std::string{"compressed format "} + compressedFormatInfo(transfer.format).name
+                          + " is not supported by this backend"};
+    }
+    virtual SyncFence doSubmitWithFence() {
+        doSubmit().wait();
+        return SyncFence{};
+    }
     virtual void doSetUniform(UniformWrite const &write) = 0;
     virtual void doExecute(Dispatch const &dispatch) = 0;
+    virtual Submission doSubmit() = 0;
     virtual void doFinish() = 0;
     // Called after doFinish(): every timed execute has completed.
     virtual std::vector<KernelTiming> doTakeTimings() = 0;
@@ -409,14 +663,90 @@ protected:
 private:
     bool timersOn = false;
 
+    template <class T>
+    static ByteRange elementRange(std::size_t const size, std::size_t const first, std::size_t const count,
+                                  char const *what) {
+        if (first > size or count > size - first) {
+            throw DeviceError{std::string{what} + "Buffer: elements [" + std::to_string(first) + ", "
+                              + std::to_string(first + count) + ") are outside the " + std::to_string(size)
+                              + "-element buffer"};
+        }
+        return ByteRange{first * sizeof(T), count * sizeof(T)};
+    }
+
+    template <class T, class Layout>
+    static typename TableResource<T, Layout>::WordRange tableWords(TableResource<T, Layout> const &table,
+                                                                   std::size_t const first, std::size_t const count,
+                                                                   char const *what) {
+        if (first > table.size() or count > table.size() - first) {
+            throw DeviceError{std::string{what} + ": elements [" + std::to_string(first) + ", "
+                              + std::to_string(first + count) + ") are outside the table"};
+        }
+        return table.wordsOf(first, count);
+    }
+
+    template <class K>
+    static Dispatch makeDispatch(K &kernel) {
+        static_assert(isKernel<K>, "K must declare fileLocation, local_size and main()");
+        auto const localSize = uvec3{kernel.local_size};
+        auto dispatch = Dispatch{};
+        dispatch.programName = K::fileLocation;
+        dispatch.localSize = localSize;
+        dispatch.makeWorker = [&kernel, localSize](uvec3 const workGroups) -> std::function<void(uvec3)> {
+            return [copy = kernel, localSize, workGroups](uvec3 const groupId) mutable {
+                detail::runWorkGroup(copy, detail::WorkGroupPosition{groupId, localSize, workGroups});
+            };
+        };
+        return dispatch;
+    }
+
+    template <std::uint32_t B, Filter F, Wrap W, Mip M>
+    static CompressedImage *requireCompressed(CompressedTextureBinding<B, F, W, M> const &texture) {
+        if (texture.attachedImage() == nullptr) {
+            throw DeviceError{"binding " + std::to_string(B) + " has no attached compressed image"};
+        }
+        return texture.attachedImage();
+    }
+
     template <class I>
-    static ImageTransfer imageTransfer(typename I::Resource const &resource) {
+    static std::uint32_t imageLevels(I const &image) {
+        detail::requireAttached(image);
+        return image.levelCount();
+    }
+
+    template <class I>
+    static ImageTransfer imageTransfer(I const &image, std::uint32_t const first, std::uint32_t const count) {
+        detail::requireAttached(image);
+        if (first >= image.levelCount() or count > image.levelCount() - first) {
+            throw DeviceError{"image transfer: mip level " + std::to_string(first + count - 1) + " does not exist"};
+        }
         auto transfer = ImageTransfer{};
-        transfer.identity = &resource.identity();
+        transfer.identity = image.identity();
         transfer.format = I::Traits::format;
         transfer.dim = I::dim;
-        transfer.extent = DimTraits<I::dim>::toExtent3(resource.extent());
+        transfer.extent = DimTraits<I::dim>::toExtent3(image.levelResource(0)->extent());
+        transfer.levels = image.levelCount();
+        transfer.firstLevel = first;
+        transfer.levelCount = count;
         return transfer;
+    }
+
+    template <class I>
+    void uploadLevels(I const &image, std::uint32_t const first, std::uint32_t const count) {
+        auto transfer = imageTransfer(image, first, count);
+        transfer.writeTexels = [&image](std::uint32_t const level, ByteSpan const texels) {
+            writeStorageTexels<I>(*image.levelResource(level), texels);
+        };
+        doUploadImage(transfer);
+    }
+
+    template <class I>
+    void downloadLevels(I const &image, std::uint32_t const first, std::uint32_t const count) {
+        auto transfer = imageTransfer(image, first, count);
+        transfer.readTexels = [&image](std::uint32_t const level, ConstByteSpan const texels) {
+            readStorageTexels<I>(*image.levelResource(level), texels);
+        };
+        doDownloadImage(transfer);
     }
 
     template <class I>

@@ -2,93 +2,22 @@
 // be created on this machine, and checks that the results agree.
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
-
-#include <gtest/gtest.h>
-
-#include <tc/cpu/cpu_device.hpp>
-#include <tc/devices.hpp>
 
 #include <game_of_life/simulate.hpp>
 #include <nv12_to_rgba/convert.hpp>
 #include <raytracer/render.hpp>
 
+#include "equivalence.hpp"
 #include "kernels/feature_kernels.hpp"
 
 namespace {
 
 using namespace tc;
-
-struct BackendCase {
-    std::string backend;
-    std::string deviceNameContains;
-};
-
-std::string caseName(testing::TestParamInfo<BackendCase> const &info) {
-    auto name = info.param.backend + (info.param.deviceNameContains.empty() ? "" : "_" + info.param.deviceNameContains);
-    for (auto &c : name) {
-        c = std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
-    }
-    return name;
-}
-
-std::vector<BackendCase> gpuCases() {
-    auto cases = std::vector<BackendCase>{};
-    for (auto const &backend : availableBackends()) {
-        if (backend == "cpu") {
-            continue;
-        }
-        cases.push_back(BackendCase{backend, ""});
-        cases.push_back(BackendCase{backend, "llvmpipe"});
-    }
-    return cases;
-}
-
-struct Equivalence : testing::TestWithParam<BackendCase> {
-    void SetUp() override {
-        auto request = DeviceRequest{};
-        request.backend = GetParam().backend;
-        request.deviceNameContains = GetParam().deviceNameContains;
-        try {
-            gpu = createDevice(request);
-        } catch (DeviceError const &error) {
-            GTEST_SKIP() << "backend unavailable: " << error.what();
-        }
-        cpu = cpu::createDevice();
-    }
-
-    // Runs `body` on both devices; skips when the GPU backend reports that
-    // the kernel cannot run there (e.g. features OpenGL ES lacks).
-    template <class Result>
-    std::pair<Result, Result> runBoth(std::function<Result(Device &)> const &body) {
-        auto expected = body(*cpu);
-        try {
-            return {expected, body(*gpu)};
-        } catch (DeviceError const &error) {
-            if (std::string{error.what()}.find("cannot run on OpenGL ES") != std::string::npos) {
-                throw SkipKernel{error.what()};
-            }
-            throw;
-        }
-    }
-
-    struct SkipKernel {
-        std::string reason;
-    };
-
-    std::unique_ptr<Device> gpu;
-    std::unique_ptr<Device> cpu;
-};
-
-template <class T>
-std::vector<T> contents(BufferResource<T> const &buffer) {
-    return std::vector<T>(buffer.begin(), buffer.end());
-}
+using namespace tc::testing_support;
 
 TEST_P(Equivalence, ConstStructArray) {
     auto const [expected, actual] = runBoth<std::vector<vec4>>([](Device &device) {
@@ -947,7 +876,12 @@ TEST_P(Equivalence, Raytracer) {
     EXPECT_LT(farOff, static_cast<int>(expected.size() / 500));
 }
 
+} // namespace
+
+namespace tc::testing_support {
+
+// Instantiates the Equivalence cases of every test file.
 INSTANTIATE_TEST_SUITE_P(Backends, Equivalence, testing::ValuesIn(gpuCases()), caseName);
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(Equivalence);
 
-} // namespace
+} // namespace tc::testing_support

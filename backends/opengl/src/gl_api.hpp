@@ -8,6 +8,8 @@ namespace tc::opengl {
 using PfnProgramUniformDv = void(GL_APIENTRY *)(GLuint, GLint, GLsizei, double const *);
 // glBufferStorage: OpenGL 4.4, or GL_EXT_buffer_storage on OpenGL ES.
 using PfnBufferStorage = void(GL_APIENTRY *)(GLenum, GLsizeiptr, void const *, GLbitfield);
+// glTextureView: OpenGL 4.3, or GL_OES_texture_view / GL_EXT_texture_view on OpenGL ES.
+using PfnTextureView = void(GL_APIENTRY *)(GLuint, GLenum, GLuint, GLenum, GLuint, GLuint, GLuint, GLuint);
 
 inline constexpr GLbitfield kMapPersistentBit = 0x0040;
 inline constexpr GLbitfield kMapCoherentBit = 0x0080;
@@ -25,6 +27,7 @@ inline constexpr GLenum kGpuDisjoint = 0x8FBB;
     X(PFNGLGETERRORPROC, glGetError)                                                                                   \
     X(PFNGLGETINTEGERVPROC, glGetIntegerv)                                                                             \
     X(PFNGLGETINTEGERI_VPROC, glGetIntegeri_v)                                                                         \
+    X(PFNGLGETINTEGER64VPROC, glGetInteger64v)                                                                         \
     X(PFNGLCREATESHADERPROC, glCreateShader)                                                                           \
     X(PFNGLSHADERSOURCEPROC, glShaderSource)                                                                           \
     X(PFNGLCOMPILESHADERPROC, glCompileShader)                                                                         \
@@ -46,6 +49,7 @@ inline constexpr GLenum kGpuDisjoint = 0x8FBB;
     X(PFNGLMAPBUFFERRANGEPROC, glMapBufferRange)                                                                       \
     X(PFNGLUNMAPBUFFERPROC, glUnmapBuffer)                                                                             \
     X(PFNGLBINDBUFFERBASEPROC, glBindBufferBase)                                                                       \
+    X(PFNGLBINDBUFFERRANGEPROC, glBindBufferRange)                                                                     \
     X(PFNGLGENTEXTURESPROC, glGenTextures)                                                                             \
     X(PFNGLDELETETEXTURESPROC, glDeleteTextures)                                                                       \
     X(PFNGLBINDTEXTUREPROC, glBindTexture)                                                                             \
@@ -54,11 +58,14 @@ inline constexpr GLenum kGpuDisjoint = 0x8FBB;
     X(PFNGLTEXSTORAGE3DPROC, glTexStorage3D)                                                                           \
     X(PFNGLTEXSUBIMAGE2DPROC, glTexSubImage2D)                                                                         \
     X(PFNGLTEXSUBIMAGE3DPROC, glTexSubImage3D)                                                                         \
+    X(PFNGLCOMPRESSEDTEXSUBIMAGE2DPROC, glCompressedTexSubImage2D)                                                     \
     X(PFNGLPIXELSTOREIPROC, glPixelStorei)                                                                             \
     X(PFNGLBINDIMAGETEXTUREPROC, glBindImageTexture)                                                                   \
     X(PFNGLDISPATCHCOMPUTEPROC, glDispatchCompute)                                                                     \
+    X(PFNGLDISPATCHCOMPUTEINDIRECTPROC, glDispatchComputeIndirect)                                                     \
     X(PFNGLMEMORYBARRIERPROC, glMemoryBarrier)                                                                         \
     X(PFNGLFINISHPROC, glFinish)                                                                                       \
+    X(PFNGLFLUSHPROC, glFlush)                                                                                         \
     X(PFNGLPROGRAMUNIFORM1IVPROC, glProgramUniform1iv)                                                                 \
     X(PFNGLPROGRAMUNIFORM2IVPROC, glProgramUniform2iv)                                                                 \
     X(PFNGLPROGRAMUNIFORM3IVPROC, glProgramUniform3iv)                                                                 \
@@ -100,6 +107,9 @@ inline constexpr GLenum kGpuDisjoint = 0x8FBB;
     X(PfnProgramUniformDv, glProgramUniform4dv)                                                                        \
     X(PfnBufferStorage, glBufferStorage)                                                                               \
     X(PfnBufferStorage, glBufferStorageEXT)                                                                            \
+    X(PfnTextureView, glTextureView)                                                                                   \
+    X(PfnTextureView, glTextureViewOES)                                                                                \
+    X(PfnTextureView, glTextureViewEXT)                                                                                \
     X(PfnGetQueryObjectUi64v, glGetQueryObjectui64v)                                                                   \
     X(PfnGetQueryObjectUi64v, glGetQueryObjectui64vEXT)                                                                \
     X(PFNGLBEGINQUERYPROC, glBeginQueryEXT)                                                                            \

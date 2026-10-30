@@ -78,6 +78,7 @@ struct ImageModel {
     std::uint32_t binding = 0;
     tc::ImageFormat format;
     tc::Dim dim = tc::Dim::D2;
+    bool external = false; // ExternalImageBinding: a platform frame
     clang::FieldDecl const *field = nullptr;
     AccessUsage usage;
 };
@@ -89,6 +90,7 @@ struct TextureModel {
     tc::Dim dim = tc::Dim::D2;
     tc::Filter filter = tc::Filter::Nearest;
     tc::Wrap wrap = tc::Wrap::ClampToEdge;
+    tc::Mip mip = tc::Mip::None;
     clang::FieldDecl const *field = nullptr;
 };
 
@@ -129,7 +131,10 @@ struct KernelModel {
     std::vector<SharedModel> shared;
     std::vector<UniformModel> uniforms;
     std::uint32_t pushConstantSize = 0;
-    bool usesBarrier = false; // `static constexpr bool usesBarrier = true;`
+    std::uint32_t sharedBytes = 0;
+    bool usesBarrier = false;   // `static constexpr bool usesBarrier = true;`
+    bool usesSubgroups = false; // `static constexpr bool usesSubgroups = true;`
+    bool mediumFloats = false;  // `static constexpr tc::Precision floatPrecision = tc::Precision::Medium;`
 
     bool isShared(clang::FieldDecl const *field) const {
         for (auto const &variable : shared) {
@@ -191,6 +196,16 @@ struct KernelModel {
     }
 };
 
+// GL_KHR_shader_subgroup_* extensions a kernel needs (bit flags).
+enum SubgroupExtension : std::uint32_t {
+    kSubgroupBasic = 1u << 0,
+    kSubgroupVote = 1u << 1,
+    kSubgroupArithmetic = 1u << 2,
+    kSubgroupBallot = 1u << 3,
+    kSubgroupShuffle = 1u << 4,
+    kSubgroupShuffleRelative = 1u << 5,
+};
+
 // GLSL shared by every dialect: everything after the resource declarations.
 struct GlslBody {
     std::vector<std::string> bufferTypes;  // GLSL element type per KernelModel::buffers entry
@@ -202,6 +217,8 @@ struct GlslBody {
     std::vector<std::string> prototypes;
     std::vector<std::string> functions;
     bool usesDouble = false;
+    std::uint32_t features = 0;           // tc::KernelFeature bits
+    std::uint32_t subgroupExtensions = 0; // SubgroupExtension bits
 };
 
 // AST-independent result for one kernel, consumed by the output writers.
@@ -214,6 +231,7 @@ struct ResourceArtifact {
     tc::ImageFormat format;
     tc::Filter filter = tc::Filter::Nearest;
     tc::Wrap wrap = tc::Wrap::ClampToEdge;
+    tc::Mip mip = tc::Mip::None;
 };
 
 struct UniformArtifact {
@@ -245,6 +263,8 @@ struct KernelArtifact {
     std::vector<UniformArtifact> uniforms;
     std::vector<TableCheck> tableChecks;
     std::uint32_t pushConstantSize = 0;
+    std::uint32_t sharedBytes = 0;
+    std::uint32_t features = 0;
 };
 
 } // namespace tc::transpiler

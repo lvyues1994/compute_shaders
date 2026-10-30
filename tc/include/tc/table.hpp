@@ -436,6 +436,34 @@ struct TableResource {
         writeRecord(index, record);
     }
 
+    // Words [first, first + count) of words() holding every field of the
+    // elements [firstElement, firstElement + elements): what a ranged
+    // uploadTable or downloadTable moves. Layouts place each field at an
+    // address that grows with the index, so the range spans from the
+    // lowest field of the first element to the highest of the last. In Soa
+    // pages that span includes columns of neighbouring elements, which a
+    // ranged transfer moves too.
+    struct WordRange {
+        std::size_t first = 0;
+        std::size_t count = 0;
+    };
+    WordRange wordsOf(std::size_t const firstElement, std::size_t const elements) const noexcept {
+        assert(firstElement + elements <= elementCount);
+        if (elements == 0) {
+            return {};
+        }
+        auto low = storage.size();
+        auto high = std::size_t{0};
+        detail::forEachIndex(
+            [&](auto i) {
+                constexpr auto I = decltype(i)::value;
+                low = std::min(low, fieldAddress<I>(firstElement));
+                high = std::max(high, fieldAddress<I>(firstElement + elements - 1) + fieldSize<I>);
+            },
+            std::make_index_sequence<Fields::count>{});
+        return WordRange{low, high - low};
+    }
+
     // The word stream the devices upload, bind and download.
     BufferResource<std::uint32_t> &words() noexcept { return storage; }
     BufferResource<std::uint32_t> const &words() const noexcept { return storage; }

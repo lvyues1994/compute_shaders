@@ -18,7 +18,8 @@ namespace tc {
 namespace detail {
 
 template <class T>
-using EnableAtomic = std::enable_if_t<isIntegralScalar<T>, int>;
+using EnableAtomic =
+    std::enable_if_t<isIntegralScalar<T> or std::is_same_v<T, i64> or std::is_same_v<T, u64>, int>;
 
 template <class T>
 struct AtomicIdentity {

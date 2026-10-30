@@ -301,7 +301,7 @@ struct TC_KERNEL TableEdits {
 };
 
 TEST(Table, KernelsEditElementsInPlace) {
-    auto device = cpu::createDevice(cpu::CpuDeviceConfig{2});
+    auto device = cpu::createDevice(cpu::CpuDeviceConfig{2, nullptr});
     auto table = TableResource<Body>{4};
     for (std::size_t i = 0; i < table.size(); ++i) {
         table.set(i, sampleBody(static_cast<float>(i)));
@@ -385,7 +385,7 @@ struct TC_KERNEL Doubler {
 };
 
 TEST(CpuDevice, RunsKernelsWithoutTranspilation) {
-    auto device = cpu::createDevice(cpu::CpuDeviceConfig{3});
+    auto device = cpu::createDevice(cpu::CpuDeviceConfig{3, nullptr});
     auto data = BufferResource<std::int32_t>{100};
     for (int i = 0; i < 100; ++i) {
         data[i] = i;
@@ -430,7 +430,7 @@ struct TC_KERNEL UndeclaredBarrier {
 
 template <class K>
 void runOnCpu(K &kernel) {
-    auto device = cpu::createDevice(cpu::CpuDeviceConfig{1});
+    auto device = cpu::createDevice(cpu::CpuDeviceConfig{1, nullptr});
     auto out = BufferResource<uint>{4};
     kernel.out.attach(out);
     device->useKernel(kernel);

@@ -37,8 +37,9 @@ GlslangResult GlslangRunner::validate(std::string const &shaderPath) const {
     return run({shaderPath}, shaderPath + ".log");
 }
 
-GlslangResult GlslangRunner::compileSpirv(std::string const &shaderPath, std::string const &spirvPath) const {
-    auto result = run({"-V", "--target-env", "vulkan1.0", "-o", spirvPath, shaderPath}, shaderPath + ".log");
+GlslangResult GlslangRunner::compileSpirv(std::string const &shaderPath, std::string const &spirvPath,
+                                         std::string const &targetEnvironment) const {
+    auto result = run({"-V", "--target-env", targetEnvironment, "-o", spirvPath, shaderPath}, shaderPath + ".log");
     if (not result.ok) {
         return result;
     }

@@ -10,6 +10,12 @@ namespace tc {
 
 using uint = std::uint32_t;
 
+// 64-bit integers on the GPU (KernelFeature::Int64). They are `long long`:
+// std::int64_t is `long` on Linux and Android, which tc-transpile treats
+// like std::size_t, as 32 bits.
+using i64 = long long;
+using u64 = unsigned long long;
+
 // The GLSL scalar types a kernel may use; `int`/`uint` are exactly 32 bits.
 template <class T>
 inline constexpr bool isScalar = std::is_same_v<T, bool> or std::is_same_v<T, std::int32_t>

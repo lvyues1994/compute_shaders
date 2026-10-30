@@ -37,6 +37,9 @@ using RGBA32I = Format<Encoding::Integer, std::int32_t, 4>;
 using R32F = Format<Encoding::Float, float, 1>;
 using RG32F = Format<Encoding::Float, float, 2>;
 using RGBA32F = Format<Encoding::Float, float, 4>;
+using R16F = Format<Encoding::Float, half, 1>;
+using RG16F = Format<Encoding::Float, half, 2>;
+using RGBA16F = Format<Encoding::Float, half, 4>; // storage images on every target; filterable on OpenGL ES
 
 } // namespace gpu
 
@@ -75,7 +78,7 @@ inline std::string glslFormatQualifier(ImageFormat const &format) {
 inline bool isPortableStorageFormat(ImageFormat const &format) {
     auto const q = glslFormatQualifier(format);
     return q == "rgba8" or q == "rgba8ui" or q == "rgba8i" or q == "r32ui" or q == "r32i" or q == "r32f"
-        or q == "rgba32ui" or q == "rgba32i" or q == "rgba32f";
+        or q == "rgba32ui" or q == "rgba32i" or q == "rgba32f" or q == "rgba16f";
 }
 
 namespace detail {

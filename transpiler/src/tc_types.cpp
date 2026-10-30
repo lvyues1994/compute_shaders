@@ -20,6 +20,10 @@ bool isTcDecl(clang::Decl const *decl) {
     return decl != nullptr and rootNamespace(decl) == "tc";
 }
 
+bool isTcValueRecord(clang::RecordDecl const *record) {
+    return record != nullptr and record->getQualifiedNameAsString() == "tc::DispatchIndirectCommand";
+}
+
 clang::QualType bareType(clang::QualType const type) {
     return type.getNonReferenceType().getCanonicalType().getUnqualifiedType();
 }

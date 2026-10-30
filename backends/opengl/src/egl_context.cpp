@@ -130,6 +130,20 @@ std::unique_ptr<EglContext> EglContext::create(OpenGLDeviceConfig const &config)
             continue;
         }
         egl->rendererName = reinterpret_cast<char const *>(egl->gl.glGetString(GL_RENDERER));
+        auto const *displayExtensions = eglQueryString(egl->display, EGL_EXTENSIONS);
+        auto &sync = egl->syncApi;
+        sync.create = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(eglGetProcAddress("eglCreateSyncKHR"));
+        sync.destroy = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(eglGetProcAddress("eglDestroySyncKHR"));
+        sync.clientWait = reinterpret_cast<PFNEGLCLIENTWAITSYNCKHRPROC>(eglGetProcAddress("eglClientWaitSyncKHR"));
+        sync.getAttribute = reinterpret_cast<PFNEGLGETSYNCATTRIBKHRPROC>(eglGetProcAddress("eglGetSyncAttribKHR"));
+        sync.serverWait = reinterpret_cast<PFNEGLWAITSYNCKHRPROC>(eglGetProcAddress("eglWaitSyncKHR"));
+        sync.dupNativeFence =
+            reinterpret_cast<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(eglGetProcAddress("eglDupNativeFenceFDANDROID"));
+        sync.fences = hasExtension(displayExtensions, "EGL_KHR_fence_sync") and sync.create != nullptr
+                  and sync.destroy != nullptr and sync.clientWait != nullptr and sync.getAttribute != nullptr;
+        sync.serverWaits = sync.fences and hasExtension(displayExtensions, "EGL_KHR_wait_sync") and sync.serverWait != nullptr;
+        sync.nativeFences = sync.fences and hasExtension(displayExtensions, "EGL_ANDROID_native_fence_sync")
+                        and sync.dupNativeFence != nullptr;
         if (not config.deviceNameContains.empty()
             and egl->rendererName.find(config.deviceNameContains) == std::string::npos) {
             tried += " '" + egl->rendererName + "'";

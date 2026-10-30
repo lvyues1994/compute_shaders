@@ -18,7 +18,9 @@ struct GlslangRunner {
     std::string executable;
 
     GlslangResult validate(std::string const &shaderPath) const;
-    GlslangResult compileSpirv(std::string const &shaderPath, std::string const &spirvPath) const;
+    // `targetEnvironment`: vulkan1.0, or vulkan1.1 for subgroup operations.
+    GlslangResult compileSpirv(std::string const &shaderPath, std::string const &spirvPath,
+                               std::string const &targetEnvironment) const;
 
 private:
     GlslangResult run(std::vector<std::string> const &args, std::string const &logPath) const;

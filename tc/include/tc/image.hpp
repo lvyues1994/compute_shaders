@@ -6,6 +6,7 @@
 #include <tc/buffer.hpp>
 #include <tc/dim.hpp>
 #include <tc/gpu_format.hpp>
+#include <tc/mip_chain.hpp>
 #include <tc/pixel.hpp>
 
 namespace tc {
@@ -23,15 +24,28 @@ struct ImageBinding {
     using Pixel = P;
     using Traits = GPUFormatTraits<G>;
     using Resource = BufferResource<P, D>;
+    using Chain = MipChain<P, D>;
     using IndexType = typename DimTraits<D>::IndexType;
     static constexpr Dim dim = D;
     static constexpr std::uint32_t binding = Binding;
 
-    void attach(Resource &resource_) noexcept { resource = &resource_; }
-    Resource *attachedResource() const noexcept { return resource; }
+    void attach(Resource &resource_) noexcept { target = detail::ImageAttachment<P, D>{&resource_, nullptr, 0}; }
+    // Kernels read and write mip level `level` of the chain.
+    void attach(Chain &chain_, std::uint32_t const level = 0) noexcept {
+        assert(level < chain_.levels());
+        target = detail::ImageAttachment<P, D>{nullptr, &chain_, level};
+    }
+
+    // The level kernels access.
+    Resource *attachedResource() const noexcept { return target.resource(target.level); }
+    std::uint32_t level() const noexcept { return target.level; }
+    // The whole attachment, for transfers.
+    std::uint32_t levelCount() const noexcept { return target.levels(); }
+    Resource *levelResource(std::uint32_t const index) const noexcept { return target.resource(index); }
+    ResourceIdentity const *identity() const noexcept { return target.identity(); }
 
 private:
-    Resource *resource = nullptr;
+    detail::ImageAttachment<P, D> target;
 };
 
 template <class I>
@@ -40,7 +54,7 @@ struct IsImageBinding : std::false_type {};
 template <class G, Dim D, class P, std::uint32_t B>
 struct IsImageBinding<ImageBinding<G, D, P, B>> : std::true_type {};
 
-// GLSL imageSize: int-vector extent of the bound image.
+// GLSL imageSize: int-vector extent of the bound image (level).
 template <class G, Dim D, class P, std::uint32_t B>
 typename DimTraits<D>::IndexType imageSize(ImageBinding<G, D, P, B> const &image) noexcept {
     assert(image.attachedResource() != nullptr and "ImageBinding used before attach()");

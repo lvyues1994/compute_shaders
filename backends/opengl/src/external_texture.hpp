@@ -23,4 +23,8 @@ struct ExternalTexture {
 // Throws DeviceError when the platform or driver cannot import `image`.
 std::unique_ptr<ExternalTexture> importExternalTexture(EglContext const &egl, ExternalImage const &image);
 
+// An RGBA frame as an immutable GL_TEXTURE_2D that image units can write
+// (GL_EXT_EGL_image_storage).
+std::unique_ptr<ExternalTexture> importExternalStorage(EglContext const &egl, ExternalImage const &image);
+
 } // namespace tc::opengl

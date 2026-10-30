@@ -62,12 +62,16 @@ bool compileShaders(KernelArtifact &kernel, GlslangRunner const &glslang) {
     if (not writeFile(desktop, kernel.glslDesktop) or not writeFile(vulkan, kernel.glslVulkan)) {
         return false;
     }
-    auto const desktopResult = glslang.validate(desktop);
+    // glslang has no 64-bit atomics for desktop GLSL (GL_NV_shader_atomic_int64);
+    // the driver checks that variant when the OpenGL backend compiles it.
+    auto const checkDesktop = not tc::uses(kernel.features, tc::KernelFeature::Int64Atomics);
+    auto const desktopResult = checkDesktop ? glslang.validate(desktop) : GlslangResult{true, {}, {}};
     if (not desktopResult.ok) {
         llvm::errs() << desktop << ": error: generated OpenGL GLSL does not compile:\n" << desktopResult.log << "\n";
         return false;
     }
-    auto spirv = glslang.compileSpirv(vulkan, vulkan + ".spv");
+    auto const subgroups = tc::uses(kernel.features, tc::KernelFeature::Subgroups);
+    auto spirv = glslang.compileSpirv(vulkan, vulkan + ".spv", subgroups ? "vulkan1.1" : "vulkan1.0");
     if (not spirv.ok) {
         llvm::errs() << vulkan << ": error: generated Vulkan GLSL does not compile:\n" << spirv.log << "\n";
         return false;
@@ -88,6 +92,47 @@ bool compileShaders(KernelArtifact &kernel, GlslangRunner const &glslang) {
         kernel.glslEs.clear();
     }
     return true;
+}
+
+// The interface text ProgramRegistry::reloadFrom compares with the
+// registered program, from the same reflection the registration source has.
+std::string interfaceOf(KernelArtifact const &kernel) {
+    auto resources = std::vector<tc::ResourceSlot>{};
+    for (auto const &resource : kernel.resources) {
+        auto slot = tc::ResourceSlot{};
+        slot.name = resource.name;
+        slot.binding = resource.binding;
+        slot.kind = resource.kind;
+        slot.access = resource.access;
+        slot.imageDim = resource.dim;
+        slot.imageFormat = resource.format;
+        if (resource.kind == tc::ResourceKind::SampledTexture) {
+            slot.filter = resource.filter;
+            slot.wrap = resource.wrap;
+            slot.mip = resource.mip;
+        }
+        resources.push_back(slot);
+    }
+    auto uniforms = std::vector<tc::UniformSlot>{};
+    for (auto const &uniform : kernel.uniforms) {
+        auto slot = tc::UniformSlot{};
+        slot.name = uniform.name;
+        slot.location = uniform.location;
+        slot.scalar = uniform.scalar;
+        slot.components = uniform.components;
+        slot.columns = uniform.columns;
+        slot.pushConstantOffset = uniform.pushConstantOffset;
+        uniforms.push_back(slot);
+    }
+    auto program = tc::KernelProgram{};
+    program.name = kernel.name;
+    program.localSize = tc::uvec3{kernel.localSize[0], kernel.localSize[1], kernel.localSize[2]};
+    program.resources = tc::Span<tc::ResourceSlot const>{resources.data(), resources.size()};
+    program.uniforms = tc::Span<tc::UniformSlot const>{uniforms.data(), uniforms.size()};
+    program.pushConstantSize = kernel.pushConstantSize;
+    program.sharedBytes = kernel.sharedBytes;
+    program.features = kernel.features;
+    return tc::describeInterface(program);
 }
 
 std::string resolveGlslang() {
@@ -119,7 +164,7 @@ int main(int argc, char const **argv) {
     tool.clearArgumentsAdjusters();
     tool.appendArgumentsAdjuster(clang::tooling::getClangSyntaxOnlyAdjuster());
     tool.appendArgumentsAdjuster(clang::tooling::getInsertArgumentAdjuster(
-        {"-xc++", "-Wno-pragma-once-outside-header", "-resource-dir", TC_CLANG_RESOURCE_DIR},
+        {"-xc++", "-Wno-pragma-once-outside-header", "-DTC_TRANSPILER=1", "-resource-dir", TC_CLANG_RESOURCE_DIR},
         clang::tooling::ArgumentInsertPosition::BEGIN));
 
     auto const sourceName = llvm::sys::path::filename(sources.front()).str();
@@ -140,6 +185,11 @@ int main(int argc, char const **argv) {
     }
     for (auto &kernel : result.kernels) {
         if (not compileShaders(kernel, glslang)) {
+            return EXIT_FAILURE;
+        }
+        auto interfacePath = llvm::SmallString<256>{glslDirectory.getValue()};
+        llvm::sys::path::append(interfacePath, kernel.name + ".interface");
+        if (not writeFile(std::string{interfacePath}, interfaceOf(kernel))) {
             return EXIT_FAILURE;
         }
     }
