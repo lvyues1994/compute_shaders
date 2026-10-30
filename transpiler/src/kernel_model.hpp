@@ -36,6 +36,43 @@ struct BufferModel {
     AccessUsage usage;
 };
 
+// One field of a table element in the packed word layout (tc/table.hpp).
+struct PackedField {
+    clang::FieldDecl const *decl = nullptr; // nullptr: the element itself (vector, matrix or array tables)
+    clang::QualType type;
+    std::uint32_t offset = 0; // first word within the packed record
+    std::uint32_t words = 0;
+};
+
+struct PackedLayout {
+    std::uint32_t words = 0;
+    bool isRecord = false;
+    std::vector<PackedField> fields;
+};
+
+// A table layout type (tc::Aos, tc::Soa<P> or a user layout, see
+// tc/table.hpp): fieldAddress is translated to GLSL, fieldAlignment evaluated.
+struct TableAddressing {
+    clang::CXXRecordDecl const *record = nullptr;
+    clang::CXXMethodDecl const *fieldAddress = nullptr;
+    clang::CXXMethodDecl const *fieldAlignment = nullptr;
+    bool contiguousRecords = true;
+};
+
+struct TableModel {
+    std::string name;
+    std::uint32_t binding = 0;
+    clang::QualType elementType;
+    std::string elementCppName; // fully qualified, for the generated layout checks
+    TableAddressing addressing;
+    PackedLayout layout;
+    clang::FieldDecl const *field = nullptr;
+    AccessUsage usage;
+    // uvec2 / uvec4 views of the same buffer used by the generated accessors.
+    bool usesView2 = false;
+    bool usesView4 = false;
+};
+
 struct ImageModel {
     std::string name;
     std::uint32_t binding = 0;
@@ -85,6 +122,7 @@ struct KernelModel {
     std::string programName;
     std::array<std::uint32_t, 3> localSize{1, 1, 1};
     std::vector<BufferModel> buffers;
+    std::vector<TableModel> tables;
     std::vector<ImageModel> images;
     std::vector<TextureModel> textures;
     std::vector<ExternalTextureModel> externalTextures;
@@ -125,6 +163,15 @@ struct KernelModel {
         return nullptr;
     }
 
+    TableModel *findTable(clang::FieldDecl const *field) {
+        for (auto &table : tables) {
+            if (table.field == field) {
+                return &table;
+            }
+        }
+        return nullptr;
+    }
+
     ImageModel *findImage(clang::FieldDecl const *field) {
         for (auto &image : images) {
             if (image.field == field) {
@@ -151,6 +198,7 @@ struct GlslBody {
     std::vector<std::string> shared;       // `T name[N]` per KernelModel::shared entry
     std::vector<std::string> structs;
     std::vector<std::string> constants;
+    std::vector<std::string> tableAccessors; // generated get/set functions of the tables
     std::vector<std::string> prototypes;
     std::vector<std::string> functions;
     bool usesDouble = false;
@@ -177,6 +225,14 @@ struct UniformArtifact {
     std::uint32_t pushConstantOffset = 0;
 };
 
+// The packed layout tc-transpile assumed for a table element; the generated
+// source asserts that tc/table.hpp computes the same.
+struct TableCheck {
+    std::string elementType;
+    std::uint32_t words = 0;
+    std::vector<std::uint32_t> fieldOffsets; // empty unless the element is a struct
+};
+
 struct KernelArtifact {
     std::string name;
     std::array<std::uint32_t, 3> localSize{1, 1, 1};
@@ -187,6 +243,7 @@ struct KernelArtifact {
     std::vector<std::uint32_t> spirv;
     std::vector<ResourceArtifact> resources;
     std::vector<UniformArtifact> uniforms;
+    std::vector<TableCheck> tableChecks;
     std::uint32_t pushConstantSize = 0;
 };
 

@@ -12,6 +12,12 @@ using PfnBufferStorage = void(GL_APIENTRY *)(GLenum, GLsizeiptr, void const *, G
 inline constexpr GLbitfield kMapPersistentBit = 0x0040;
 inline constexpr GLbitfield kMapCoherentBit = 0x0080;
 
+// Timer queries: core in desktop OpenGL 3.3, GL_EXT_disjoint_timer_query on
+// OpenGL ES.
+using PfnGetQueryObjectUi64v = void(GL_APIENTRY *)(GLuint, GLenum, GLuint64 *);
+inline constexpr GLenum kTimeElapsed = 0x88BF;
+inline constexpr GLenum kGpuDisjoint = 0x8FBB;
+
 // Entry points of the OpenGL 4.3 core / OpenGL ES 3.1 common subset that the
 // backend uses, loaded at runtime so one binary drives both APIs.
 #define TC_GL_REQUIRED_FUNCTIONS(X)                                                                                    \
@@ -79,7 +85,11 @@ inline constexpr GLbitfield kMapCoherentBit = 0x0080;
     X(PFNGLDELETESAMPLERSPROC, glDeleteSamplers)                                                                       \
     X(PFNGLSAMPLERPARAMETERIPROC, glSamplerParameteri)                                                                 \
     X(PFNGLBINDSAMPLERPROC, glBindSampler)                                                                             \
-    X(PFNGLGETSTRINGIPROC, glGetStringi)
+    X(PFNGLGETSTRINGIPROC, glGetStringi)                                                                               \
+    X(PFNGLGENQUERIESPROC, glGenQueries)                                                                               \
+    X(PFNGLDELETEQUERIESPROC, glDeleteQueries)                                                                         \
+    X(PFNGLBEGINQUERYPROC, glBeginQuery)                                                                               \
+    X(PFNGLENDQUERYPROC, glEndQuery)
 
 #define TC_GL_OPTIONAL_FUNCTIONS(X)                                                                                    \
     X(PFNGLDEBUGMESSAGECALLBACKPROC, glDebugMessageCallback)                                                           \
@@ -89,7 +99,11 @@ inline constexpr GLbitfield kMapCoherentBit = 0x0080;
     X(PfnProgramUniformDv, glProgramUniform3dv)                                                                        \
     X(PfnProgramUniformDv, glProgramUniform4dv)                                                                        \
     X(PfnBufferStorage, glBufferStorage)                                                                               \
-    X(PfnBufferStorage, glBufferStorageEXT)
+    X(PfnBufferStorage, glBufferStorageEXT)                                                                            \
+    X(PfnGetQueryObjectUi64v, glGetQueryObjectui64v)                                                                   \
+    X(PfnGetQueryObjectUi64v, glGetQueryObjectui64vEXT)                                                                \
+    X(PFNGLBEGINQUERYPROC, glBeginQueryEXT)                                                                            \
+    X(PFNGLENDQUERYPROC, glEndQueryEXT)
 
 struct GlApi {
 #define TC_GL_DECLARE(type, name) type name = nullptr;

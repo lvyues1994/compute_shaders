@@ -1,5 +1,6 @@
 #include "glsl_writer.hpp"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <clang/Basic/SourceManager.h>
 
 #include "glsl_names.hpp"
+#include "packed_layout.hpp"
 #include "tc_types.hpp"
 
 namespace tc::transpiler {
@@ -149,6 +151,7 @@ private:
     // Types.
     std::string typeName(clang::QualType type, clang::SourceLocation loc);
     std::string declaration(clang::QualType type, std::string const &name, clang::SourceLocation loc);
+    std::string recordName(clang::CXXRecordDecl const *record, clang::SourceLocation loc);
     std::string requireStruct(clang::CXXRecordDecl const *record, clang::SourceLocation loc);
     std::string fieldName(clang::FieldDecl const *field) { return glslIdentifier(field->getName()); }
     std::string zeroValue(clang::QualType type, clang::SourceLocation loc);
@@ -168,6 +171,7 @@ private:
 
     // Functions.
     std::string requireFunction(clang::FunctionDecl const *decl, FunctionKind kind, clang::SourceLocation loc);
+    std::string functionBaseName(clang::FunctionDecl const *decl, clang::SourceLocation loc);
     std::string signature(FunctionEntry const &entry);
     std::string definition(FunctionEntry const &entry);
     bool checkRecursion();
@@ -201,6 +205,38 @@ private:
     std::string arrayInit(clang::InitListExpr const *list, clang::QualType element, std::uint64_t size);
     std::string structValue(clang::CXXRecordDecl const *record, clang::SourceLocation loc);
 
+    // Tables: `t[i]` and `t[i].field` reads become calls of generated
+    // accessors; writes are rewritten statement by statement.
+    struct TableAccess {
+        TableModel *table = nullptr;
+        clang::Expr const *index = nullptr;
+        PackedField const *field = nullptr; // nullptr: the whole element
+        clang::Expr const *node = nullptr;  // the subscript, or the member expression selecting `field`
+    };
+    TableModel *tableOfSubscript(clang::CXXOperatorCallExpr const *call);
+    std::optional<TableAccess> tableFieldAccess(clang::MemberExpr const *member);
+    std::optional<TableAccess> tableTarget(clang::Expr const *e);
+    std::string tableRead(TableAccess const &access, Role inherited, clang::SourceLocation loc);
+    std::optional<std::string> tableWriteStatement(clang::Expr const *e, int depth);
+    std::string tableIndex(clang::Expr const *index);
+    // The words an accessor of element `i` touches: [first, last) counted
+    // from a base that is aligned to `vector` words, so they can be moved in
+    // uvec2 / uvec4 chunks that never leave the element.
+    struct TableWindow {
+        std::string chunkBase; // index of chunk 0 in the `vector`-word view
+        std::uint32_t vector = 1;
+        std::uint32_t first = 0;
+        std::uint32_t last = 0;
+    };
+    TableWindow tableWindow(TableModel &table, PackedField const *field);
+    std::string tableView(TableModel &table, std::uint32_t vector);
+    std::string tableGetter(TableModel &table, PackedField const *field);
+    std::string tableSetter(TableModel &table, PackedField const *field);
+    std::string unpackValue(clang::QualType type, std::vector<std::string> const &words, std::uint32_t &cursor,
+                            clang::SourceLocation loc);
+    void packWords(clang::QualType type, std::string const &value, std::vector<std::string> &words,
+                   clang::SourceLocation loc);
+
     bool isAtomicTarget(clang::Expr const *e) const;
     void markBufferUse(clang::Expr const *object, Role role);
     void markImageUse(clang::Expr const *image, bool write);
@@ -227,6 +263,12 @@ private:
     std::map<clang::FunctionDecl const *, std::set<clang::FunctionDecl const *>> callGraph;
     std::map<clang::ValueDecl const *, std::string> localNames;
     std::vector<std::string> constantInitializers;
+    std::set<std::string> definedAccessors;
+    // While rewriting a table write, the access that a local copy replaces.
+    struct Replacement {
+        clang::Expr const *node = nullptr;
+        std::string name;
+    } replacement;
 
     clang::FunctionDecl const *currentFunction = nullptr;
     FunctionKind currentKind = FunctionKind::KernelEntry;
@@ -291,6 +333,9 @@ std::string Writer::typeName(clang::QualType const original, clang::SourceLocati
         unsupported(loc, "pointer or unsized array type '" + original.getAsString() + "'");
         return "int";
     }
+    if (auto const *encoded = asTcSpecialization(type, "Encoded")) {
+        return typeName(templateTypeArg(encoded, 0), loc); // only tables store the encoding
+    }
     if (auto const *record = type->getAsCXXRecordDecl()) {
         if (isTcDecl(record)) {
             diags.error(loc, "'" + original.getAsString() + "' cannot be used as a value inside a kernel");
@@ -320,6 +365,26 @@ std::string Writer::declaration(clang::QualType const original, std::string cons
     return typeName(type, loc) + " " + name + dims;
 }
 
+// The GLSL spelling of a record name: template arguments are appended, and
+// tc records (codecs) get a tc_ prefix so they cannot clash with user names.
+std::string Writer::recordName(clang::CXXRecordDecl const *record, clang::SourceLocation const loc) {
+    auto name = (isTcDecl(record) ? "tc_" : "") + glslIdentifier(record->getName());
+    if (auto const *spec = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
+        for (auto const &arg : spec->getTemplateArgs().asArray()) {
+            if (arg.getKind() == clang::TemplateArgument::Type) {
+                auto part = typeName(arg.getAsType(), loc);
+                for (auto &c : part) {
+                    c = (c == '[' or c == ']') ? '_' : c;
+                }
+                name += "_" + part;
+            } else if (arg.getKind() == clang::TemplateArgument::Integral) {
+                name += "_" + std::to_string(arg.getAsIntegral().getExtValue());
+            }
+        }
+    }
+    return name;
+}
+
 std::string Writer::requireStruct(clang::CXXRecordDecl const *record, clang::SourceLocation const loc) {
     record = record->getDefinition();
     if (record == nullptr) {
@@ -340,20 +405,7 @@ std::string Writer::requireStruct(clang::CXXRecordDecl const *record, clang::Sou
         return "int";
     }
     structsInProgress.insert(record);
-    auto name = glslIdentifier(record->getName());
-    if (auto const *spec = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
-        for (auto const &arg : spec->getTemplateArgs().asArray()) {
-            if (arg.getKind() == clang::TemplateArgument::Type) {
-                auto part = typeName(arg.getAsType(), loc);
-                for (auto &c : part) {
-                    c = (c == '[' or c == ']') ? '_' : c;
-                }
-                name += "_" + part;
-            } else if (arg.getKind() == clang::TemplateArgument::Integral) {
-                name += "_" + std::to_string(arg.getAsIntegral().getExtValue());
-            }
-        }
-    }
+    auto const name = recordName(record, loc);
     auto text = "struct " + name + " {\n";
     for (auto const *field : record->fields()) {
         if (field->isBitField()) {
@@ -393,6 +445,9 @@ std::string Writer::zeroValue(clang::QualType const original, clang::SourceLocat
         auto elements =
             std::vector<std::string>(carray->getSize().getZExtValue(), zeroValue(carray->getElementType(), loc));
         return typeName(type, loc) + "(" + join(elements, ", ") + ")";
+    }
+    if (auto const *encoded = asTcSpecialization(type, "Encoded")) {
+        return zeroValue(templateTypeArg(encoded, 0), loc);
     }
     if (auto const *record = type->getAsCXXRecordDecl()) {
         return structValue(record, loc);
@@ -462,6 +517,9 @@ std::string Writer::constantValue(clang::APValue const &value, clang::QualType c
     }
     if (auto const *carray = context.getAsConstantArrayType(type)) {
         return arrayConstant(value, carray->getElementType(), carray->getSize().getZExtValue(), loc);
+    }
+    if (auto const *encoded = asTcSpecialization(type, "Encoded")) {
+        return constantValue(value.getStructField(0), templateTypeArg(encoded, 0), loc);
     }
     if (auto const *record = type->getAsCXXRecordDecl()) {
         auto const name = requireStruct(record, loc);
@@ -627,38 +685,131 @@ std::string Writer::requireFunction(clang::FunctionDecl const *decl, FunctionKin
     }
     if (decl->getReturnType()->isReferenceType() or decl->getReturnType()->isPointerType()) {
         unsupported(decl->getLocation(), "returning a reference or pointer");
-    }
-    if (decl->isOverloadedOperator()) {
-        diags.error(loc, "user-defined operators are not supported in kernels; use a named function");
+        if (decl->isOverloadedOperator()) {
+            diags.note(decl->getLocation(), "operators such as += that return *this cannot be translated; return the "
+                                            "result by value (`T operator+(T, T)`) and assign it");
+        }
     }
     auto entry = FunctionEntry{};
     entry.decl = decl;
     entry.kind = kind;
-    auto const baseName = decl->getDeclName().isIdentifier() ? decl->getName().str() : std::string{"op"};
+    auto const baseName = functionBaseName(decl, loc);
     switch (kind) {
     case FunctionKind::KernelEntry:
         entry.glslName = "main";
         break;
     case FunctionKind::StructMethod:
-        entry.glslName =
-            requireStruct(llvm::cast<clang::CXXMethodDecl>(decl)->getParent(), loc) + "_" + glslIdentifier(baseName);
+        entry.glslName = requireStruct(llvm::cast<clang::CXXMethodDecl>(decl)->getParent(), loc) + "_" + baseName;
         break;
     case FunctionKind::Free:
         if (auto const *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
             method != nullptr and method->getParent() != kernel.record) {
-            entry.glslName = requireStruct(method->getParent(), loc) + "_" + glslIdentifier(baseName);
+            // A static member function: no struct value is involved.
+            entry.glslName = recordName(method->getParent(), loc) + "_" + baseName;
         } else {
-            entry.glslName = glslIdentifier(baseName);
+            entry.glslName = baseName;
         }
         break;
     case FunctionKind::KernelMethod:
-        entry.glslName = glslIdentifier(baseName);
+        entry.glslName = baseName;
         break;
+    }
+    // GLSL overloads only on parameter types; template instances such as
+    // scale<2> and scale<3> would collide, as would a function and a constant.
+    if (kind != FunctionKind::KernelEntry) {
+        entry.glslName = uniqueGlobalName(entry.glslName);
     }
     functionIndex.emplace(decl, functions.size());
     pending.push_back(functions.size());
     functions.push_back(entry);
     return entry.glslName;
+}
+
+namespace {
+
+char const *operatorWord(clang::OverloadedOperatorKind const op, unsigned const params) {
+    switch (op) {
+    case clang::OO_Plus:
+        return params == 1 ? "pos" : "add";
+    case clang::OO_Minus:
+        return params == 1 ? "neg" : "sub";
+    case clang::OO_Star:
+        return "mul";
+    case clang::OO_Slash:
+        return "div";
+    case clang::OO_Percent:
+        return "mod";
+    case clang::OO_Caret:
+        return "xor";
+    case clang::OO_Amp:
+        return "and";
+    case clang::OO_Pipe:
+        return "or";
+    case clang::OO_Tilde:
+        return "compl";
+    case clang::OO_Exclaim:
+        return "not";
+    case clang::OO_Less:
+        return "lt";
+    case clang::OO_Greater:
+        return "gt";
+    case clang::OO_LessEqual:
+        return "le";
+    case clang::OO_GreaterEqual:
+        return "ge";
+    case clang::OO_EqualEqual:
+        return "eq";
+    case clang::OO_ExclaimEqual:
+        return "ne";
+    case clang::OO_LessLess:
+        return "shl";
+    case clang::OO_GreaterGreater:
+        return "shr";
+    case clang::OO_AmpAmp:
+        return "land";
+    case clang::OO_PipePipe:
+        return "lor";
+    case clang::OO_Subscript:
+        return "at";
+    case clang::OO_Call:
+        return "call";
+    default:
+        return "op";
+    }
+}
+
+} // namespace
+
+// Identifier part of a function's GLSL name: operators and conversions get
+// words, template instances their arguments (`lerp_float`, `scale_2`).
+std::string Writer::functionBaseName(clang::FunctionDecl const *decl, clang::SourceLocation const loc) {
+    auto name = std::string{};
+    if (decl->getDeclName().isIdentifier()) {
+        name = glslIdentifier(decl->getName());
+    } else if (decl->isOverloadedOperator()) {
+        auto const *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
+        auto const params = decl->getNumParams() + (method != nullptr and not method->isStatic() ? 1 : 0);
+        name = std::string{"op_"} + operatorWord(decl->getOverloadedOperator(), params);
+    } else if (auto const *conversion = llvm::dyn_cast<clang::CXXConversionDecl>(decl)) {
+        name = "to_" + typeName(conversion->getConversionType(), loc);
+    } else {
+        name = "fn";
+    }
+    if (auto const *args = decl->getTemplateSpecializationArgs()) {
+        for (auto const &arg : args->asArray()) {
+            if (arg.getKind() == clang::TemplateArgument::Type) {
+                auto part = typeName(arg.getAsType(), loc);
+                for (auto &c : part) {
+                    c = std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+                }
+                name += "_" + part;
+            } else if (arg.getKind() == clang::TemplateArgument::Integral) {
+                auto const value = arg.getAsIntegral().getExtValue();
+                name += "_" + (value < 0 ? "m" + std::to_string(-value) : std::to_string(value));
+            }
+        }
+    }
+    return name;
 }
 
 std::string Writer::signature(FunctionEntry const &entry) {
@@ -843,6 +994,9 @@ std::string Writer::stmt(clang::Stmt const *s, int const depth) {
         return stmt(attributed->getSubStmt(), depth);
     }
     if (auto const *e = llvm::dyn_cast<clang::Expr>(s)) {
+        if (auto rewritten = tableWriteStatement(e, depth)) {
+            return *rewritten;
+        }
         return pad + expr(e) + ";\n";
     }
     if (llvm::isa<clang::CXXTryStmt>(s)) {
@@ -879,6 +1033,10 @@ std::string Writer::varDecl(clang::VarDecl const *var) {
         if (isNonConstLValueRef(type)) {
             diags.error(var->getLocation(), "GLSL has no references; '" + var->getName().str()
                                                 + "' must be a copy or a const reference");
+        } else if (var->getInit() != nullptr and tableTarget(var->getInit())) {
+            diags.error(var->getLocation(), "'" + var->getName().str()
+                                                + "' must be a copy of the table element (drop the '&'): on the "
+                                                  "CPU a reference would see later writes, on the GPU it cannot");
         }
         type = type.getNonReferenceType();
     }
@@ -1195,8 +1353,8 @@ clang::FieldDecl const *Writer::kernelField(clang::Expr const *e) const {
 }
 
 std::string Writer::kernelMember(clang::FieldDecl const *field, Role const inherited, clang::SourceLocation const loc) {
-    if (kernel.findBuffer(field) != nullptr or kernel.findImage(field) != nullptr or kernel.isTexture(field)
-        or kernel.isShared(field)) {
+    if (kernel.findBuffer(field) != nullptr or kernel.findTable(field) != nullptr or kernel.findImage(field) != nullptr
+        or kernel.isTexture(field) or kernel.isShared(field)) {
         return glslIdentifier(field->getName());
     }
     if (kernel.findUniform(field) != nullptr) {
@@ -1214,6 +1372,12 @@ std::string Writer::kernelMember(clang::FieldDecl const *field, Role const inher
 
 std::string Writer::member(clang::MemberExpr const *me, Role const inherited) {
     auto const loc = me->getBeginLoc();
+    if (me == replacement.node) {
+        return replacement.name;
+    }
+    if (auto const access = tableFieldAccess(me)) {
+        return tableRead(*access, inherited, loc);
+    }
     auto const *base = me->getBase();
     auto const baseIsThis = llvm::isa<clang::CXXThisExpr>(base->IgnoreParenImpCasts());
     if (auto const *var = llvm::dyn_cast<clang::VarDecl>(me->getMemberDecl())) {
@@ -1242,7 +1406,8 @@ std::string Writer::member(clang::MemberExpr const *me, Role const inherited) {
         return "0";
     }
     if (asTcSpecialization(field->getParent(), "Uniform") != nullptr
-        or asTcSpecialization(field->getParent(), "Shared") != nullptr) {
+        or asTcSpecialization(field->getParent(), "Shared") != nullptr
+        or asTcSpecialization(field->getParent(), "Encoded") != nullptr) {
         return exprAs(base, inherited);
     }
     auto const object = exprAs(base, inherited);
@@ -1318,18 +1483,26 @@ std::string Writer::memberCall(clang::CXXMemberCallExpr const *mc, Role const in
     auto const name = method->getDeclName().isIdentifier() ? method->getName() : llvm::StringRef{};
     auto const args = llvm::ArrayRef<clang::Expr const *>{mc->getArgs(), mc->getNumArgs()};
 
-    if (llvm::isa<clang::CXXConversionDecl>(method)) {
-        if (asTcSpecialization(record, "Uniform") != nullptr or asTcSpecialization(record, "Shared") != nullptr) {
-            return exprAs(object, inherited);
-        }
-        unsupported(loc, "user-defined conversion");
-        return "0";
+    if (llvm::isa<clang::CXXConversionDecl>(method)
+        and (asTcSpecialization(record, "Uniform") != nullptr or asTcSpecialization(record, "Shared") != nullptr
+             or asTcSpecialization(record, "Encoded") != nullptr)) {
+        return exprAs(object, inherited);
     }
     if (asTcSpecialization(record, "detail::VecFields") != nullptr and isSwizzleName(name)) {
         return expr(object) + "." + name.str();
     }
     if (asTcSpecialization(record, "BufferBinding") != nullptr and name == "length") {
         return expr(object) + ".length()";
+    }
+    if (asTcSpecialization(record, "TableBinding") != nullptr and name == "length") {
+        auto const *field = kernelField(object);
+        auto *table = field != nullptr ? kernel.findTable(field) : nullptr;
+        if (table == nullptr) {
+            unsupported(loc, "a TableBinding that is not a member of the kernel");
+            return "0";
+        }
+        table->usage.read = true;
+        return "int(" + table->name + "[0])"; // header word 0: the element count
     }
     if (auto const array = asStdArray(context.getRecordType(record))) {
         if (name == "size") {
@@ -1365,6 +1538,17 @@ std::string Writer::operatorCall(clang::CXXOperatorCallExpr const *oc, Role cons
     if (op == clang::OO_Subscript) {
         auto const *object = oc->getArg(0);
         auto const objectType = bareType(object->getType());
+        if (asTcSpecialization(objectType, "TableBinding") != nullptr) {
+            if (oc == replacement.node) {
+                return replacement.name;
+            }
+            auto *table = tableOfSubscript(oc);
+            if (table == nullptr) {
+                unsupported(loc, "a TableBinding that is not a member of the kernel");
+                return "0";
+            }
+            return tableRead(TableAccess{table, oc->getArg(1), nullptr, oc}, inherited, loc);
+        }
         if (asTcSpecialization(objectType, "BufferBinding") != nullptr) {
             markBufferUse(object, inherited);
             auto const name = expr(object);
@@ -1375,16 +1559,32 @@ std::string Writer::operatorCall(clang::CXXOperatorCallExpr const *oc, Role cons
             auto const base = exprAs(object, inherited);
             return base + "[" + expr(oc->getArg(1)) + "]";
         }
-        unsupported(loc, "operator[] of '" + objectType.getAsString() + "'");
-        return "0";
+        if (callee == nullptr or isTcDecl(callee) or callee->isInStdNamespace()) {
+            unsupported(loc, "operator[] of '" + objectType.getAsString() + "'");
+            return "0";
+        }
     }
     auto const *method = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(callee);
     auto const isImplicitAssignment = method != nullptr
                                   and (method->isCopyAssignmentOperator() or method->isMoveAssignmentOperator())
                                   and (method->isImplicit() or method->isDefaulted());
-    if (callee == nullptr or (not isTcDecl(callee) and not isImplicitAssignment)) {
-        diags.error(loc, "user-defined operators are not supported in kernels; use a named function");
+    if (callee == nullptr) {
+        unsupported(loc, "calling an operator through a pointer");
         return "0";
+    }
+    // Operators of user types become calls of their translated functions.
+    if (not isTcDecl(callee) and not isImplicitAssignment) {
+        auto const args = llvm::ArrayRef<clang::Expr const *>{oc->getArgs(), oc->getNumArgs()};
+        if (method != nullptr and not method->isStatic()) {
+            auto const fn = requireFunction(method, FunctionKind::StructMethod, loc);
+            if (not method->isConst() and not args[0]->isLValue()) {
+                diags.error(loc, "non-const member operators can only be applied to variables in kernels");
+            }
+            auto const self = exprAs(args[0], method->isConst() ? Role::Read : Role::ReadWrite);
+            auto const rest = arguments(method, args.drop_front());
+            return fn + "(" + self + (rest.empty() ? "" : ", " + rest) + ")";
+        }
+        return requireFunction(callee, FunctionKind::Free, loc) + "(" + arguments(callee, args) + ")";
     }
     auto const spelling = std::string{clang::getOperatorSpelling(op)};
     switch (op) {
@@ -1480,6 +1680,9 @@ std::string Writer::construct(clang::CXXConstructExpr const *ctor, Role const in
     if (decl->isCopyOrMoveConstructor() and ctor->getNumArgs() >= 1) {
         return exprAs(ctor->getArg(0), inherited);
     }
+    if (asTcSpecialization(type, "Encoded") != nullptr) {
+        return ctor->getNumArgs() == 1 ? expr(ctor->getArg(0)) : zeroValue(type, loc);
+    }
     if (asTcVec(type) or asTcMat(type)) {
         if (ctor->getNumArgs() == 0) {
             return zeroValue(type, loc);
@@ -1550,6 +1753,442 @@ std::string Writer::initList(clang::InitListExpr const *list) {
     }
     unsupported(loc, "this initializer list");
     return "0";
+}
+
+// ---------------------------------------------------------------- tables
+
+namespace {
+
+// `t[i]` may reach a member access or an assignment through temporaries and
+// no-op casts.
+clang::Expr const *stripTableWrappers(clang::Expr const *e) {
+    for (;;) {
+        if (auto const *paren = llvm::dyn_cast<clang::ParenExpr>(e)) {
+            e = paren->getSubExpr();
+        } else if (auto const *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+                   cast != nullptr
+                   and (cast->getCastKind() == clang::CK_NoOp or cast->getCastKind() == clang::CK_LValueToRValue
+                        or cast->getCastKind() == clang::CK_DerivedToBase
+                        or cast->getCastKind() == clang::CK_UncheckedDerivedToBase)) {
+            e = cast->getSubExpr();
+        } else if (auto const *temp = llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e)) {
+            e = temp->getSubExpr();
+        } else if (auto const *bind = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(e)) {
+            e = bind->getSubExpr();
+        } else if (auto const *full = llvm::dyn_cast<clang::FullExpr>(e)) {
+            e = full->getSubExpr();
+        } else {
+            return e;
+        }
+    }
+}
+
+bool isCompoundAssignment(clang::OverloadedOperatorKind const op) {
+    switch (op) {
+    case clang::OO_PlusEqual:
+    case clang::OO_MinusEqual:
+    case clang::OO_StarEqual:
+    case clang::OO_SlashEqual:
+    case clang::OO_PercentEqual:
+    case clang::OO_AmpEqual:
+    case clang::OO_PipeEqual:
+    case clang::OO_CaretEqual:
+    case clang::OO_LessLessEqual:
+    case clang::OO_GreaterGreaterEqual:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+TableModel *Writer::tableOfSubscript(clang::CXXOperatorCallExpr const *call) {
+    if (call->getOperator() != clang::OO_Subscript
+        or asTcSpecialization(bareType(call->getArg(0)->getType()), "TableBinding") == nullptr) {
+        return nullptr;
+    }
+    auto const *field = kernelField(call->getArg(0));
+    return field != nullptr ? kernel.findTable(field) : nullptr;
+}
+
+// `t[i].field` for a top-level field of a struct element.
+std::optional<Writer::TableAccess> Writer::tableFieldAccess(clang::MemberExpr const *member) {
+    auto const *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+    auto const *call = llvm::dyn_cast<clang::CXXOperatorCallExpr>(stripTableWrappers(member->getBase()));
+    if (field == nullptr or call == nullptr) {
+        return std::nullopt;
+    }
+    auto *table = tableOfSubscript(call);
+    if (table == nullptr or not table->layout.isRecord) {
+        return std::nullopt;
+    }
+    for (auto const &packed : table->layout.fields) {
+        if (packed.decl->getCanonicalDecl() == field->getCanonicalDecl()) {
+            return TableAccess{table, call->getArg(1), &packed, member};
+        }
+    }
+    return std::nullopt;
+}
+
+// The table access an lvalue such as `t[i].velocity.y` or `t[i].weights[2]`
+// lives in: the top-level field, or the whole element.
+std::optional<Writer::TableAccess> Writer::tableTarget(clang::Expr const *e) {
+    for (auto const *node = e;;) {
+        node = stripTableWrappers(node);
+        if (auto const *member = llvm::dyn_cast<clang::MemberExpr>(node)) {
+            if (auto const access = tableFieldAccess(member)) {
+                return access;
+            }
+            if (llvm::isa<clang::CXXThisExpr>(member->getBase()->IgnoreParenImpCasts())) {
+                return std::nullopt;
+            }
+            node = member->getBase();
+        } else if (auto const *call = llvm::dyn_cast<clang::CXXOperatorCallExpr>(node);
+                   call != nullptr and call->getOperator() == clang::OO_Subscript) {
+            if (auto *table = tableOfSubscript(call)) {
+                return TableAccess{table, call->getArg(1), nullptr, call};
+            }
+            node = call->getArg(0);
+        } else if (auto const *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(node)) {
+            node = subscript->getBase();
+        } else {
+            return std::nullopt;
+        }
+    }
+}
+
+std::string Writer::tableRead(TableAccess const &access, Role const inherited, clang::SourceLocation const loc) {
+    if (inherited != Role::Read) {
+        diags.error(loc, "a table element can only be written by a statement of its own, such as `t[i] = v;`, "
+                         "`t[i].field = v;` or `t[i].field.x += v;`; pass a copy to functions that modify it");
+        return "0";
+    }
+    access.table->usage.read = true;
+    return tableGetter(*access.table, access.field) + "(" + tableIndex(access.index) + ")";
+}
+
+std::string Writer::tableIndex(clang::Expr const *index) {
+    auto const text = expr(index);
+    return typeName(index->getType(), index->getBeginLoc()) == "uint" ? text : "uint(" + text + ")";
+}
+
+// `t[i] = v;` and `t[i].field = v;` store directly. Any other write loads
+// the field (or element) into a local, applies the statement to it and
+// stores it back.
+std::optional<std::string> Writer::tableWriteStatement(clang::Expr const *e, int const depth) {
+    auto const *full = stripTableWrappers(e);
+    auto const *lhs = static_cast<clang::Expr const *>(nullptr);
+    auto const *rhs = static_cast<clang::Expr const *>(nullptr);
+    auto plain = false;
+    if (auto const *op = llvm::dyn_cast<clang::BinaryOperator>(full); op != nullptr and op->isAssignmentOp()) {
+        lhs = op->getLHS();
+        rhs = op->getRHS();
+        plain = op->getOpcode() == clang::BO_Assign;
+    } else if (auto const *unary = llvm::dyn_cast<clang::UnaryOperator>(full);
+               unary != nullptr and unary->isIncrementDecrementOp()) {
+        lhs = unary->getSubExpr();
+    } else if (auto const *call = llvm::dyn_cast<clang::CXXOperatorCallExpr>(full); call != nullptr) {
+        auto const op = call->getOperator();
+        if (op == clang::OO_Equal) {
+            lhs = call->getArg(0);
+            rhs = call->getArg(1);
+            plain = true;
+        } else if (isCompoundAssignment(op) or op == clang::OO_PlusPlus or op == clang::OO_MinusMinus) {
+            lhs = call->getArg(0);
+        }
+    }
+    if (lhs == nullptr) {
+        return std::nullopt;
+    }
+    auto const access = tableTarget(lhs);
+    if (not access) {
+        return std::nullopt;
+    }
+    auto const loc = e->getBeginLoc();
+    if (access->index->HasSideEffects(context)) {
+        diags.error(access->index->getBeginLoc(), "the index of a table element that is written must not have "
+                                                  "side effects; compute it into a local first");
+    }
+    auto &table = *access->table;
+    table.usage.written = true;
+    auto const pad = indent(depth);
+    auto const index = tableIndex(access->index);
+    if (plain and stripTableWrappers(lhs) == access->node) {
+        return pad + tableSetter(table, access->field) + "(" + index + ", " + expr(rhs) + ");\n";
+    }
+    table.usage.read = true;
+    auto const temp = "tc_t" + std::to_string(loopCounter++);
+    auto const type = access->field != nullptr ? access->field->type : table.elementType;
+    auto text = pad + "{\n";
+    text += indent(depth + 1) + declaration(type, temp, loc) + " = " + tableGetter(table, access->field) + "(" + index
+          + ");\n";
+    auto const saved = std::exchange(replacement, Replacement{access->node, temp});
+    text += indent(depth + 1) + expr(e) + ";\n";
+    replacement = saved;
+    text += indent(depth + 1) + tableSetter(table, access->field) + "(" + index + ", " + temp + ");\n";
+    return text + pad + "}\n";
+}
+
+namespace {
+
+std::string uintLiteral(std::uint64_t const value) {
+    return std::to_string(value) + "u";
+}
+
+} // namespace
+
+// The words of element i an accessor moves start at 4 + fieldAddress(...)
+// (after the four-word header), computed by the layout's own fieldAddress
+// translated to GLSL. With contiguous records that is the whole element and
+// fields are word ranges of it; otherwise it is the field's own words. The
+// layout's fieldAlignment, evaluated now, says which chunks never straddle
+// elements.
+Writer::TableWindow Writer::tableWindow(TableModel &table, PackedField const *field) {
+    auto const loc = table.field->getLocation();
+    auto const &addressing = table.addressing;
+    auto const words = table.layout.words;
+    auto const contiguous = addressing.contiguousRecords;
+    auto const offset = contiguous or field == nullptr ? 0u : field->offset;
+    auto const length = contiguous or field == nullptr ? words : field->words;
+    auto alignment = evaluateCall(context, addressing.fieldAlignment, {words, offset, length});
+    if (not alignment or (*alignment != 1 and *alignment != 2 and *alignment != 4)) {
+        diags.warning(loc, "fieldAlignment of the layout of '" + table.name
+                               + "' did not evaluate to 1, 2 or 4 at build time; its words are moved one by one");
+        alignment = 1;
+    }
+    auto const address = requireFunction(addressing.fieldAddress, FunctionKind::Free, loc) + "(i, "
+                       + uintLiteral(words) + ", " + uintLiteral(offset) + ", " + uintLiteral(length) + ")";
+    auto window = TableWindow{};
+    window.vector = static_cast<std::uint32_t>(*alignment);
+    window.chunkBase = window.vector == 1 ? "4u + " + address : "(4u + " + address + ") / " + uintLiteral(window.vector);
+    window.first = contiguous and field != nullptr ? field->offset : 0;
+    window.last = contiguous and field != nullptr ? field->offset + field->words : length;
+    return window;
+}
+
+std::string Writer::tableView(TableModel &table, std::uint32_t const vector) {
+    if (vector == 2) {
+        table.usesView2 = true;
+        return table.name + "_2";
+    }
+    if (vector == 4) {
+        table.usesView4 = true;
+        return table.name + "_4";
+    }
+    return table.name;
+}
+
+// Loads the chunks covering the window and unpacks the value from them.
+std::string Writer::tableGetter(TableModel &table, PackedField const *field) {
+    auto const loc = table.field->getLocation();
+    auto const suffix = field != nullptr and field->decl != nullptr ? "_" + fieldName(field->decl) : std::string{};
+    auto const name = "tc_" + table.name + "_get" + suffix;
+    if (definedAccessors.count(name) != 0) {
+        return name;
+    }
+    auto const type = field != nullptr ? field->type : table.elementType;
+    if (field == nullptr and table.layout.isRecord and not table.addressing.contiguousRecords) {
+        auto parts = std::vector<std::string>{};
+        for (auto const &packed : table.layout.fields) {
+            parts.push_back(tableGetter(table, &packed) + "(i)");
+        }
+        auto const typeText = typeName(type, loc);
+        definedAccessors.insert(name);
+        out.tableAccessors.push_back(typeText + " " + name + "(uint i) {\n    return " + typeText + "("
+                                     + join(parts, ", ") + ");\n}");
+        return name;
+    }
+    auto const window = tableWindow(table, field);
+    auto const view = tableView(table, window.vector);
+    auto const chunkType = window.vector == 1 ? std::string{"uint"} : "uvec" + std::to_string(window.vector);
+    auto body = "    uint b = " + window.chunkBase + ";\n";
+    auto words = std::vector<std::string>{};
+    for (auto chunk = window.first / window.vector; chunk * window.vector < window.last; ++chunk) {
+        auto const name_ = "c" + std::to_string(chunk);
+        body += "    " + chunkType + " " + name_ + " = " + view + "[b + " + uintLiteral(chunk) + "];\n";
+        for (std::uint32_t k = 0; k < window.vector; ++k) {
+            auto const word = chunk * window.vector + k;
+            if (word >= window.first and word < window.last) {
+                words.push_back(window.vector == 1 ? name_ : name_ + "." + "xyzw"[k]);
+            }
+        }
+    }
+    auto cursor = std::uint32_t{0};
+    body += "    return " + unpackValue(type, words, cursor, loc) + ";\n";
+    definedAccessors.insert(name);
+    out.tableAccessors.push_back(typeName(type, loc) + " " + name + "(uint i) {\n" + body + "}");
+    return name;
+}
+
+// Stores through the same uint / uvec2 / uvec4 view the getter uses. A
+// partial chunk is a load/modify/store of that vector; writing the words
+// through uint[] while the getter reads uvec4[] is not aliasing on some
+// Vulkan compilers, and the next load sees the old value.
+std::string Writer::tableSetter(TableModel &table, PackedField const *field) {
+    auto const loc = table.field->getLocation();
+    auto const suffix = field != nullptr and field->decl != nullptr ? "_" + fieldName(field->decl) : std::string{};
+    auto const name = "tc_" + table.name + "_set" + suffix;
+    if (definedAccessors.count(name) != 0) {
+        return name;
+    }
+    auto const type = field != nullptr ? field->type : table.elementType;
+    if (field == nullptr and table.layout.isRecord and not table.addressing.contiguousRecords) {
+        auto body = std::string{};
+        for (auto const &packed : table.layout.fields) {
+            body += "    " + tableSetter(table, &packed) + "(i, v." + fieldName(packed.decl) + ");\n";
+        }
+        definedAccessors.insert(name);
+        out.tableAccessors.push_back("void " + name + "(uint i, " + declaration(type, "v", loc) + ") {\n" + body
+                                     + "}");
+        return name;
+    }
+    auto const window = tableWindow(table, field);
+    auto words = std::vector<std::string>{};
+    packWords(type, "v", words, loc);
+    auto const word = [&](std::uint32_t const index) { return words[index - window.first]; };
+    auto const view = tableView(table, window.vector);
+    auto body = "    uint b = " + window.chunkBase + ";\n";
+    for (auto chunk = window.first / window.vector; chunk * window.vector < window.last; ++chunk) {
+        auto const begin = chunk * window.vector;
+        auto const end = begin + window.vector;
+        auto const slot = view + "[b + " + uintLiteral(chunk) + "]";
+        if (window.vector == 1) {
+            body += "    " + slot + " = " + word(begin) + ";\n";
+            continue;
+        }
+        if (begin >= window.first and end <= window.last) {
+            auto parts = std::vector<std::string>{};
+            for (auto w = begin; w < end; ++w) {
+                parts.push_back(word(w));
+            }
+            body += "    " + slot + " = uvec" + std::to_string(window.vector) + "(" + join(parts, ", ") + ");\n";
+            continue;
+        }
+        auto const temp = "c" + std::to_string(chunk);
+        body += "    uvec" + std::to_string(window.vector) + " " + temp + " = " + slot + ";\n";
+        for (auto w = std::max(begin, window.first); w < std::min(end, window.last); ++w) {
+            body += "    " + temp + "." + "xyzw"[w - begin] + " = " + word(w) + ";\n";
+        }
+        body += "    " + slot + " = " + temp + ";\n";
+    }
+    definedAccessors.insert(name);
+    out.tableAccessors.push_back("void " + name + "(uint i, " + declaration(type, "v", loc) + ") {\n" + body + "}");
+    return name;
+}
+
+// A GLSL expression rebuilding a value from `words` (uint expressions),
+// consumed from `cursor` on.
+std::string Writer::unpackValue(clang::QualType const original, std::vector<std::string> const &words,
+                                std::uint32_t &cursor, clang::SourceLocation const loc) {
+    if (auto const encoded = encodedInfo(original, context, diags, loc)) {
+        auto parts = std::vector<std::string>{};
+        for (std::uint32_t i = 0; i < encoded->words; ++i) {
+            parts.push_back(words[cursor++]);
+        }
+        return requireFunction(encoded->decode, FunctionKind::Free, loc) + "(uint[" + std::to_string(encoded->words)
+             + "](" + join(parts, ", ") + "))";
+    }
+    auto type = bareType(original);
+    if (auto const *enumType = type->getAs<clang::EnumType>()) {
+        type = bareType(enumType->getDecl()->getIntegerType());
+    }
+    auto const word = [&] { return words[cursor++]; };
+    if (type->isBooleanType()) {
+        return "(" + word() + " != 0u)";
+    }
+    if (type->isRealFloatingType()) {
+        if (typeName(type, loc) == "double") {
+            auto const low = word();
+            auto const high = word();
+            return "packDouble2x32(uvec2(" + low + ", " + high + "))";
+        }
+        return "uintBitsToFloat(" + word() + ")";
+    }
+    if (type->isIntegerType()) {
+        return typeName(type, loc) == "uint" ? word() : "int(" + word() + ")";
+    }
+    auto parts = std::vector<std::string>{};
+    if (auto const vec = asTcVec(type)) {
+        for (unsigned i = 0; i < vec->size; ++i) {
+            parts.push_back(unpackValue(vec->element, words, cursor, loc));
+        }
+        return typeName(type, loc) + "(" + join(parts, ", ") + ")";
+    }
+    if (auto const matrix = asTcMat(type)) {
+        for (unsigned i = 0; i < matrix->columns * matrix->rows; ++i) {
+            parts.push_back(unpackValue(matrix->element, words, cursor, loc));
+        }
+        return typeName(type, loc) + "(" + join(parts, ", ") + ")";
+    }
+    if (auto const array = asStdArray(type)) {
+        for (std::uint64_t i = 0; i < array->size; ++i) {
+            parts.push_back(unpackValue(array->element, words, cursor, loc));
+        }
+        return typeName(type, loc) + "(" + join(parts, ", ") + ")";
+    }
+    auto const *record = type->getAsCXXRecordDecl();
+    for (auto const *field : record->fields()) {
+        parts.push_back(unpackValue(field->getType(), words, cursor, loc));
+    }
+    return requireStruct(record, loc) + "(" + join(parts, ", ") + ")";
+}
+
+// Appends the uint expressions of the words of `value`, in packed order.
+void Writer::packWords(clang::QualType const original, std::string const &value, std::vector<std::string> &words,
+                       clang::SourceLocation const loc) {
+    if (auto const encoded = encodedInfo(original, context, diags, loc)) {
+        auto const encode = requireFunction(encoded->encode, FunctionKind::Free, loc);
+        for (std::uint32_t i = 0; i < encoded->words; ++i) {
+            words.push_back(encode + "(" + value + ")[" + std::to_string(i) + "]");
+        }
+        return;
+    }
+    auto type = bareType(original);
+    if (auto const *enumType = type->getAs<clang::EnumType>()) {
+        type = bareType(enumType->getDecl()->getIntegerType());
+    }
+    if (type->isBooleanType()) {
+        words.push_back("(" + value + " ? 1u : 0u)");
+        return;
+    }
+    if (type->isRealFloatingType()) {
+        if (typeName(type, loc) == "double") {
+            words.push_back("unpackDouble2x32(" + value + ").x");
+            words.push_back("unpackDouble2x32(" + value + ").y");
+            return;
+        }
+        words.push_back("floatBitsToUint(" + value + ")");
+        return;
+    }
+    if (type->isIntegerType()) {
+        words.push_back(typeName(type, loc) == "uint" ? value : "uint(" + value + ")");
+        return;
+    }
+    if (auto const vec = asTcVec(type)) {
+        for (unsigned i = 0; i < vec->size; ++i) {
+            packWords(vec->element, value + "[" + std::to_string(i) + "]", words, loc);
+        }
+        return;
+    }
+    if (auto const matrix = asTcMat(type)) {
+        for (unsigned c = 0; c < matrix->columns; ++c) {
+            for (unsigned r = 0; r < matrix->rows; ++r) {
+                packWords(matrix->element, value + "[" + std::to_string(c) + "][" + std::to_string(r) + "]", words,
+                          loc);
+            }
+        }
+        return;
+    }
+    if (auto const array = asStdArray(type)) {
+        for (std::uint64_t i = 0; i < array->size; ++i) {
+            packWords(array->element, value + "[" + std::to_string(i) + "]", words, loc);
+        }
+        return;
+    }
+    for (auto const *field : type->getAsCXXRecordDecl()->fields()) {
+        packWords(field->getType(), value + "." + fieldName(field), words, loc);
+    }
 }
 
 // ------------------------------------------------------------------- run

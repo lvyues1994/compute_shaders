@@ -103,6 +103,14 @@ std::optional<std::uint32_t> computeQueueFamily(VkPhysicalDevice const physical)
     return std::nullopt;
 }
 
+std::uint32_t timestampValidBits(VkPhysicalDevice const physical, std::uint32_t const family) {
+    auto count = std::uint32_t{0};
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, nullptr);
+    auto families = std::vector<VkQueueFamilyProperties>(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, families.data());
+    return family < count ? families[family].timestampValidBits : 0;
+}
+
 // Makes every earlier write on the queue visible to every later access.
 void fullBarrier(VkCommandBuffer const cmd) {
     auto barrier = vkStruct<VkMemoryBarrier>(VK_STRUCTURE_TYPE_MEMORY_BARRIER);
@@ -262,9 +270,13 @@ struct VulkanDevice final : Device {
 
     DeviceInfo info() const override {
         auto const memory = sharedMemoryType();
-        auto const deviceLocal = (memoryProperties.memoryTypes[memory].propertyFlags
-                                  & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-        return DeviceInfo{"vulkan", properties.deviceName, deviceLocal};
+        auto result = DeviceInfo{};
+        result.backend = "vulkan";
+        result.deviceName = properties.deviceName;
+        result.unifiedMemory =
+            (memoryProperties.memoryTypes[memory].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        result.timers = timestampBits > 0 and properties.limits.timestampPeriod > 0.0f;
+        return result;
     }
 
 protected:
@@ -281,8 +293,16 @@ protected:
     void doSetUniform(UniformWrite const &write) override;
     void doExecute(Dispatch const &dispatch) override;
     void doFinish() override { flush(); }
+    std::vector<KernelTiming> doTakeTimings() override { return std::exchange(timings, {}); }
 
 private:
+    struct PendingTiming {
+        std::string program;
+        uvec3 workGroups{};
+        std::uint32_t firstQuery = 0; // start and end timestamps
+    };
+    static constexpr std::uint32_t kQueryCapacity = 256;
+
     VkFormatFeatureFlags formatFeatures(VkFormat format) const;
     VkSampler samplerFor(Filter filter, Wrap wrap);
     void createInstance(VulkanDeviceConfig const &config);
@@ -297,6 +317,9 @@ private:
     VkCommandBuffer recording();
     void flush();
     VkDeviceSize stagingSlice(VkDeviceSize size);
+    // Query indices of a start and an end timestamp in the current batch.
+    std::uint32_t reserveTimestamps(VkCommandBuffer cmd);
+    void readTimestamps();
     VkDescriptorSet allocateSet(VkDescriptorSetLayout layout);
     void collectGarbage();
     KernelProgram const &programFor(std::string_view name);
@@ -342,6 +365,12 @@ private:
     std::map<std::uint32_t, void const *> boundExternals;
     std::map<std::uint32_t, bool> uniformsSet;
     std::array<std::byte, 256> pushConstants{};
+
+    std::uint32_t timestampBits = 0; // of the compute queue family; 0: no timestamps
+    DeviceObject<VkQueryPool> queryPool;
+    std::uint32_t queriesUsed = 0; // by the current batch
+    std::vector<PendingTiming> pendingTimings;
+    std::vector<KernelTiming> timings;
 };
 
 VulkanDevice::VulkanDevice(VulkanDeviceConfig const &config) {
@@ -444,6 +473,7 @@ void VulkanDevice::pickPhysicalDevice(VulkanDeviceConfig const &config) {
                           + (found.empty() ? std::string{} : " (found" + found + ")")};
     }
     vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
+    timestampBits = timestampValidBits(physical, queueFamily);
 }
 
 void VulkanDevice::createLogicalDevice() {
@@ -643,7 +673,45 @@ void VulkanDevice::flush() {
     check(vkResetFences(device.handle, 1, &rawFence), "vkResetFences");
     stagingUsed = 0;
     check(vkResetDescriptorPool(device.handle, descriptorPool.get(), 0), "vkResetDescriptorPool");
+    readTimestamps();
     collectGarbage();
+}
+
+std::uint32_t VulkanDevice::reserveTimestamps(VkCommandBuffer const cmd) {
+    if (queryPool.get() == VK_NULL_HANDLE) {
+        auto info = vkStruct<VkQueryPoolCreateInfo>(VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO);
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = kQueryCapacity;
+        auto pool = VkQueryPool{};
+        check(vkCreateQueryPool(device.handle, &info, nullptr, &pool), "vkCreateQueryPool");
+        queryPool = DeviceObject<VkQueryPool>{device.handle, pool, vkDestroyQueryPool};
+    }
+    if (queriesUsed == 0) {
+        vkCmdResetQueryPool(cmd, queryPool.get(), 0, kQueryCapacity);
+    }
+    auto const first = queriesUsed;
+    queriesUsed += 2;
+    return first;
+}
+
+// Converts the timestamps of the batch that just completed.
+void VulkanDevice::readTimestamps() {
+    if (queriesUsed == 0) {
+        return;
+    }
+    auto ticks = std::vector<std::uint64_t>(queriesUsed);
+    check(vkGetQueryPoolResults(device.handle, queryPool.get(), 0, queriesUsed, ticks.size() * sizeof(std::uint64_t),
+                                ticks.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+          "vkGetQueryPoolResults");
+    auto const mask = timestampBits >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << timestampBits) - 1;
+    auto const nanosecondsPerTick = static_cast<double>(properties.limits.timestampPeriod);
+    for (auto &pending : pendingTimings) {
+        auto const elapsed = (ticks[pending.firstQuery + 1] - ticks[pending.firstQuery]) & mask;
+        timings.push_back(KernelTiming{std::move(pending.program), pending.workGroups,
+                                       static_cast<double>(elapsed) * nanosecondsPerTick * 1e-6});
+    }
+    pendingTimings.clear();
+    queriesUsed = 0;
 }
 
 // Offset of `size` staging bytes no other command of this batch uses.
@@ -1175,6 +1243,9 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
             throw DeviceError{"workgroup count exceeds the device limit"};
         }
     }
+    if (timersEnabled() and queriesUsed + 2 > kQueryCapacity) {
+        flush(); // before allocating the descriptor set: flush() resets the pool
+    }
     for (auto const &slot : reflection.uniforms) {
         if (uniformsSet.count(slot.location) == 0) {
             throw DeviceError{"execute: uniform '" + std::string{slot.name} + "' was never set with setUniform()"};
@@ -1258,7 +1329,17 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, reflection.pushConstantSize,
                            pushConstants.data());
     }
+    if (not timersEnabled()) {
+        vkCmdDispatch(cmd, dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
+        return;
+    }
+    // Bottom-of-pipe for both: each is written once every earlier command
+    // has completed, so the pair brackets exactly this dispatch.
+    auto const first = reserveTimestamps(cmd);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool.get(), first);
     vkCmdDispatch(cmd, dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool.get(), first + 1);
+    pendingTimings.push_back(PendingTiming{std::string{dispatch.programName}, dispatch.workGroups, first});
 }
 
 } // namespace

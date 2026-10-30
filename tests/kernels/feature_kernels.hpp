@@ -403,4 +403,223 @@ struct TC_KERNEL TextureSampling {
     }
 };
 
+enum class Phase : std::uint32_t { Idle = 0, Moving = 1, Resting = 2 };
+
+// Natural layouts that std430 would pad or reject: 8 words packed versus
+// 48 bytes in C++.
+struct Spark {
+    vec3 position;
+    float mass;
+    vec3 velocity;
+    uint flags;
+};
+
+struct Probe {
+    mat3 frame;
+    std::array<float, 3> weights;
+    Spark spark;
+    bool active;
+    Phase phase;
+    std::int32_t counter;
+};
+
+// Packed tables: field reads, whole-element reads and writes, writes to a
+// component of a field, nested structs, matrices, arrays, bool, enums and a
+// table of vec3. Shared by the Aos and Soa variants below.
+#define TC_TABLE_OPS_MAIN                                                                                              \
+    void main() {                                                                                                      \
+        uint i = gl_GlobalInvocationID.x;                                                                              \
+        if (i >= uint(sparks.length())) {                                                                              \
+            return;                                                                                                    \
+        }                                                                                                              \
+        if ((sparks[i].flags & 1u) != 0u) {                                                                            \
+            Spark s = sparks[i];                                                                                       \
+            s.velocity += vec3{0.0f, -9.81f, 0.0f} * dt.value;                                                         \
+            s.position += s.velocity * dt.value;                                                                       \
+            sparks[i] = s;                                                                                             \
+        } else {                                                                                                       \
+            sparks[i].velocity.y -= 1.0f;                                                                              \
+            sparks[i].mass = sparks[i].mass * 0.5f;                                                                    \
+            sparks[i].flags++;                                                                                         \
+        }                                                                                                              \
+        Probe p = probes[i];                                                                                           \
+        p.frame = p.frame * mat3(2.0f);                                                                                \
+        p.weights[1] += p.spark.mass;                                                                                  \
+        p.active = not p.active;                                                                                       \
+        p.phase = p.active ? Phase::Moving : Phase::Resting;                                                           \
+        p.counter -= int(i);                                                                                           \
+        probes[i] = p;                                                                                                 \
+        probes[i].spark.velocity.z += 0.25f;                                                                           \
+        probes[i].weights[2] = 7.0f;                                                                                   \
+        points[i] = points[i] * 2.0f + vec3(float(i));                                                                 \
+        points[i].x += 1.0f;                                                                                           \
+        report[i] = vec4(sparks[i].position, float(probes.length()));                                                  \
+    }
+
+struct TC_KERNEL TableOps {
+    static constexpr char fileLocation[] = "table_ops";
+    uvec3 local_size{32, 1, 1};
+
+    TableBinding<Spark, 0> sparks;
+    TableBinding<Probe, 1> probes;
+    TableBinding<vec3, 2> points;
+    BufferBinding<vec4, 3> report;
+    Uniform<float, 0> dt{};
+
+    TC_TABLE_OPS_MAIN
+};
+
+// 16-element pages: 50 elements end in a partly used page.
+struct TC_KERNEL TableOpsSoa {
+    static constexpr char fileLocation[] = "table_ops_soa";
+    uvec3 local_size{32, 1, 1};
+
+    TableBinding<Spark, 0, Soa<16>> sparks;
+    TableBinding<Probe, 1, Soa<16>> probes;
+    TableBinding<vec3, 2, Soa<16>> points;
+    BufferBinding<vec4, 3> report;
+    Uniform<float, 0> dt{};
+
+    TC_TABLE_OPS_MAIN
+};
+
+// A user layout, unknown to tc-transpile: records padded to whole 16-byte
+// chunks, so even a 23-word Probe moves in uvec4 loads.
+struct PaddedAos {
+    static constexpr bool contiguousRecords = true;
+
+    static constexpr std::size_t stride(std::uint32_t const recordWords) noexcept {
+        return (recordWords + 3u) / 4u * 4u;
+    }
+    static constexpr std::size_t dataWords(std::size_t const count, std::uint32_t const recordWords) noexcept {
+        return count * stride(recordWords);
+    }
+    static constexpr std::size_t fieldAddress(std::size_t const index, std::uint32_t const recordWords,
+                                              std::uint32_t const fieldOffset, std::uint32_t /*fieldWords*/) noexcept {
+        return index * stride(recordWords) + fieldOffset;
+    }
+    static constexpr std::uint32_t fieldAlignment(std::uint32_t /*recordWords*/, std::uint32_t const fieldOffset,
+                                                  std::uint32_t /*fieldWords*/) noexcept {
+        return fieldOffset % 4u == 0u ? 4u : fieldOffset % 2u == 0u ? 2u : 1u;
+    }
+};
+
+struct TC_KERNEL TableOpsPadded {
+    static constexpr char fileLocation[] = "table_ops_padded";
+    uvec3 local_size{32, 1, 1};
+
+    TableBinding<Spark, 0, PaddedAos> sparks;
+    TableBinding<Probe, 1, PaddedAos> probes;
+    TableBinding<vec3, 2, PaddedAos> points;
+    BufferBinding<vec4, 3> report;
+    Uniform<float, 0> dt{};
+
+    TC_TABLE_OPS_MAIN
+};
+
+#undef TC_TABLE_OPS_MAIN
+
+// A user math type: member operators, a free operator, a subscript and an
+// explicit conversion all translate to GLSL functions.
+struct Complex {
+    float re;
+    float im;
+
+    Complex operator+(Complex const &o) const { return Complex{re + o.re, im + o.im}; }
+    Complex operator*(Complex const &o) const { return Complex{re * o.re - im * o.im, re * o.im + im * o.re}; }
+    Complex operator-() const { return Complex{-re, -im}; }
+    bool operator==(Complex const &o) const { return re == o.re and im == o.im; }
+    float operator[](int const part) const { return part == 0 ? re : im; }
+    explicit operator vec2() const { return vec2{re, im}; }
+};
+
+inline Complex operator*(float const s, Complex const &c) {
+    return Complex{s * c.re, s * c.im};
+}
+
+// Template instances that share a signature need distinct GLSL names.
+template <int N>
+float scaled(float const x) {
+    return x * float(N);
+}
+
+template <class T>
+T twice(T const x) {
+    return x + x;
+}
+
+struct TC_KERNEL LanguageFeatures {
+    static constexpr char fileLocation[] = "language_features";
+    uvec3 local_size{32, 1, 1};
+
+    BufferBinding<vec4, 0> out;
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        float f = float(i);
+        Complex z = Complex{f * 0.1f, 1.0f};
+        Complex w = z * z + (-z);
+        w = 0.5f * w;
+        vec2 asVector = vec2(w);
+        bool same = w == z;
+        out[i * 2u] = vec4(asVector, w[1], same ? 1.0f : 0.0f);
+        out[i * 2u + 1u] = vec4(scaled<2>(f), scaled<3>(f), twice(f), float(twice(int(i))));
+    }
+};
+
+// A user codec: three channels in [0, 1] at 10 bits each, written in plain
+// kernel C++ like the built-in codecs.
+struct Unorm10x3 {
+    using Value = vec3;
+    static constexpr std::uint32_t words = 1;
+    static std::array<uint, 1> encode(vec3 const &value) {
+        uvec3 q = uvec3(round(clamp(value, 0.0f, 1.0f) * 1023.0f));
+        return std::array<uint, 1>{q.x | (q.y << 10u) | (q.z << 20u)};
+    }
+    static vec3 decode(std::array<uint, 1> const &bits) {
+        uint w = bits[0];
+        return vec3(float(w & 1023u), float((w >> 10u) & 1023u), float((w >> 20u) & 1023u)) / 1023.0f;
+    }
+};
+
+// 20 words through codecs instead of 39 plain.
+struct Surfel {
+    Encoded<mat4, Affine3x4> transform;
+    Encoded<vec4, Unorm8x4> color;
+    Encoded<vec3, OctahedralNormal> normal;
+    Encoded<vec2, Half2> uv;
+    Encoded<vec4, Half4> extra;
+    Encoded<vec3, Unorm10x3> albedo;
+    Encoded<vec4, Snorm8x4> tangent;
+    float weight;
+};
+
+// Reads through every codec, then stores a whole element, one encoded field
+// and a component of one, in an Aos and a Soa table.
+struct TC_KERNEL CodecOps {
+    static constexpr char fileLocation[] = "codec_ops";
+    uvec3 local_size{32, 1, 1};
+
+    TableBinding<Surfel, 0> surfels;
+    TableBinding<Surfel, 1, Soa<16>> copies;
+    BufferBinding<vec4, 2> report;
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= uint(surfels.length())) {
+            return;
+        }
+        Surfel s = surfels[i];
+        report[i * 4u] = s.transform.value * vec4{1.0f, 2.0f, 3.0f, 1.0f};
+        report[i * 4u + 1u] = s.color.value * s.weight;
+        report[i * 4u + 2u] = vec4(s.normal.value, s.uv.value.x);
+        report[i * 4u + 3u] = s.extra.value + vec4(s.albedo.value, 0.0f) + s.tangent.value;
+        s.color = vec4(1.0f) - s.color.value;
+        copies[i] = s;
+        surfels[i].normal = normalize(vec3{s.normal.value.y, s.normal.value.z, s.normal.value.x});
+        surfels[i].uv.value.y += 0.25f;
+        surfels[i].weight = surfels[i].weight * 2.0f;
+    }
+};
+
 } // namespace tests

@@ -6,10 +6,12 @@
 
 #include <clang/AST/Attr.h>
 #include <clang/AST/Expr.h>
+#include <clang/AST/QualTypeNames.h>
 #include <clang/ASTMatchers/ASTMatchFinder.h>
 #include <clang/ASTMatchers/ASTMatchers.h>
 
 #include "glsl_names.hpp"
+#include "packed_layout.hpp"
 #include "tc_types.hpp"
 
 namespace tc::transpiler {
@@ -184,6 +186,28 @@ bool classifyField(clang::FieldDecl const *field, KernelModel &model, clang::AST
         model.buffers.push_back(buffer);
         return true;
     }
+    if (auto const *spec = asTcSpecialization(field->getType(), "TableBinding")) {
+        auto table = TableModel{};
+        table.name = name;
+        table.elementType = templateTypeArg(spec, 0);
+        table.binding = static_cast<std::uint32_t>(templateIntArg(spec, 1));
+        auto addressing = tableAddressing(templateTypeArg(spec, 2), diags, field->getLocation());
+        if (not addressing) {
+            return false;
+        }
+        table.addressing = *addressing;
+        auto policy = context.getPrintingPolicy();
+        policy.SuppressTagKeyword = true;
+        table.elementCppName = clang::TypeName::getFullyQualifiedName(table.elementType, context, policy, false);
+        table.field = field;
+        auto layout = packedLayout(table.elementType, context, diags, field->getLocation());
+        if (not layout) {
+            return false;
+        }
+        table.layout = std::move(*layout);
+        model.tables.push_back(std::move(table));
+        return true;
+    }
     if (auto const *spec = asTcSpecialization(field->getType(), "ImageBinding")) {
         auto const format = imageFormatOf(templateTypeArg(spec, 0), context);
         if (not format) {
@@ -275,6 +299,9 @@ bool checkUniqueSlots(KernelModel const &model, Diagnostics &diags) {
     };
     for (auto const &buffer : model.buffers) {
         claim(buffer.binding, buffer.field);
+    }
+    for (auto const &table : model.tables) {
+        claim(table.binding, table.field);
     }
     for (auto const &image : model.images) {
         claim(image.binding, image.field);

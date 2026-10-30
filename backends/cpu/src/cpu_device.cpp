@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace tc::cpu {
@@ -21,7 +23,12 @@ struct CpuDevice final : Device {
     explicit CpuDevice(CpuDeviceConfig const &config) : threadCount(resolveThreadCount(config.threadCount)) {}
 
     DeviceInfo info() const override {
-        return DeviceInfo{"cpu", "host (" + std::to_string(threadCount) + " threads)", true};
+        auto result = DeviceInfo{};
+        result.backend = "cpu";
+        result.deviceName = "host (" + std::to_string(threadCount) + " threads)";
+        result.unifiedMemory = true;
+        result.timers = true;
+        return result;
     }
 
 protected:
@@ -43,12 +50,27 @@ protected:
 
     void doExecute(Dispatch const &dispatch) override;
     void doFinish() override {}
+    std::vector<KernelTiming> doTakeTimings() override { return std::exchange(timings, {}); }
 
 private:
+    void run(Dispatch const &dispatch) const;
+
     std::uint32_t threadCount;
+    std::vector<KernelTiming> timings;
 };
 
 void CpuDevice::doExecute(Dispatch const &dispatch) {
+    if (not timersEnabled()) {
+        run(dispatch);
+        return;
+    }
+    auto const start = std::chrono::steady_clock::now();
+    run(dispatch);
+    auto const elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start);
+    timings.push_back(KernelTiming{std::string{dispatch.programName}, dispatch.workGroups, elapsed.count()});
+}
+
+void CpuDevice::run(Dispatch const &dispatch) const {
     auto const groups = dispatch.workGroups;
     auto const total = std::uint64_t{groups.x} * groups.y * groups.z;
     if (total == 0) {

@@ -33,6 +33,23 @@ KernelArtifact makeArtifact(KernelModel const &model, ShaderVariants const &shad
         resource.access = accessOf(buffer.usage);
         artifact.resources.push_back(resource);
     }
+    for (auto const &table : model.tables) {
+        auto resource = ResourceArtifact{};
+        resource.name = table.name;
+        resource.binding = table.binding;
+        resource.kind = tc::ResourceKind::StorageBuffer;
+        resource.access = accessOf(table.usage);
+        artifact.resources.push_back(resource);
+        auto check = TableCheck{};
+        check.elementType = table.elementCppName;
+        check.words = table.layout.words;
+        if (table.layout.isRecord) {
+            for (auto const &field : table.layout.fields) {
+                check.fieldOffsets.push_back(field.offset);
+            }
+        }
+        artifact.tableChecks.push_back(check);
+    }
     for (auto const &image : model.images) {
         auto resource = ResourceArtifact{};
         resource.name = image.name;

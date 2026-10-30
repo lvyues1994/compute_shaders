@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -58,6 +59,21 @@ GlObject makeTexture(GlApi const &gl) {
     gl.glGenTextures(1, &id);
     return GlObject{gl, id, [](GlApi const &api, GLuint name) { api.glDeleteTextures(1, &name); }};
 }
+
+GlObject makeQuery(GlApi const &gl) {
+    auto id = GLuint{0};
+    gl.glGenQueries(1, &id);
+    return GlObject{gl, id, [](GlApi const &api, GLuint name) { api.glDeleteQueries(1, &name); }};
+}
+
+// GL_TIME_ELAPSED queries; the entry points differ between desktop OpenGL
+// and the OpenGL ES extension.
+struct TimerQueries {
+    PFNGLBEGINQUERYPROC begin = nullptr;
+    PFNGLENDQUERYPROC end = nullptr;
+    PfnGetQueryObjectUi64v result = nullptr;
+    bool reportsDisjoint = false; // GL_GPU_DISJOINT_EXT
+};
 
 GlObject compileProgram(GlApi const &gl, std::string const &source, std::string const &name) {
     auto const shader = gl.glCreateShader(GL_COMPUTE_SHADER);
@@ -168,7 +184,11 @@ struct OpenGLDevice final : Device {
     explicit OpenGLDevice(OpenGLDeviceConfig const &config);
 
     DeviceInfo info() const override {
-        return DeviceInfo{api == OpenGLApi::ES ? "gles" : "opengl", egl->renderer()};
+        auto result = DeviceInfo{};
+        result.backend = api == OpenGLApi::ES ? "gles" : "opengl";
+        result.deviceName = egl->renderer();
+        result.timers = timerQueries.has_value();
+        return result;
     }
 
 protected:
@@ -189,8 +209,17 @@ protected:
         gl().glMemoryBarrier(GL_ALL_BARRIER_BITS);
         gl().glFinish();
     }
+    std::vector<KernelTiming> doTakeTimings() override;
 
 private:
+    struct PendingTiming {
+        std::string program;
+        uvec3 workGroups{};
+        GlObject query;
+    };
+
+    std::optional<TimerQueries> findTimerQueries() const;
+    bool gpuDisjoint() const;
     GlApi const &gl() const noexcept { return egl->api(); }
     PfnBufferStorage bufferStorage() const;
     GLuint samplerFor(Filter filter, Wrap wrap);
@@ -219,6 +248,10 @@ private:
     std::map<std::uint32_t, BoundTexture> boundTextures;
     std::map<std::uint32_t, void const *> boundExternals;
     std::map<std::uint32_t, std::pair<UniformWrite, std::vector<std::byte>>> uniformValues;
+
+    std::optional<TimerQueries> timerQueries;
+    std::vector<GlObject> idleQueries;
+    std::vector<PendingTiming> pendingTimings;
 };
 
 GLenum wrapMode(Wrap const wrap) {
@@ -255,7 +288,56 @@ OpenGLDevice::OpenGLDevice(OpenGLDeviceConfig const &config) : egl(EglContext::c
             nullptr);
     }
     readbackBuffer = makeBuffer(gl());
+    timerQueries = findTimerQueries();
     checkGl(gl(), "device setup");
+}
+
+std::optional<TimerQueries> OpenGLDevice::findTimerQueries() const {
+    auto queries = TimerQueries{};
+    if (api == OpenGLApi::Desktop) {
+        queries.begin = gl().glBeginQuery;
+        queries.end = gl().glEndQuery;
+        queries.result = gl().glGetQueryObjectui64v;
+    } else if (hasGlExtension(gl(), "GL_EXT_disjoint_timer_query")) {
+        queries.begin = gl().glBeginQueryEXT != nullptr ? gl().glBeginQueryEXT : gl().glBeginQuery;
+        queries.end = gl().glEndQueryEXT != nullptr ? gl().glEndQueryEXT : gl().glEndQuery;
+        queries.result = gl().glGetQueryObjectui64vEXT;
+        queries.reportsDisjoint = true;
+    }
+    if (queries.result == nullptr) {
+        return std::nullopt;
+    }
+    return queries;
+}
+
+// Reading GL_GPU_DISJOINT_EXT also clears it.
+bool OpenGLDevice::gpuDisjoint() const {
+    if (not timerQueries or not timerQueries->reportsDisjoint) {
+        return false;
+    }
+    auto disjoint = GLint{0};
+    gl().glGetIntegerv(kGpuDisjoint, &disjoint);
+    return disjoint != 0;
+}
+
+std::vector<KernelTiming> OpenGLDevice::doTakeTimings() {
+    egl->makeCurrent();
+    auto const disjoint = gpuDisjoint();
+    auto result = std::vector<KernelTiming>{};
+    result.reserve(pendingTimings.size());
+    for (auto &pending : pendingTimings) {
+        auto nanoseconds = GLuint64{0};
+        timerQueries->result(pending.query.get(), GL_QUERY_RESULT, &nanoseconds);
+        auto timing = KernelTiming{std::move(pending.program), pending.workGroups, std::nullopt};
+        if (not disjoint) {
+            timing.milliseconds = static_cast<double>(nanoseconds) * 1e-6;
+        }
+        result.push_back(std::move(timing));
+        idleQueries.push_back(std::move(pending.query));
+    }
+    pendingTimings.clear();
+    checkGl(gl(), "takeTimings");
+    return result;
 }
 
 // Drops device mirrors whose host resource no longer exists.
@@ -703,8 +785,27 @@ void OpenGLDevice::doExecute(Dispatch const &dispatch) {
         }
         applyUniform(program, value->second.first, value->second.second);
     }
+    if (not timersEnabled()) {
+        gl().glDispatchCompute(dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
+        gl().glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        checkGl(gl(), "execute");
+        return;
+    }
+    if (pendingTimings.empty()) {
+        gpuDisjoint(); // clears a disjoint event from before this measurement
+    }
+    auto pending = PendingTiming{std::string{dispatch.programName}, dispatch.workGroups, GlObject{}};
+    if (idleQueries.empty()) {
+        pending.query = makeQuery(gl());
+    } else {
+        pending.query = std::move(idleQueries.back());
+        idleQueries.pop_back();
+    }
+    timerQueries->begin(kTimeElapsed, pending.query.get());
     gl().glDispatchCompute(dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
+    timerQueries->end(kTimeElapsed);
     gl().glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    pendingTimings.push_back(std::move(pending));
     checkGl(gl(), "execute");
 }
 

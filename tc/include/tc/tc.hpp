@@ -5,6 +5,7 @@
 #include <tc/atomic.hpp>
 #include <tc/buffer.hpp>
 #include <tc/builtins.hpp>
+#include <tc/codec.hpp>
 #include <tc/dim.hpp>
 #include <tc/external_image.hpp>
 #include <tc/glsl_math.hpp>
@@ -15,6 +16,7 @@
 #include <tc/mat.hpp>
 #include <tc/pixel.hpp>
 #include <tc/shared.hpp>
+#include <tc/table.hpp>
 #include <tc/texture.hpp>
 #include <tc/uniform.hpp>
 #include <tc/vec.hpp>

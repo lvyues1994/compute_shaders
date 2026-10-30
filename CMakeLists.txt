@@ -19,6 +19,7 @@ option(TC_ENABLE_OPENGL "Build the OpenGL / OpenGL ES backend (EGL)" ON)
 option(TC_ENABLE_VULKAN "Build the Vulkan backend" ON)
 option(TC_BUILD_EXAMPLES "Build the examples" ${PROJECT_IS_TOP_LEVEL})
 option(TC_BUILD_TESTS "Build the tests" ${PROJECT_IS_TOP_LEVEL})
+option(TC_BUILD_BENCHMARKS "Build the tc_bench benchmark" ${PROJECT_IS_TOP_LEVEL})
 set(TC_TRANSPILER_EXECUTABLE "" CACHE FILEPATH
     "Prebuilt host tc-transpile; used when TC_BUILD_TRANSPILER is OFF (e.g. Android cross builds)")
 
@@ -38,6 +39,10 @@ include(cmake/TcKernels.cmake)
 
 if(TC_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(TC_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 if(TC_BUILD_TESTS)

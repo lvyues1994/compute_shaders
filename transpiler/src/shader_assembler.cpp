@@ -97,6 +97,22 @@ std::string assemble(KernelModel const &kernel, GlslBody const &body, std::strin
               + accessQualifier(accessOf(buffer.usage)) + "buffer _" + buffer.name + "Layout {\n    "
               + body.bufferTypes[i] + " " + buffer.name + "[];\n};\n";
     }
+    // Tables: a header (word 0 = element count), then the packed elements;
+    // uvec2 / uvec4 views of the same binding give the accessors wide loads.
+    for (auto const &table : kernel.tables) {
+        auto const declare = [&](std::string const &type, std::string const &suffix) {
+            text += "layout(std430, binding = " + std::to_string(table.binding) + ") "
+                  + accessQualifier(accessOf(table.usage)) + "buffer _" + table.name + "Layout" + suffix + " {\n    "
+                  + type + " " + table.name + suffix + "[];\n};\n";
+        };
+        declare("uint", "");
+        if (table.usesView2) {
+            declare("uvec2", "_2");
+        }
+        if (table.usesView4) {
+            declare("uvec4", "_4");
+        }
+    }
     for (auto const &image : kernel.images) {
         auto const precision = dialect == Dialect::Es ? "highp " : "";
         text += "layout(binding = " + std::to_string(image.binding) + ", " + tc::glslFormatQualifier(image.format)
@@ -141,11 +157,15 @@ std::string assemble(KernelModel const &kernel, GlslBody const &body, std::strin
     if (not body.constants.empty()) {
         text += "\n";
     }
+    // Prototypes first: table accessors call codec functions.
     for (auto const &prototype : body.prototypes) {
         text += prototype + "\n";
     }
     if (not body.prototypes.empty()) {
         text += "\n";
+    }
+    for (auto const &accessor : body.tableAccessors) {
+        text += accessor + "\n\n";
     }
     for (auto const &function : body.functions) {
         text += function + "\n\n";

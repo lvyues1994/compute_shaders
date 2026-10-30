@@ -32,7 +32,22 @@ constexpr char kDiverged[] =
     "barrier() was not reached by every invocation of a workgroup (some returned or branched around it); "
     "on a GPU this hangs or corrupts shared memory";
 
+thread_local std::vector<TableFlush> pendingTableFlushes;
+
 } // namespace
+
+void registerTableFlush(TableFlush const flush) {
+    pendingTableFlushes.push_back(flush);
+}
+
+void flushTables(bool const keepEntries) noexcept {
+    for (auto const &flush : pendingTableFlushes) {
+        flush.writeBack(flush.cache, keepEntries);
+    }
+    if (not keepEntries) {
+        pendingTableFlushes.clear();
+    }
+}
 
 #if TC_FIBERS
 
@@ -297,6 +312,7 @@ void runCooperative(std::uint32_t const count, CooperativeGroup const &group) {
             activeGroup = &shared;
             group.prepare(group.context, i);
             group.run(group.context, i);
+            flushTables(false);
             auto const lock = std::lock_guard<std::mutex>{shared.mutex};
             ++shared.finished;
             if (shared.arrived != 0 and shared.arrived + shared.finished == shared.count) {
@@ -314,6 +330,8 @@ void workgroupBarrier() {
     if (group == nullptr) {
         fail(kNotCooperative);
     }
+    // Invocations on other threads read the table elements this one wrote.
+    flushTables(true);
     auto lock = std::unique_lock<std::mutex>{group->mutex};
     auto const generation = group->generation;
     if (++group->arrived == group->count) {

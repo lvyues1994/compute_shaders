@@ -50,20 +50,24 @@ kernel 头文件 (C++17)
         ├─ AST → GLSL：所有 C++ 隐式转换写成显式构造（GLSL ES 没有隐式转换）
         ├─ 推断每个 binding 的 readonly / writeonly
         ├─ std430 布局检查：buffer 里的结构体在 C++ 和 GLSL 里字节布局必须一致
+        ├─ 表（TableBinding）：按紧凑字流生成逐字段的 get/set 函数，尽量用 uvec4 宽读写；
+        │    布局的 fieldAddress 照常转译，fieldAlignment 在构建时由 Clang 常量求值
         ├─ 生成三种方言：GL 430 / ES 310 / Vulkan 450（uniform 变为 push constant）
         ├─ glslangValidator 校验，并把 Vulkan 版编译成 SPIR-V
-        └─ 生成 <header>.tc.cpp：内嵌 GLSL + SPIR-V + 反射数据，静态注册到 ProgramRegistry
+        └─ 生成 <header>.tc.cpp：内嵌 GLSL + SPIR-V + 反射数据，静态注册到 ProgramRegistry；
+             有表时还用 static_assert 检查主机与转译器算出的字流布局一致
 ```
 
 | 目录 | 内容 |
 |---|---|
-| `tc/` | 头文件 DSL：`vec`/swizzle、`mat`、GLSL 内建函数（含 pack/unpack、位操作、原子操作）、`BufferResource`/`BufferBinding`、像素与图像格式、`ImageBinding`、`TextureBinding`、`ExternalImage`、`Shared`/`barrier()`、`Uniform`、`Device` 抽象、`ProgramRegistry` |
+| `tc/` | 头文件 DSL：`vec`/swizzle、`mat`、GLSL 内建函数（含 pack/unpack、位操作、原子操作）、`BufferResource`/`BufferBinding`、`TableResource`/`TableBinding` 与布局 `Aos`/`Soa<P>`、`Encoded` 与编码器、像素与图像格式、`ImageBinding`、`TextureBinding`、`ExternalImage`、`Shared`/`barrier()`、`Uniform`、`Device` 抽象、`ProgramRegistry` |
 | `backends/cpu` `opengl` `vulkan` | 各后端，各自一个工厂函数 `tc::<backend>::createDevice(config)` |
 | `backends/devices` | 按名字创建后端：`tc::createDevice({"vulkan", "llvmpipe"})` |
 | `transpiler/` | `tc-transpile` 主机工具 |
 | `cmake/TcKernels.cmake` | `tc_add_kernels(<target> HEADERS ...)` |
 | `examples/` | `float_adder`、`game_of_life`、`raytracer`（对应演讲的三个案例）；`nv12_to_rgba`（纹理 + 矩阵 uniform 做格式转换）；`external_frame`（仅 Android，零拷贝导入 `AHardwareBuffer`） |
 | `tests/` | DSL 单元测试、跨后端等价性测试、转译器报错测试 |
+| `benchmarks/` | `tc_bench`：各用例在各后端上的 GPU 时间、墙钟时间和带宽 |
 
 生成的 GLSL 在 `build/<preset>/.../tc_generated/<target>/glsl/*.comp`，可以直接查看。
 
@@ -71,7 +75,8 @@ kernel 头文件 (C++17)
 
 kernel 是带 `TC_KERNEL` 标注的 struct，必须有 `fileLocation`、`local_size` 和 `void main()`。可用的成员：
 
-- `BufferBinding<T, binding>`：SSBO，`A[i]` 读写，`A.length()`。`T` 可以是标量、`vec`、或只含这些成员的结构体（布局由转译器检查）。
+- `BufferBinding<T, binding>`：SSBO，`A[i]` 读写，`A.length()`。`T` 可以是标量、`vec`、或只含这些成员的结构体，C++ 布局必须和 std430 一致（由转译器检查）。
+- `TableBinding<T, binding, Layout = Aos>`：表，元素按紧凑字流存放，结构体可以按自然的写法定义，可以切换 AOS / SOA 布局，字段可以带编码，见下文"表"。
 - `ImageBinding<GpuFormat, Dim, CpuPixel, binding>`：存储图像，配合 `imageLoad` / `imageStore` / `imageSize`。GPU 内部格式和主机像素格式可以不同（例如主机用 `cpu::R8UI`，GPU 用 `gpu::R32UI`），上传/下载时自动转换；CPU 后端读写同样经过 GPU 格式，结果与 GPU 一致。
 - `TextureBinding<GpuFormat, Dim, CpuPixel, binding, Filter, Wrap>`：采样纹理（`sampler2D` 等），配合 `texelFetch` / `texture` / `textureSize`。过滤（`Nearest`/`Linear`）和寻址（`ClampToEdge`/`Repeat`/`MirroredRepeat`）是类型的一部分，CPU 后端按 GL 规则实现双线性采样。纹理用 `uploadImage` 上传，用 `bindTexture` 绑定。
 - `ExternalTextureBinding<binding>`：外部帧（见下文"零拷贝"），配合 `texture` / `textureSize`，结果是 RGB，YUV 由驱动或 CPU 转换。
@@ -85,10 +90,102 @@ kernel 是带 `TC_KERNEL` 标注的 struct，必须有 `fileLocation`、`local_s
 - 打包与位操作：`packUnorm4x8`/`unpackUnorm4x8` 等 5 组 pack/unpack，`bitfieldExtract`/`bitfieldInsert`/`bitfieldReverse`/`bitCount`/`findLSB`/`findMSB`。
 - 原子操作：`atomicAdd`/`And`/`Or`/`Xor`/`Min`/`Max`/`Exchange`/`CompSwap`，目标只能是 buffer 元素或 `Shared` 变量（转译器检查）。
 - 同步：`barrier()`，以及 `memoryBarrier*()` / `groupMemoryBarrier()`。
+- 用户类型的运算符和转换：成员或自由的 `operator+`、`operator*`、`operator==`、`operator[]`、`operator()`，以及 `explicit operator vec2()` 这样的转换函数，都转译成普通 GLSL 函数（如 `Complex_op_mul`、`Complex_to_vec2`）。返回引用的运算符（`operator+=` 返回 `*this`）不支持，转译器会提示改成按值返回。
+- 函数模板：每个实例得到独立的 GLSL 名字（`scaled<2>` → `scaled_2`，`twice<float>` → `twice_float`）；函数与常量同名时自动加后缀。
 
 因为 C++17 不允许字符串字面量作模板参数，swizzle 写成成员函数：`v.xy()`、`v.zyx()`（转译成 `v.xy`、`v.zyx`），单分量直接用 `v.x`。
 
 CPU 后端执行 `usesBarrier` kernel 时，一个工作组的所有 invocation 作为协作纤程运行（x86_64 / aarch64 上的 Linux 与 Android，手写上下文切换，每个纤程 64 KiB 栈加保护页），`barrier()` 处让出，全部到齐后再继续；其他平台退化为每个 invocation 一个线程。如果部分 invocation 没有到达同一个 `barrier()`（GPU 上是未定义行为），CPU 后端会直接报错终止，而不是给出一个碰巧正确的结果。
+
+## 表：紧凑布局、AOS/SOA 与字段编码
+
+思路来自 SaeruHikari 的文章[《纯血 C++ 着色器：AOS/SOA 自动布局与加载优化》](https://zhuanlan.zhihu.com/p/2097630291724612499)：数据的含义（结构体类型）和存放方式（布局、编码）分开，kernel 代码不随存放方式改变。
+
+`BufferBinding` 要求 C++ 布局与 std430 一致，所以 `vec3` 在 C++ 里占 16 字节，`struct { vec3 position; float mass; }` 这样自然的写法会被拒绝。`TableBinding` 不受这个限制：元素被压成没有空洞的 32 位字流（`vec3` 3 个字，`mat3` 9 个字，`bool` 1 个字），由转译器生成打包和解包的 GLSL。
+
+```cpp
+struct Spark {                       // 8 个字；C++ 里 sizeof 是 48
+    vec3 position;
+    float mass;
+    vec3 velocity;
+    uint flags;
+};
+
+struct TC_KERNEL Step {
+    static constexpr char fileLocation[] = "step";
+    uvec3 local_size{256, 1, 1};
+    TableBinding<Spark, 0> sparks;   // 换成 TableBinding<Spark, 0, Soa<>> 即为 SOA
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= uint(sparks.length()) or (sparks[i].flags & 1u) == 0u) return;  // 只读 flags 一个字段
+        Spark s = sparks[i];                 // 读整个元素
+        s.position += s.velocity;
+        sparks[i] = s;                       // 写整个元素
+        sparks[i].velocity.y -= 9.81f;       // 改一个字段的一个分量
+    }
+};
+```
+
+```cpp
+auto sparks = tc::TableResource<Spark>{n};      // 或 device->createTable<Spark>(n)，零拷贝
+sparks.set(i, Spark{...});   Spark s = sparks.get(i);
+device->uploadTable(sparks);  device->bindTable(kernel.sparks);  device->downloadTable(sparks);
+```
+
+规则：
+
+- 在 kernel 里，`t[i]` 读整个元素，`t[i].field` 在 GPU 上只读这个字段。写入必须是单独的一条语句：`t[i] = v;`、`t[i].field = v;` 直接写；`t[i].field.x += v;` 这类部分写入会展开成"读出字段、修改、写回"。表元素不能绑定到引用，不能传给非 const 引用参数，也不能做原子操作。
+- 元素可以含 `bool`、`int32_t`、`uint32_t`、`float`、`double`、32 位枚举、`vec`/`mat`、`std::array`、嵌套结构体和 `Encoded` 字段；不能有 C 数组、指针或基类。C++17 没有反射，主机端通过聚合初始化和结构化绑定逐个找到字段，最多 32 个。
+- 缓冲区开头有 4 个字的头部，第 0 个字是元素个数（`t.length()`）。
+- CPU 后端上，`t[i]` 返回当前线程缓存的元素副本，每个 invocation 结束时（用 `barrier()` 的 kernel 在工作组结束时）只把改动过的字写回，所以并发改同一元素不同字段的工作组不会互相覆盖。
+
+### 布局
+
+布局是一个只含 constexpr 函数的结构体，主机直接调用；转译器把 `fieldAddress` 当作普通代码转译成 GLSL，并在构建时求值 `fieldAlignment`，以决定能否用 `uvec2`/`uvec4` 宽读写。
+
+| 布局 | 存放方式 | 适合 |
+|---|---|---|
+| `Aos` | 元素一个接一个 | 整个元素都要读写 |
+| `Soa<P>` | 每 P 个元素一页，页内每个字段连续成一列（AoSoA） | 只读部分字段、提前返回 |
+| 自定义 | 实现 `contiguousRecords`、`dataWords`、`fieldAddress`、`fieldAlignment`（接口见 `tc/table.hpp`） | 例如把元素补齐到 16 字节以便宽读写（`tests/kernels/feature_kernels.hpp` 的 `PaddedAos`） |
+
+### 字段编码
+
+`Encoded<V, Codec>` 字段在 kernel 和主机代码里是普通的 `V`（`.value` 或隐式转换），存进表时由编码器压缩，读出时还原。编码器的 `encode`/`decode` 也是普通的 kernel C++，用户可以自己写（测试里的 `Unorm10x3` 就是一个例子）。只有表会应用编码；局部变量和 std430 buffer 里存的还是完整的 `V`。
+
+| 编码器 | 值 | 字数 |
+|---|---|---|
+| `Unorm8x4` / `Snorm8x4` | `vec4` | 1（原本 4） |
+| `Unorm16x2` / `Half2` | `vec2` | 1（原本 2） |
+| `Half4` | `vec4` | 2（原本 4） |
+| `Affine3x4` | `mat4`，最后一行固定为 (0, 0, 0, 1) | 12（原本 16） |
+| `OctahedralNormal` | 单位 `vec3` | 1（原本 3），误差小于 1e-4 |
+
+## 性能测量
+
+`device->enableTimers(true)` 之后，每次 `execute()` 都在设备上计时：Vulkan 用时间戳查询，桌面 GL 用 `GL_TIME_ELAPSED`，GLES 用 `GL_EXT_disjoint_timer_query`，CPU 后端用主机时钟。`device->takeTimings()` 等待已提交的工作完成，按执行顺序返回每次 dispatch 的耗时；GLES 报告时钟不连续时，对应的结果为空。`DeviceInfo::timers` 表示设备是否支持计时。
+
+`tc_bench` 在所有可用后端上跑一组用例，先预热，再按时间预算决定迭代次数，报告 GPU 时间中位数、最小值、墙钟时间和有效带宽：
+
+```sh
+./build/linux-release/benchmarks/tc_bench                         # 全部用例、全部后端
+./build/linux-release/benchmarks/tc_bench --backend vulkan --case cull,shade --csv out.csv
+./build/linux-release/benchmarks/tc_bench --scale 0.25            # 手机上缩小问题规模
+```
+
+RTX 5070 Ti、Vulkan 上的部分结果（GPU 时间，毫秒；OpenGL 和 GLES 基本相同）：
+
+| 对比 | 用例 | 时间 |
+|---|---|---|
+| 打包本身没有开销（同为每个粒子 32 字节） | `particles_std430` / `particles_table` / `particles_soa` | 0.171 / 0.171 / 0.171 |
+| 只读部分字段时 SOA 快约 2 倍 | `cull_aos` / `cull_soa` | 0.169 / 0.079 |
+| 编码后的字段读得更快（每个元素 25 → 15 个字） | `shade_plain` / `shade_encoded` | 0.292 / 0.189 |
+| `vec3` 不再补齐到 16 字节 | `points_vec4_std430` / `points_vec3_table` | 0.171 / 0.097 |
+
+同一组对比在 Adreno 830 的 Vulkan 上（`--scale 0.25`）也成立：`particles_*` 0.503 / 0.517 / 0.507，`cull_aos` / `cull_soa` 0.647 / 0.299，`shade_plain` / `shade_encoded` 0.888 / 0.576，`points_vec4_std430` / `points_vec3_table` 0.498 / 0.370。该机 GLES 的 `GL_EXT_disjoint_timer_query` 会给出接近 0 的时间，带宽请看墙钟或改用 Vulkan 时间戳。
+
+一开始表的访问函数按 32 位逐字读取，`particles_table` 比 std430 慢 30%～50%（Vulkan / GL）；改成按 `uvec4` 读写后才持平。是否能宽读写由布局的 `fieldAlignment` 决定。
 
 ## 零拷贝与外部帧
 
@@ -144,7 +241,7 @@ adb shell /data/local/tmp/tc_compute/game_of_life --backend gles
 adb shell rm -rf /data/local/tmp/tc_compute
 ```
 
-`android-arm64` 预设同时构建测试（GoogleTest 通过 `FetchContent` 下载），`build/android-arm64/tests/` 下的 `tc_core_tests` 和 `tc_equivalence_tests` 用同样的方式推到设备上运行。在 Adreno 830 上，单元测试（包括 aarch64 纤程 barrier）和 GLES、Vulkan 的全部等价性测试都通过。
+`android-arm64` 预设同时构建测试（GoogleTest 通过 `FetchContent` 下载），`build/android-arm64/tests/` 下的 `tc_core_tests` 和 `tc_equivalence_tests` 用同样的方式推到设备上运行。在 Adreno 830 上，`tc_core_tests` 26 项通过（含 aarch64 纤程 barrier 和表打包），`tc_equivalence_tests` 的 GLES 与 Vulkan 用例通过；llvmpipe 设备和 GLES 上读写非 r32 图像按设计跳过。
 
 在 App 里使用时，把 `tc`、`tc_cpu`、`tc_opengl`、`tc_vulkan` 作为子项目加入 Android Studio 的 CMake 工程，`tc_add_kernels` 通过 `TC_TRANSPILER_EXECUTABLE` 使用主机上的转译器。
 
@@ -156,13 +253,17 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 转译用 AST 打印而不是 Rewriter：每个隐式转换都显式输出，结果对 GLSL ES 也合法；常量初始化交给 Clang 的常量求值器。
 - 一次转译产出三种方言和 SPIR-V；Vulkan 的 uniform 自动放进 push constant 块，偏移由转译器计算并写入反射数据。
 - 增加了 std430 布局检查和 binding 读写推断。
+- 增加了表（紧凑字流、AOS/SOA、字段编码），思路来自上文提到的知乎文章；布局和编码器写成普通 C++，由转译器照常转译。
 
 ## 已知限制
 
 - swizzle 只读；写分量用 `v.x = ...`。
+- kernel 里的结构体不能有基类；运算符不能返回引用。
+- 表字段不能做原子操作；CPU 后端读写表比读写 std430 buffer 慢约 3 倍（要逐字打包，还要经过元素缓存）。
 - 有符号整数的 `%` 在操作数为负时，GLSL 结果未定义，与 C++ 不同。
 - CPU 后端的原子操作是 relaxed 顺序，与 GLSL 一致；不同工作组之间没有执行顺序保证，这一点在所有后端上都一样。
 - `Shared` 总量超过 16 KiB（GLES 3.1 与 Vulkan 的最低保证）时转译器给出警告。
 - 外部帧的 YUV 转换在 GPU 上由驱动或采样器硬件完成，色度插值方式各家不同，与 CPU 结果有约 1/255 的平均差异。
 - OpenGL 设备只能在创建它的线程上使用。
 - NVIDIA 595 驱动的 Vulkan 路径会读错"含 `vec3` 的结构体常量数组"，转译器会把这类数组改为在 `main()` 开头逐元素初始化（见 `glsl_writer.cpp` 的 `defineConstant`）。
+- 部分 GLES 实现（Adreno 830）的 `GL_EXT_disjoint_timer_query` 几乎总是返回接近 0 的时间且不置 disjoint；`tc_bench` 的 GPU 列会偏小，带宽请用墙钟或 Vulkan。

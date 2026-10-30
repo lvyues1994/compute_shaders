@@ -425,6 +425,321 @@ TEST_P(Equivalence, WorkgroupReduce) {
     EXPECT_EQ(reduced, total);
 }
 
+struct TableState {
+    std::vector<tests::Spark> sparks;
+    std::vector<tests::Probe> probes;
+    std::vector<vec3> points;
+    std::vector<vec4> report;
+};
+
+tests::Spark makeSpark(int const i) {
+    auto const f = static_cast<float>(i);
+    return tests::Spark{vec3{f, 2.0f * f, -f}, 1.0f + f, vec3{0.5f, f, 1.0f}, static_cast<uint>(i % 3)};
+}
+
+tests::Probe makeProbe(int const i) {
+    auto const f = static_cast<float>(i);
+    auto probe = tests::Probe{};
+    probe.frame = mat3{vec3{1.0f, f, 0.0f}, vec3{0.0f, 1.0f, f}, vec3{f, 0.0f, 1.0f}};
+    probe.weights = {f, 0.5f, -f};
+    probe.spark = makeSpark(i + 100);
+    probe.active = i % 2 == 0;
+    probe.phase = tests::Phase::Idle;
+    probe.counter = 1000 + i;
+    return probe;
+}
+
+template <class Resource>
+struct TableTag {
+    using type = Resource;
+};
+
+// Runs TableOps or TableOpsSoa on tables from `makeTable` (host or device
+// memory).
+template <class Kernel, class MakeTable>
+TableState runTableOps(Device &device, MakeTable const &makeTable) {
+    constexpr int n = 50;
+    auto sparks = makeTable(TableTag<typename decltype(Kernel::sparks)::Resource>{}, n);
+    auto probes = makeTable(TableTag<typename decltype(Kernel::probes)::Resource>{}, n);
+    auto points = makeTable(TableTag<typename decltype(Kernel::points)::Resource>{}, n);
+    for (int i = 0; i < n; ++i) {
+        sparks.set(i, makeSpark(i));
+        probes.set(i, makeProbe(i));
+        points.set(i, vec3{static_cast<float>(i), 1.0f, -2.0f});
+    }
+    auto report = BufferResource<vec4>{n};
+    auto kernel = Kernel{};
+    kernel.sparks.attach(sparks);
+    kernel.probes.attach(probes);
+    kernel.points.attach(points);
+    kernel.report.attach(report);
+    kernel.dt = 0.5f;
+    device.uploadTable(sparks);
+    device.uploadTable(probes);
+    device.uploadTable(points);
+    device.uploadBuffer(report);
+    device.useKernel(kernel);
+    device.bindTable(kernel.sparks);
+    device.bindTable(kernel.probes);
+    device.bindTable(kernel.points);
+    device.bindBuffer(kernel.report);
+    device.setUniform(kernel.dt);
+    device.execute(kernel, uvec3{2u, 1u, 1u});
+    device.downloadTable(sparks);
+    device.downloadTable(probes);
+    device.downloadTable(points);
+    device.downloadBuffer(report);
+    auto state = TableState{};
+    for (int i = 0; i < n; ++i) {
+        state.sparks.push_back(sparks.get(i));
+        state.probes.push_back(probes.get(i));
+        state.points.push_back(points.get(i));
+    }
+    state.report = contents(report);
+    return state;
+}
+
+void expectNear(vec3 const a, vec3 const b, std::size_t const i) {
+    for (int c = 0; c < 3; ++c) {
+        EXPECT_NEAR(a[c], b[c], 1e-4f) << "element " << i << " component " << c;
+    }
+}
+
+void expectSameTables(TableState const &expected, TableState const &actual) {
+    ASSERT_EQ(expected.sparks.size(), actual.sparks.size());
+    for (std::size_t i = 0; i < expected.sparks.size(); ++i) {
+        auto const &e = expected.sparks[i];
+        auto const &a = actual.sparks[i];
+        expectNear(e.position, a.position, i);
+        expectNear(e.velocity, a.velocity, i);
+        EXPECT_FLOAT_EQ(e.mass, a.mass) << i;
+        EXPECT_EQ(e.flags, a.flags) << i;
+        auto const &ep = expected.probes[i];
+        auto const &ap = actual.probes[i];
+        for (int c = 0; c < 3; ++c) {
+            expectNear(ep.frame[c], ap.frame[c], i);
+        }
+        EXPECT_EQ(ep.weights, ap.weights) << i;
+        expectNear(ep.spark.velocity, ap.spark.velocity, i);
+        EXPECT_EQ(ep.spark.flags, ap.spark.flags) << i;
+        EXPECT_EQ(ep.active, ap.active) << i;
+        EXPECT_EQ(ep.phase, ap.phase) << i;
+        EXPECT_EQ(ep.counter, ap.counter) << i;
+        expectNear(expected.points[i], actual.points[i], i);
+        for (int c = 0; c < 4; ++c) {
+            EXPECT_NEAR(expected.report[i][c], actual.report[i][c], 1e-4f) << i;
+        }
+    }
+}
+
+auto const hostTables = [](auto tag, int const n) {
+    return typename decltype(tag)::type(static_cast<std::size_t>(n));
+};
+
+TEST_P(Equivalence, PackedTables) {
+    auto const [expected, actual] =
+        runBoth<TableState>([&](Device &device) { return runTableOps<tests::TableOps>(device, hostTables); });
+    expectSameTables(expected, actual);
+    // A spot check against hand-computed values: spark 1 takes the update
+    // branch (flags 1), spark 3 the field-edit branch (flags 0).
+    EXPECT_NEAR(actual.sparks[1].velocity.y, 1.0f - 9.81f * 0.5f, 1e-4f);
+    EXPECT_EQ(actual.sparks[3].flags, 1u);
+    EXPECT_FLOAT_EQ(actual.sparks[3].mass, 2.0f);
+    EXPECT_EQ(actual.probes[2].phase, tests::Phase::Resting);
+    EXPECT_FLOAT_EQ(actual.probes[2].weights[2], 7.0f);
+    EXPECT_FLOAT_EQ(actual.report[0].w, 50.0f);
+}
+
+TEST_P(Equivalence, ZeroCopyTables) {
+    auto const [expected, actual] = runBoth<TableState>([](Device &device) {
+        auto const deviceTables = [&device](auto tag, int const n) {
+            using Resource = typename decltype(tag)::type;
+            return device.createTable<typename Resource::value_type, typename Resource::layout_type>(
+                static_cast<std::size_t>(n));
+        };
+        return runTableOps<tests::TableOps>(device, deviceTables);
+    });
+    expectSameTables(expected, actual);
+    if (GetParam().backend == "vulkan") {
+        EXPECT_TRUE(gpu->createTable<tests::Spark>(4).usesExternalMemory());
+    }
+}
+
+// Switching the layout changes neither the kernel code nor the results.
+TEST_P(Equivalence, SoaTables) {
+    auto const [expected, actual] =
+        runBoth<TableState>([&](Device &device) { return runTableOps<tests::TableOpsSoa>(device, hostTables); });
+    expectSameTables(expected, actual);
+    auto const aos = runTableOps<tests::TableOps>(*cpu, hostTables);
+    expectSameTables(aos, actual);
+}
+
+// A layout defined in user code: its fieldAddress runs on the host and,
+// translated, on the GPU.
+TEST_P(Equivalence, UserLayoutTables) {
+    auto const [expected, actual] =
+        runBoth<TableState>([&](Device &device) { return runTableOps<tests::TableOpsPadded>(device, hostTables); });
+    expectSameTables(expected, actual);
+    auto const aos = runTableOps<tests::TableOps>(*cpu, hostTables);
+    expectSameTables(aos, actual);
+    EXPECT_EQ((TableResource<tests::Probe, tests::PaddedAos>::wordsFor(50)), 4u + 50u * 24u);
+}
+
+struct CodecState {
+    std::vector<tests::Surfel> surfels;
+    std::vector<tests::Surfel> copies;
+    std::vector<vec4> report;
+};
+
+tests::Surfel makeSurfel(int const i) {
+    auto const f = static_cast<float>(i);
+    auto surfel = tests::Surfel{};
+    surfel.transform = mat4{vec4{1.0f, 0.0f, 0.0f, 0.0f}, vec4{0.0f, 0.5f, 0.0f, 0.0f}, vec4{0.0f, 0.0f, 2.0f, 0.0f},
+                            vec4{f, -f, 0.25f * f, 1.0f}};
+    surfel.color = vec4{0.1f, 0.5f, 0.9f, f / 64.0f};
+    surfel.normal = normalize(vec3{f - 20.0f, 3.0f, -2.0f});
+    surfel.uv = vec2{f / 7.0f, 0.3f};
+    surfel.extra = vec4{f * 1.5f, -2.0f, 1000.0f, 0.001f};
+    surfel.albedo = vec3{0.2f, f / 64.0f, 0.7f};
+    surfel.tangent = vec4{-0.3f, 0.6f, 0.0f, 1.0f};
+    surfel.weight = 1.0f + f;
+    return surfel;
+}
+
+CodecState runCodecOps(Device &device) {
+    constexpr int n = 40;
+    auto surfels = TableResource<tests::Surfel>{n};
+    auto copies = TableResource<tests::Surfel, Soa<16>>{n};
+    for (int i = 0; i < n; ++i) {
+        surfels.set(i, makeSurfel(i));
+    }
+    auto report = BufferResource<vec4>{4 * n};
+    auto kernel = tests::CodecOps{};
+    kernel.surfels.attach(surfels);
+    kernel.copies.attach(copies);
+    kernel.report.attach(report);
+    device.uploadTable(surfels);
+    device.uploadTable(copies);
+    device.uploadBuffer(report);
+    device.useKernel(kernel);
+    device.bindTable(kernel.surfels);
+    device.bindTable(kernel.copies);
+    device.bindBuffer(kernel.report);
+    device.execute(kernel, uvec3{2u, 1u, 1u});
+    device.downloadTable(surfels);
+    device.downloadTable(copies);
+    device.downloadBuffer(report);
+    auto state = CodecState{};
+    for (int i = 0; i < n; ++i) {
+        state.surfels.push_back(surfels.get(i));
+        state.copies.push_back(copies.get(i));
+    }
+    state.report = contents(report);
+    return state;
+}
+
+template <class V>
+void expectNearVec(V const &a, V const &b, float const tolerance, std::string const &what) {
+    for (int c = 0; c < V::length(); ++c) {
+        EXPECT_NEAR(a[c], b[c], tolerance * std::max(1.0f, std::abs(a[c]))) << what << " component " << c;
+    }
+}
+
+// Half floats and 8-bit channels may round differently on GPUs: one step.
+void expectSameSurfel(tests::Surfel const &e, tests::Surfel const &a, std::string const &what) {
+    for (int c = 0; c < 4; ++c) {
+        expectNearVec(e.transform.value[c], a.transform.value[c], 1e-6f, what + " transform");
+    }
+    expectNearVec(e.color.value, a.color.value, 1.01f / 255.0f, what + " color");
+    expectNearVec(e.normal.value, a.normal.value, 2e-4f, what + " normal");
+    expectNearVec(e.uv.value, a.uv.value, 1e-3f, what + " uv");
+    expectNearVec(e.extra.value, a.extra.value, 1e-3f, what + " extra");
+    expectNearVec(e.albedo.value, a.albedo.value, 1.01f / 1023.0f, what + " albedo");
+    expectNearVec(e.tangent.value, a.tangent.value, 1.01f / 127.0f, what + " tangent");
+    EXPECT_FLOAT_EQ(e.weight, a.weight) << what;
+}
+
+TEST_P(Equivalence, Codecs) {
+    auto const [expected, actual] = runBoth<CodecState>(runCodecOps);
+    for (std::size_t i = 0; i < expected.surfels.size(); ++i) {
+        expectSameSurfel(expected.surfels[i], actual.surfels[i], "surfel " + std::to_string(i));
+        expectSameSurfel(expected.copies[i], actual.copies[i], "copy " + std::to_string(i));
+        for (int r = 0; r < 4; ++r) {
+            expectNearVec(expected.report[4 * i + r], actual.report[4 * i + r], 2e-3f,
+                          "report " + std::to_string(4 * i + r));
+        }
+    }
+    // What the codecs keep: 8-bit colour, unit normals, exact affine parts.
+    auto const original = makeSurfel(5);
+    EXPECT_NEAR(actual.copies[5].color.value.x, 1.0f - original.color.value.x, 1.0f / 255.0f);
+    EXPECT_NEAR(length(actual.surfels[5].normal.value), 1.0f, 1e-5f);
+    EXPECT_EQ(actual.surfels[5].transform.value[3], original.transform.value[3]);
+    EXPECT_NEAR(actual.surfels[5].uv.value.y, 0.3f + 0.25f, 1e-3f);
+    EXPECT_NE(actual.surfels[5].uv.value.y, 0.3f + 0.25f) << "stored as half precision";
+}
+
+TEST_P(Equivalence, LanguageFeatures) {
+    auto const [expected, actual] = runBoth<std::vector<vec4>>([](Device &device) {
+        auto out = BufferResource<vec4>{64};
+        auto kernel = tests::LanguageFeatures{};
+        kernel.out.attach(out);
+        device.uploadBuffer(out);
+        device.useKernel(kernel);
+        device.bindBuffer(kernel.out);
+        device.execute(kernel, uvec3{1u, 1u, 1u});
+        device.downloadBuffer(out);
+        return contents(out);
+    });
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        expectNearVec(expected[i], actual[i], 1e-5f, "element " + std::to_string(i));
+    }
+    // i = 3: z = 0.3 + i, z * z = -0.91 + 0.6i, w = (z * z - z) / 2 = -0.605 - 0.2i.
+    EXPECT_NEAR(actual[6].x, -0.605f, 1e-5f);
+    EXPECT_NEAR(actual[6].z, -0.2f, 1e-5f);
+    EXPECT_EQ(actual[7], (vec4{6.0f, 9.0f, 6.0f, 6.0f}));
+}
+
+// One timing per execute(), in order, while timers are enabled.
+TEST_P(Equivalence, Timers) {
+    if (not gpu->info().timers) {
+        GTEST_SKIP() << "no timer queries on " << gpu->info().deviceName;
+    }
+    for (auto *device : {cpu.get(), gpu.get()}) {
+        constexpr int n = 1 << 16;
+        auto values = BufferResource<uint>{n};
+        auto sums = BufferResource<uint>{n / 64};
+        auto kernel = tests::WorkgroupReduce{};
+        kernel.values.attach(values);
+        kernel.sums.attach(sums);
+        device->uploadBuffer(values);
+        device->uploadBuffer(sums);
+        device->useKernel(kernel);
+        device->bindBuffer(kernel.values);
+        device->bindBuffer(kernel.sums);
+        device->execute(kernel, uvec3{n / 64u, 1u, 1u}); // not timed
+        device->enableTimers(true);
+        for (uint groups = 1; groups <= 3; ++groups) {
+            device->execute(kernel, uvec3{groups * 256u, 1u, 1u});
+        }
+        auto const timings = device->takeTimings();
+        ASSERT_EQ(timings.size(), 3u) << device->info().backend;
+        auto total = 0.0;
+        for (uint i = 0; i < 3; ++i) {
+            EXPECT_EQ(timings[i].program, "workgroup_reduce");
+            EXPECT_EQ(timings[i].workGroups, (uvec3{(i + 1) * 256u, 1u, 1u}));
+            if (timings[i].milliseconds) {
+                EXPECT_GE(*timings[i].milliseconds, 0.0);
+                EXPECT_LT(*timings[i].milliseconds, 10'000.0);
+                total += *timings[i].milliseconds;
+            }
+        }
+        EXPECT_GT(total, 0.0) << device->info().backend;
+        device->enableTimers(false);
+        device->execute(kernel, uvec3{1u, 1u, 1u});
+        EXPECT_TRUE(device->takeTimings().empty());
+    }
+}
+
 TEST_P(Equivalence, TiledTranspose) {
     auto const [expected, actual] = runBoth<std::vector<float>>([](Device &device) {
         auto const size = ivec2{37, 23};

@@ -25,6 +25,21 @@ void runCooperative(std::uint32_t count, CooperativeGroup const &group);
 
 void workgroupBarrier();
 
+// A per-thread cache of table elements handed to CPU invocations (see
+// TableBinding). writeBack stores the words that changed; unless
+// `keepEntries`, it also drops the elements.
+struct TableFlush {
+    void *cache = nullptr;
+    void (*writeBack)(void *cache, bool keepEntries) noexcept = nullptr;
+};
+
+// Called by a cache when it takes its first element on this thread.
+void registerTableFlush(TableFlush flush);
+
+// Writes back every cache of this thread: at the end of each invocation (and
+// each cooperative workgroup), so later invocations see the results.
+void flushTables(bool keepEntries) noexcept;
+
 } // namespace detail
 
 inline void barrier() {

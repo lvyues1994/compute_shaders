@@ -15,7 +15,7 @@ llvm::StringSet<> const &reservedWords() {
         "layout", "centroid", "flat", "smooth", "noperspective", "patch", "sample", "invariant", "precise",
         "subroutine", "in", "out", "inout", "discard", "lowp", "mediump", "highp", "precision", "common",
         "partition", "active", "resource", "noinline", "external", "interface", "half", "fixed", "superp",
-        "input", "output", "filter", "cast", "atomic_uint", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4",
+        "input", "output", "filter", "cast", "packed", "atomic_uint", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4",
         "uvec2", "uvec3", "uvec4", "bvec2", "bvec3", "bvec4", "dvec2", "dvec3", "dvec4", "hvec2", "hvec3", "hvec4",
         "fvec2", "fvec3", "fvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3",
         "mat3x4", "mat4x2", "mat4x3", "mat4x4", "dmat2", "dmat3", "dmat4", "uint", "image1D", "image2D",

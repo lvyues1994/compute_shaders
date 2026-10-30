@@ -146,7 +146,9 @@ int main(int argc, char const **argv) {
     if (not depfilePath.empty() and not writeFile(depfilePath, writeDepfile(outputPath, result.dependencies))) {
         return EXIT_FAILURE;
     }
-    if (not writeFile(outputPath, writeRegistrationSource(result.kernels, sourceName))) {
+    auto headerPath = llvm::SmallString<256>{sources.front()};
+    llvm::sys::fs::make_absolute(headerPath);
+    if (not writeFile(outputPath, writeRegistrationSource(result.kernels, sourceName, headerPath.str().str()))) {
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;

@@ -7,6 +7,8 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include <tc/buffer.hpp>
 #include <tc/builtins.hpp>
@@ -16,6 +18,7 @@
 #include <tc/mat.hpp>
 #include <tc/program.hpp>
 #include <tc/span.hpp>
+#include <tc/table.hpp>
 #include <tc/texture.hpp>
 #include <tc/uniform.hpp>
 #include <tc/workgroup.hpp>
@@ -34,6 +37,18 @@ struct DeviceInfo {
     // createBuffer() memory is GPU-local as well as CPU-visible (mobile and
     // integrated GPUs, desktop GPUs with resizable BAR).
     bool unifiedMemory = false;
+    // enableTimers() is available: GPU timestamp queries, or host time on
+    // the CPU backend.
+    bool timers = false;
+};
+
+// Device time of one execute() call.
+struct KernelTiming {
+    std::string program;
+    uvec3 workGroups{};
+    // nullopt when the GPU reported a disjoint event (a clock or power state
+    // change) that invalidates the measurement.
+    std::optional<double> milliseconds;
 };
 
 // Type-erased requests passed from the template API to a backend.
@@ -168,10 +183,12 @@ void runWorkGroup(K &kernel, WorkGroupPosition const &position) {
         };
         group.run = [](void *const c, std::uint32_t) { static_cast<Context *>(c)->kernel->main(); };
         runCooperative(count, group);
+        flushTables(false);
     } else {
         for (uint index = 0; index < count; ++index) {
             enterInvocation(position, index);
             kernel.main();
+            flushTables(false);
         }
     }
 }
@@ -223,6 +240,23 @@ struct Device {
         doDownloadBuffer(resource.identity(), resource.bytes());
     }
 
+    // A table whose words live in createBuffer() memory.
+    template <class T, class Layout = Aos>
+    TableResource<T, Layout> createTable(std::size_t const count) {
+        auto const words = static_cast<std::int32_t>(TableResource<T, Layout>::wordsFor(count));
+        return TableResource<T, Layout>{createBuffer<std::uint32_t>(words), count};
+    }
+
+    template <class T, class Layout>
+    void uploadTable(TableResource<T, Layout> const &table) {
+        uploadBuffer(table.words());
+    }
+
+    template <class T, class Layout>
+    void downloadTable(TableResource<T, Layout> &table) {
+        downloadBuffer(table.words());
+    }
+
     // Works for ImageBinding and TextureBinding: both describe the GPU format.
     template <class I, std::enable_if_t<detail::isImageLike<I>, int> = 0>
     void uploadImage(I const &image) {
@@ -251,6 +285,14 @@ struct Device {
 
     template <class T, std::uint32_t B>
     void bindBuffer(BufferBinding<T, B> const &binding) {
+        auto request = BufferBindRequest{};
+        request.binding = B;
+        request.identity = &detail::requireAttached(binding).identity();
+        doBindBuffer(request);
+    }
+
+    template <class T, std::uint32_t B, class Layout>
+    void bindTable(TableBinding<T, B, Layout> const &binding) {
         auto request = BufferBindRequest{};
         request.binding = B;
         request.identity = &detail::requireAttached(binding).identity();
@@ -309,6 +351,23 @@ struct Device {
     // and so does writing such memory while queued work still reads it.
     void finish() { doFinish(); }
 
+    // While enabled, every execute() is timed on the device. Throws
+    // DeviceError when info().timers is false.
+    void enableTimers(bool const enabled) {
+        if (enabled and not info().timers) {
+            throw DeviceError{"enableTimers: " + info().backend + " device '" + info().deviceName
+                              + "' has no timer queries"};
+        }
+        timersOn = enabled;
+    }
+
+    // Waits for queued work and returns the timings of the executes recorded
+    // since the previous call, in execution order.
+    std::vector<KernelTiming> takeTimings() {
+        doFinish();
+        return doTakeTimings();
+    }
+
     // Queues `workGroups` workgroups of kernel.local_size invocations each.
     template <class K>
     void execute(K &kernel, uvec3 const workGroups) {
@@ -342,8 +401,14 @@ protected:
     virtual void doSetUniform(UniformWrite const &write) = 0;
     virtual void doExecute(Dispatch const &dispatch) = 0;
     virtual void doFinish() = 0;
+    // Called after doFinish(): every timed execute has completed.
+    virtual std::vector<KernelTiming> doTakeTimings() = 0;
+
+    bool timersEnabled() const noexcept { return timersOn; }
 
 private:
+    bool timersOn = false;
+
     template <class I>
     static ImageTransfer imageTransfer(typename I::Resource const &resource) {
         auto transfer = ImageTransfer{};
