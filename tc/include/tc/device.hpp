@@ -1325,9 +1325,10 @@ struct Device {
         if (index >= arguments.size()) {
             throw DeviceError{"executeIndirect: argument " + std::to_string(index) + " is outside the buffer"};
         }
+        auto const *host = arguments.data(); // nullptr for the view of a DeviceBuffer on a GPU
         auto dispatch = makeDispatch(kernel);
-        dispatch.indirect =
-            IndirectArguments{&arguments.identity(), index * sizeof(DispatchIndirectCommand), arguments.data() + index};
+        dispatch.indirect = IndirectArguments{&arguments.identity(), index * sizeof(DispatchIndirectCommand),
+                                              host != nullptr ? host + index : nullptr};
         doExecute(dispatch);
     }
 
