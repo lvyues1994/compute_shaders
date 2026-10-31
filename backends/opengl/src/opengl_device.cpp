@@ -182,6 +182,7 @@ struct MappedBuffer {
 
 struct BufferMirror {
     std::weak_ptr<void const> owner;
+    GlObject memory; // imported buffers: the memory object, deleted after the buffer
     GlObject buffer;
     std::shared_ptr<MappedBuffer> mapped; // set for createBuffer() allocations instead of `buffer`
     std::shared_ptr<GlObject> heap;       // set for placed device buffers: bytes [offset, offset + size) of it
@@ -288,6 +289,8 @@ struct OpenGLDevice final : Device {
         result.deviceName = egl->renderer();
         result.timers = timerQueries.has_value();
         result.syncFiles = egl->sync().nativeFences and egl->sync().serverWaits;
+        result.gpu = gpu;
+        result.importsMemory = memoryImport;
         result.limits = limits;
         return result;
     }
@@ -324,6 +327,7 @@ protected:
         return PlacementSize{(bytes + 255) / 256 * 256, 256};
     }
     void doCopyBuffer(BufferCopy const &copy) override;
+    void doImportBuffer(BufferImport const &request) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
@@ -396,6 +400,8 @@ private:
     std::optional<TimerQueries> timerQueries;
     PfnTextureView textureView = nullptr;
     DeviceLimits limits;
+    std::optional<GpuIdentity> gpu;
+    bool memoryImport = false;
     // Shader writes are incoherent: a glMemoryBarrier goes before a command
     // that uses what an earlier dispatch wrote (or writes what it read).
     // Placed buffers are tracked by their bytes of the heap.
@@ -451,6 +457,16 @@ OpenGLDevice::OpenGLDevice(OpenGLDeviceConfig const &config) : egl(EglContext::c
     timerQueries = findTimerQueries();
     textureView = findTextureView();
     limits = queryLimits();
+    if (hasGlExtension(gl(), "GL_EXT_memory_object") and gl().glGetUnsignedBytevEXT != nullptr
+        and gl().glGetUnsignedBytei_vEXT != nullptr) {
+        auto identity = GpuIdentity{};
+        gl().glGetUnsignedBytevEXT(kDriverUuid, identity.driver.data());
+        gl().glGetUnsignedBytei_vEXT(kDeviceUuid, 0, identity.device.data());
+        gpu = identity;
+        memoryImport = hasGlExtension(gl(), "GL_EXT_memory_object_fd") and gl().glCreateMemoryObjectsEXT != nullptr
+                   and gl().glImportMemoryFdEXT != nullptr and gl().glBufferStorageMemEXT != nullptr
+                   and gl().glDeleteMemoryObjectsEXT != nullptr;
+    }
     checkGl(gl(), "device setup");
 }
 
@@ -802,6 +818,31 @@ bool OpenGLDevice::doCreateDeviceBuffer(BufferCreation const &request) {
     buffers[request.identity->key()] = std::move(mirror);
     checkGl(gl(), "createDeviceBuffer");
     return false;
+}
+
+// A buffer whose storage is a memory object holding the imported memory.
+void OpenGLDevice::doImportBuffer(BufferImport const &request) {
+    if (not memoryImport) {
+        throw DeviceError{"importBuffer: " + egl->renderer() + " cannot import memory (needs GL_EXT_memory_object_fd)"};
+    }
+    egl->makeCurrent();
+    collectGarbage();
+    auto &memory = *request.memory;
+    auto mirror = BufferMirror{};
+    mirror.owner = request.identity->watch();
+    auto object = GLuint{0};
+    gl().glCreateMemoryObjectsEXT(1, &object);
+    mirror.memory = GlObject{gl(), object, [](GlApi const &api, GLuint name) { api.glDeleteMemoryObjectsEXT(1, &name); }};
+    gl().glImportMemoryFdEXT(object, static_cast<GLuint64>(memory.allocationBytes), kHandleTypeOpaqueFd, memory.fd.get());
+    checkGl(gl(), "importBuffer (glImportMemoryFdEXT)");
+    memory.fd.release(); // GL owns the descriptor now
+    mirror.buffer = makeBuffer(gl());
+    gl().glBindBuffer(GL_SHADER_STORAGE_BUFFER, mirror.buffer.get());
+    gl().glBufferStorageMemEXT(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(request.bytes), object,
+                               static_cast<GLuint64>(memory.offset));
+    checkGl(gl(), "importBuffer (glBufferStorageMemEXT)");
+    mirror.size = request.bytes;
+    buffers[request.identity->key()] = std::move(mirror);
 }
 
 void OpenGLDevice::doCopyBuffer(BufferCopy const &copy) {

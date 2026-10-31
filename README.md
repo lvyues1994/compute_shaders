@@ -419,6 +419,24 @@ Vulkan 后端会把连续的传输和 dispatch 录进同一个命令缓冲区，
 
 Adreno 的 GLES 驱动会在一个 program 第一次 dispatch 时，固定其中 `samplerExternalOES` 的颜色转换方式，之后换成别的格式的帧，仍然按第一帧的格式转换。为此，GL 后端对每种外部帧格式组合各链接一次同一份着色器。
 
+### 导入其他设备的内存
+
+同一块 GPU 上的另一个设备（另一个 `VkDevice`、另一个 API）导出的内存可以导入成 buffer，两边共用同一份数据：
+
+```cpp
+auto memory = tc::ExternalBufferMemory{};
+memory.fd = tc::MemoryFd{fd};            // 导出方的 opaque fd（vkGetMemoryFdKHR）
+memory.allocationBytes = allocationSize; // 导出方那次分配的大小
+memory.offset = 0;                       // buffer 在分配里的起点
+memory.memoryType = typeIndex;           // Vulkan：导出方分配用的内存类型
+auto shared = device->importBuffer<uint>(std::move(memory), n);   // 一个 DeviceBuffer
+```
+
+- 导入成功后设备接管 fd。导入的 buffer 和 `DeviceBuffer` 一样由 kernel 读写，只能用在设备自己的时间线上，不能用在 `transfers()` 上。两个设备之间用 sync file 排序：对方写完交出的 fence 给 `waitFor(SyncFence)`，这边写完用 `submitWithFence()` 的 fence 交给对方。
+- 只有同一块 GPU、同一个驱动的设备才能共享内存：`DeviceInfo::gpu` 给出设备和驱动的 UUID（Vulkan 的 `VkPhysicalDeviceIDProperties`，GL 的 `GL_EXT_memory_object`），`DeviceInfo::importsMemory` 表示能否导入。
+- Vulkan 用 `VK_KHR_external_memory_fd`，导入的 buffer 在每批命令里第一次用到时从 `VK_QUEUE_FAMILY_EXTERNAL` 取得所有权，提交前交还；Vulkan 要求导入时的内存类型与导出方相同，所以要给出 `memoryType`。OpenGL / GLES 用 `GL_EXT_memory_object_fd`（memory object 加 `glBufferStorageMemEXT`）。CPU 后端不能导入。
+- 本机 NVIDIA 的三种 API 都能导入同一块 GPU 上 Vulkan 导出的内存；Mesa 的 llvmpipe（GL）能导入 lavapipe（Vulkan）导出的内存。
+
 ### 写入外部帧与 fence
 
 RGBA 外部帧（`AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM` 或 `R16G16B16A16_FLOAT`，分配时带 `GPU_SAMPLED_IMAGE | GPU_FRAMEBUFFER` 用途）还可以通过 `ExternalImageBinding<gpu::RGBA8, binding>` 作为存储图像直接写入，例如 kernel 直接渲染进合成器要显示的 buffer。与合成器、相机等其他使用者之间用 sync file 同步：
@@ -492,7 +510,7 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 一次转译产出三种方言和 SPIR-V；Vulkan 的 uniform 自动放进 push constant 块，偏移由转译器计算并写入反射数据。
 - 增加了 std430 布局检查和 binding 读写推断。
 - 增加了表（紧凑字流、AOS/SOA、字段编码），思路来自上文提到的知乎文章；布局和编码器写成普通 C++，由转译器照常转译。
-- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像和 buffer、内存堆与资源别名、传输队列、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
+- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像和 buffer、内存堆与资源别名、传输队列、导入其他设备的内存、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
 
 ## 已知限制
 
@@ -517,3 +535,5 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 不支持显式的 fp16 运算（`float16_t`），只有整个 kernel 的中等精度。
 - 压缩纹理只能是 2D 或 2D 数组，不能是 3D 或立方体贴图；也不能作为存储图像写入，只能用 `copyBufferToImage` 填充。
 - 只在设备上的图像没有读回主机的接口；需要检查内容时，用 kernel 把它采样到 buffer 里。
+- llvmpipe 的 OpenGL 导入外部内存时，buffer 不能占满整个分配（`glBufferStorageMemEXT` 报 `GL_OUT_OF_MEMORY`）；导出方多分配 64 字节就可以。
+- 导入外部内存只支持 Linux 的 opaque fd；Android 的 `AHardwareBuffer`（BLOB）还没有接上。

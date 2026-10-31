@@ -14,6 +14,18 @@ using PfnTextureView = void(GL_APIENTRY *)(GLuint, GLenum, GLuint, GLenum, GLuin
 inline constexpr GLbitfield kMapPersistentBit = 0x0040;
 inline constexpr GLbitfield kMapCoherentBit = 0x0080;
 
+// GL_EXT_memory_object and GL_EXT_memory_object_fd: buffers in memory other
+// APIs exported, and the UUIDs that say whose GPU it is.
+using PfnCreateMemoryObjects = void(GL_APIENTRY *)(GLsizei, GLuint *);
+using PfnDeleteMemoryObjects = void(GL_APIENTRY *)(GLsizei, GLuint const *);
+using PfnImportMemoryFd = void(GL_APIENTRY *)(GLuint, GLuint64, GLenum, GLint);
+using PfnBufferStorageMem = void(GL_APIENTRY *)(GLenum, GLsizeiptr, GLuint, GLuint64);
+using PfnGetUnsignedBytev = void(GL_APIENTRY *)(GLenum, GLubyte *);
+using PfnGetUnsignedBytei = void(GL_APIENTRY *)(GLenum, GLuint, GLubyte *);
+inline constexpr GLenum kHandleTypeOpaqueFd = 0x9586;
+inline constexpr GLenum kDeviceUuid = 0x9597;
+inline constexpr GLenum kDriverUuid = 0x9598;
+
 // Timer queries: core in desktop OpenGL 3.3, GL_EXT_disjoint_timer_query on
 // OpenGL ES.
 using PfnGetQueryObjectUi64v = void(GL_APIENTRY *)(GLuint, GLenum, GLuint64 *);
@@ -115,7 +127,13 @@ inline constexpr GLenum kGpuDisjoint = 0x8FBB;
     X(PfnGetQueryObjectUi64v, glGetQueryObjectui64v)                                                                   \
     X(PfnGetQueryObjectUi64v, glGetQueryObjectui64vEXT)                                                                \
     X(PFNGLBEGINQUERYPROC, glBeginQueryEXT)                                                                            \
-    X(PFNGLENDQUERYPROC, glEndQueryEXT)
+    X(PFNGLENDQUERYPROC, glEndQueryEXT)                                                                                \
+    X(PfnCreateMemoryObjects, glCreateMemoryObjectsEXT)                                                                \
+    X(PfnDeleteMemoryObjects, glDeleteMemoryObjectsEXT)                                                                \
+    X(PfnImportMemoryFd, glImportMemoryFdEXT)                                                                          \
+    X(PfnBufferStorageMem, glBufferStorageMemEXT)                                                                      \
+    X(PfnGetUnsignedBytev, glGetUnsignedBytevEXT)                                                                      \
+    X(PfnGetUnsignedBytei, glGetUnsignedBytei_vEXT)
 
 struct GlApi {
 #define TC_GL_DECLARE(type, name) type name = nullptr;

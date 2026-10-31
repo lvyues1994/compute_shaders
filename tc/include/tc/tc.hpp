@@ -11,6 +11,7 @@
 #include <tc/device_image.hpp>
 #include <tc/dim.hpp>
 #include <tc/external_image.hpp>
+#include <tc/external_memory.hpp>
 #include <tc/glsl_math.hpp>
 #include <tc/glsl_packing.hpp>
 #include <tc/gpu_format.hpp>

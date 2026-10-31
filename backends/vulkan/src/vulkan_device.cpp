@@ -190,6 +190,8 @@ struct VulkanContext {
     bool astc = false;
     std::uint32_t subgroupSize = 0; // with every GL_KHR_shader_subgroup operation in compute shaders; else 0
     bool timelineSemaphores = false;
+    bool memoryImport = false; // opaque fds of other devices' memory (VK_KHR_external_memory_fd)
+    std::optional<GpuIdentity> gpu;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
@@ -249,6 +251,7 @@ struct BufferMirror {
     DeviceObject<VkBuffer> buffer;
     std::shared_ptr<MappedBuffer> mapped; // set for createBuffer() allocations instead of the two above
     VkDeviceSize size = 0;
+    bool imported = false; // memory of another device: taken from and given back to VK_QUEUE_FAMILY_EXTERNAL
 
     VkBuffer handle() const noexcept { return mapped ? mapped->buffer.get() : buffer.get(); }
 };
@@ -482,6 +485,7 @@ struct Batch {
     std::uint32_t queriesUsed = 0;
     std::vector<PendingTiming> pendingTimings;
     std::vector<DeviceObject<VkSemaphore>> semaphores; // waited on or signalled by the submission
+    std::vector<VkBuffer> imported;              // acquired from VK_QUEUE_FAMILY_EXTERNAL, released at the end
     std::uint64_t serial = 0;                    // submission order
     std::uint64_t submission = 0;                // the Submission::sequence() it is part of
     std::shared_ptr<FenceCompletion> completion; // set while in flight
@@ -511,6 +515,8 @@ struct VulkanDevice final : Device {
         result.syncFiles = context->syncFdImport and context->syncFdExport;
         result.placedImages = true;
         result.separateTransfers = transferQueue != nullptr;
+        result.gpu = context->gpu;
+        result.importsMemory = context->memoryImport;
         auto const &supported = properties.limits;
         auto &limits = result.limits;
         limits.storageBuffers = supported.maxPerStageDescriptorStorageBuffers;
@@ -574,6 +580,7 @@ protected:
     PlacementSize doBufferPlacement(std::size_t bytes) override;
     PlacementSize doImagePlacement(ImageCreation const &request) override;
     void doCopyBuffer(BufferCopy const &copy) override;
+    void doImportBuffer(BufferImport const &request) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
@@ -632,7 +639,8 @@ private:
         return aliases.access(key, offset, size, read, write);
     }
     // Before `cmd` uses a placed resource whose bytes an alias used last:
-    // an image's contents are discarded into GENERAL layout.
+    // an image's contents are discarded into GENERAL layout. An imported
+    // buffer is acquired from the other device for the rest of the batch.
     void claim(VkCommandBuffer cmd, void const *key);
     VkImageView levelView(ImageMirror &mirror, std::uint32_t level);
     void createInstance(VulkanDeviceConfig const &config);
@@ -767,6 +775,9 @@ protected:
         if (source == device.buffers.end() or target == device.buffers.end()) {
             throw DeviceError{"copyBuffer: a buffer was never uploaded to this device"};
         }
+        if (source->second.imported or target->second.imported) {
+            throw DeviceError{"copyBuffer: imported buffers belong to the device's own timeline, not transfers()"};
+        }
         auto const cmd = commandFor({device.access(copy.source->key(), copy.sourceOffset, copy.bytes, true, false),
                                      device.access(copy.target->key(), copy.targetOffset, copy.bytes, false, true)});
         device.claim(cmd, copy.source->key());
@@ -779,6 +790,9 @@ protected:
         auto const buffer = device.buffers.find(copy.buffer->key());
         if (buffer == device.buffers.end() or buffer->second.size < copy.offset + copy.bytes) {
             throw DeviceError{"copyBufferToImage: the buffer was never uploaded to this device (or changed size)"};
+        }
+        if (buffer->second.imported) {
+            throw DeviceError{"copyBufferToImage: imported buffers belong to the device's own timeline, not transfers()"};
         }
         auto const &mirror = device.images.at(copy.image->key());
         auto const region = regionOf(copy);
@@ -1029,10 +1043,21 @@ void VulkanDevice::createLogicalDevice() {
     // Subgroup operations need Vulkan 1.1 (SPIR-V 1.3) and every operation
     // class tc exposes, in compute shaders.
     if (vulkan11) {
+        auto ids = vkStruct<VkPhysicalDeviceIDProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES);
         auto subgroups = vkStruct<VkPhysicalDeviceSubgroupProperties>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES);
+        subgroups.pNext = &ids;
         auto properties2 = vkStruct<VkPhysicalDeviceProperties2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
         properties2.pNext = &subgroups;
         vkGetPhysicalDeviceProperties2(physical, &properties2);
+        auto identity = GpuIdentity{};
+        std::copy(std::begin(ids.deviceUUID), std::end(ids.deviceUUID), identity.device.begin());
+        std::copy(std::begin(ids.driverUUID), std::end(ids.driverUUID), identity.driver.begin());
+        context->gpu = identity;
+        // Memory of other devices of this GPU, as opaque file descriptors.
+        if (hasDeviceExtension(physical, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+            extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+            context->memoryImport = true;
+        }
         auto constexpr needed = VkSubgroupFeatureFlags{
             VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
             | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT};
@@ -1320,6 +1345,19 @@ Submission VulkanDevice::submitBatch(DeviceObject<VkSemaphore> signal) {
         recordingBatch(); // an empty batch carries the semaphores
     }
     auto &batch = *recordingNow;
+    // Imported buffers go back to the device they came from.
+    for (auto const buffer : batch.imported) {
+        auto barrier = vkStruct<VkBufferMemoryBarrier>(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER);
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = 0;
+        barrier.srcQueueFamilyIndex = queueFamily;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        barrier.buffer = buffer;
+        barrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(batch.commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+    }
+    batch.imported.clear();
     hostVisibleBarrier(batch.commandBuffer);
     check(vkEndCommandBuffer(batch.commandBuffer), "vkEndCommandBuffer");
     auto fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
@@ -1907,7 +1945,82 @@ bool VulkanDevice::doCreateDeviceBuffer(BufferCreation const &request) {
     return false;
 }
 
+void VulkanDevice::doImportBuffer(BufferImport const &request) {
+    if (not context->memoryImport) {
+        throw DeviceError{"importBuffer: " + std::string{properties.deviceName}
+                          + " cannot import memory (needs Vulkan 1.1 and VK_KHR_external_memory_fd)"};
+    }
+    collectGarbage();
+    auto &memory = *request.memory;
+    auto externalProperties = vkStruct<VkExternalBufferProperties>(VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES);
+    auto externalInfo = vkStruct<VkPhysicalDeviceExternalBufferInfo>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO);
+    externalInfo.usage = kBufferUsage;
+    externalInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    vkGetPhysicalDeviceExternalBufferProperties(physical, &externalInfo, &externalProperties);
+    auto const features = externalProperties.externalMemoryProperties.externalMemoryFeatures;
+    if ((features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) == 0
+        or (features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) != 0) {
+        throw DeviceError{"importBuffer: " + std::string{properties.deviceName}
+                          + " cannot import opaque file descriptors as buffers"};
+    }
+    if (memory.memoryType >= memoryProperties.memoryTypeCount) {
+        throw DeviceError{"importBuffer: memory type " + std::to_string(memory.memoryType) + " does not exist on "
+                          + properties.deviceName};
+    }
+    auto mirror = BufferMirror{};
+    mirror.owner = request.identity->watch();
+    mirror.imported = true;
+    auto externalBuffer = vkStruct<VkExternalMemoryBufferCreateInfo>(VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+    externalBuffer.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+    info.pNext = &externalBuffer;
+    info.size = request.bytes;
+    info.usage = kBufferUsage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    auto buffer = VkBuffer{};
+    check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer (imported)");
+    mirror.buffer = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
+    auto requirements = VkMemoryRequirements{};
+    vkGetBufferMemoryRequirements(device.handle, buffer, &requirements);
+    if ((requirements.memoryTypeBits & (1u << memory.memoryType)) == 0 or memory.offset % requirements.alignment != 0
+        or memory.offset + requirements.size > memory.allocationBytes) {
+        throw DeviceError{"importBuffer: a " + std::to_string(request.bytes) + "-byte buffer cannot live at byte "
+                          + std::to_string(memory.offset) + " of memory type " + std::to_string(memory.memoryType)};
+    }
+    auto import = vkStruct<VkImportMemoryFdInfoKHR>(VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR);
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    import.fd = memory.fd.get();
+    auto allocateInfo = vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+    allocateInfo.pNext = &import;
+    allocateInfo.allocationSize = memory.allocationBytes;
+    allocateInfo.memoryTypeIndex = memory.memoryType;
+    auto raw = VkDeviceMemory{};
+    check(vkAllocateMemory(device.handle, &allocateInfo, nullptr, &raw), "vkAllocateMemory (import)");
+    memory.fd.release(); // Vulkan owns the descriptor now
+    mirror.memory = DeviceObject<VkDeviceMemory>{device.handle, raw, vkFreeMemory};
+    check(vkBindBufferMemory(device.handle, buffer, raw, memory.offset), "vkBindBufferMemory (imported)");
+    mirror.size = request.bytes;
+    buffers[request.identity->key()] = std::move(mirror);
+}
+
 void VulkanDevice::claim(VkCommandBuffer const cmd, void const *const key) {
+    if (auto const buffer = buffers.find(key); buffer != buffers.end() and buffer->second.imported) {
+        auto &acquired = recordingBatch().imported;
+        auto const handle = buffer->second.handle();
+        if (std::find(acquired.begin(), acquired.end(), handle) == acquired.end()) {
+            auto barrier = vkStruct<VkBufferMemoryBarrier>(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER);
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+            barrier.dstQueueFamilyIndex = queueFamily;
+            barrier.buffer = handle;
+            barrier.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                                 nullptr, 1, &barrier, 0, nullptr);
+            acquired.push_back(handle);
+        }
+        return;
+    }
     if (not aliases.claim(key)) {
         return;
     }

@@ -34,6 +34,12 @@ add_executable(tc_equivalence_tests
     kernels/memory_kernels.hpp)
 target_include_directories(tc_equivalence_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/examples ${PROJECT_SOURCE_DIR}/examples/common/include)
+# A plain Vulkan device exports the memory the import tests share.
+if(TC_ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED)
+    target_sources(tc_equivalence_tests PRIVATE external_memory_tests.cpp)
+    target_link_libraries(tc_equivalence_tests PRIVATE Vulkan::Vulkan)
+endif()
 target_link_libraries(tc_equivalence_tests PRIVATE tc_devices tc_cpu GTest::gtest_main tc_warnings
     astcenc-none-static) # the compressor makes ASTC test data
 tc_add_kernels(tc_equivalence_tests HEADERS

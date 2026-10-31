@@ -21,6 +21,7 @@
 #include <tc/compressed.hpp>
 #include <tc/device_buffer.hpp>
 #include <tc/external_image.hpp>
+#include <tc/external_memory.hpp>
 #include <tc/image.hpp>
 #include <tc/kernel.hpp>
 #include <tc/mat.hpp>
@@ -94,6 +95,11 @@ struct DeviceInfo {
     // dispatches (Vulkan with a transfer queue family or a second compute
     // queue). Otherwise its copies join the device's timeline in call order.
     bool separateTransfers = false;
+    // The GPU and driver; empty on the CPU backend and where the API cannot
+    // tell (OpenGL without GL_EXT_memory_object).
+    std::optional<GpuIdentity> gpu;
+    // importBuffer takes memory other devices of the same GPU exported.
+    bool importsMemory = false;
     DeviceLimits limits;
 };
 
@@ -238,6 +244,14 @@ struct BufferCreation {
     ResourceIdentity const *identity = nullptr;
     std::size_t bytes = 0;
     std::optional<HeapRange> placement;
+};
+
+// A buffer in memory another device exported (Device::importBuffer). The
+// backend takes `memory.fd` when the import succeeds.
+struct BufferImport {
+    ResourceIdentity const *identity = nullptr;
+    std::size_t bytes = 0;
+    ExternalBufferMemory *memory = nullptr;
 };
 
 // Device::copyBuffer: `bytes` bytes from byte `sourceOffset` of one device
@@ -705,6 +719,30 @@ struct Device {
         auto size = doBufferPlacement(bytes);
         size.alignment = std::max<std::size_t>({size.alignment, alignof(T), 16});
         return size;
+    }
+
+    // A buffer of `count` elements in memory another device of the same GPU
+    // exported (see ExternalBufferMemory), shared without copies. It is a
+    // DeviceBuffer: kernels read and write it, and the other device sees
+    // the results once it has waited for the work, e.g. for the fence of
+    // submitWithFence(); waitFor(SyncFence) orders this device after the
+    // other one. Use it on the device's own timeline, not on transfers().
+    // Throws DeviceError where the device cannot import (DeviceInfo::importsMemory).
+    template <class T>
+    DeviceBuffer<T> importBuffer(ExternalBufferMemory memory, std::size_t const count) {
+        auto const bytes = count * sizeof(T);
+        if (bytes == 0 or memory.fd.empty() or memory.offset > memory.allocationBytes
+            or bytes > memory.allocationBytes - memory.offset) {
+            throw DeviceError{"importBuffer: " + std::to_string(bytes) + " bytes from byte " + std::to_string(memory.offset)
+                              + " do not fit the " + std::to_string(memory.allocationBytes)
+                              + "-byte allocation, or there is no file descriptor"};
+        }
+        auto const identity = ResourceIdentity::create();
+        doImportBuffer(BufferImport{&identity, bytes, &memory});
+        auto const extent = static_cast<typename DimTraits<Dim::D1>::IndexType>(count);
+        auto state =
+            std::make_shared<detail::DeviceBufferState<T, Dim::D1>>(BufferResource<T>::hostless(extent, identity), nullptr);
+        return DeviceBuffer<T>{std::move(state)};
     }
 
     // `bytes` of device memory to place resources in (see MemoryHeap).
@@ -1201,6 +1239,10 @@ protected:
     virtual void doCopyBuffer(BufferCopy const &copy) {
         (void)copy;
         throw DeviceError{"copyBuffer is not supported by this backend"};
+    }
+    virtual void doImportBuffer(BufferImport const &request) {
+        (void)request;
+        throw DeviceError{"this device cannot import memory of other devices"};
     }
     virtual void doUseKernel(KernelUse const &use) = 0;
     virtual void doBindBuffer(BufferBindRequest const &request) = 0;
