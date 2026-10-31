@@ -7,6 +7,7 @@
 #include <tc/builtins.hpp>
 #include <tc/codec.hpp>
 #include <tc/compressed.hpp>
+#include <tc/device_buffer.hpp>
 #include <tc/device_image.hpp>
 #include <tc/dim.hpp>
 #include <tc/external_image.hpp>

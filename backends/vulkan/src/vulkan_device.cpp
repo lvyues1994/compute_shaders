@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <tc/detail/aliasing.hpp>
 #include <tc/detail/hazards.hpp>
 
 #include "vk_handles.hpp"
@@ -204,8 +205,17 @@ struct MappedBuffer {
     std::byte *mapped = nullptr;
 };
 
+// A memory heap; placed buffers and images keep its memory alive.
+struct HeapMirror {
+    std::weak_ptr<void const> owner;
+    std::shared_ptr<DeviceObject<VkDeviceMemory>> memory;
+    std::uint32_t memoryType = 0;
+    VkDeviceSize size = 0;
+};
+
 struct BufferMirror {
     std::weak_ptr<void const> owner;
+    std::shared_ptr<DeviceObject<VkDeviceMemory>> heap; // placed buffers: instead of `memory`
     DeviceObject<VkDeviceMemory> memory; // declared before the buffer: freed after it
     DeviceObject<VkBuffer> buffer;
     std::shared_ptr<MappedBuffer> mapped; // set for createBuffer() allocations instead of the two above
@@ -216,6 +226,7 @@ struct BufferMirror {
 
 struct ImageMirror {
     std::weak_ptr<void const> owner;
+    std::shared_ptr<DeviceObject<VkDeviceMemory>> heap; // placed images: instead of `memory`
     DeviceObject<VkDeviceMemory> memory;
     DeviceObject<VkImage> image;
     DeviceObject<VkImageView> view; // every level: sampled textures
@@ -469,6 +480,7 @@ struct VulkanDevice final : Device {
             (memoryProperties.memoryTypes[memory].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
         result.timers = timestampBits > 0 and properties.limits.timestampPeriod > 0.0f;
         result.syncFiles = context->syncFdImport and context->syncFdExport;
+        result.placedImages = true;
         auto const &supported = properties.limits;
         auto &limits = result.limits;
         limits.storageBuffers = supported.maxPerStageDescriptorStorageBuffers;
@@ -527,6 +539,11 @@ protected:
     void doDownloadImage(ImageTransfer const &transfer) override;
     bool doCreateImage(ImageCreation const &request) override;
     void doCopyBufferToImage(BufferImageCopy const &copy) override;
+    bool doCreateHeap(HeapCreation const &request) override;
+    bool doCreateDeviceBuffer(BufferCreation const &request) override;
+    PlacementSize doBufferPlacement(std::size_t bytes) override;
+    PlacementSize doImagePlacement(ImageCreation const &request) override;
+    void doCopyBuffer(BufferCopy const &copy) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
@@ -549,9 +566,27 @@ private:
     VkFormatFeatureFlags formatFeatures(VkFormat format) const;
     VkSampler samplerFor(Filter filter, Wrap wrap, Mip mip);
     DeviceObject<VkImageView> createView(ImageMirror const &mirror, std::uint32_t first, std::uint32_t count) const;
-    // Replaces `mirror` with a new image in GENERAL layout (contents undefined).
+    // The image tc creates for this format and shape: every usage the format
+    // supports, since one image may be stored, sampled and copied.
+    VkImageCreateInfo imageInfo(ImageFormat const &format, std::optional<CompressedFormat> compressed, Dim dim,
+                                ivec3 extent, std::uint32_t levels) const;
+    // Replaces `mirror` with a new image in GENERAL layout (contents
+    // undefined); a placed image takes its layout at its first use.
     void allocateImage(ImageMirror &mirror, ResourceIdentity const &identity, ImageFormat const &format,
-                       std::optional<CompressedFormat> compressed, Dim dim, ivec3 extent, std::uint32_t levels);
+                       std::optional<CompressedFormat> compressed, Dim dim, ivec3 extent, std::uint32_t levels,
+                       std::optional<HeapRange> const &placement = std::nullopt);
+    // Memory of `heap` for a resource with `requirements` at `offset`.
+    std::shared_ptr<DeviceObject<VkDeviceMemory>> heapMemory(HeapRange const &placement,
+                                                             VkMemoryRequirements const &requirements,
+                                                             char const *what) const;
+    PlacementSize placementOf(VkMemoryRequirements const &requirements) const;
+    detail::ResourceAccess access(void const *const key, std::size_t const offset, std::size_t const size,
+                                  bool const read, bool const write) const {
+        return aliases.access(key, offset, size, read, write);
+    }
+    // Before `cmd` uses a placed resource whose bytes an alias used last:
+    // an image's contents are discarded into GENERAL layout.
+    void claim(VkCommandBuffer cmd, void const *key);
     VkImageView levelView(ImageMirror &mirror, std::uint32_t level);
     void createInstance(VulkanDeviceConfig const &config);
     void pickPhysicalDevice(VulkanDeviceConfig const &config);
@@ -608,9 +643,11 @@ private:
     std::uint64_t completedSerial = 0; // every batch up to this one has completed
     std::vector<Grave> graveyard;
     detail::HazardTracker hazards;
+    detail::AliasTracker aliases;
     std::vector<DeviceObject<VkSemaphore>> pendingWaits; // for the next submission
     PFN_vkGetSemaphoreFdKHR getSemaphoreFd = nullptr;
     PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
+    std::unordered_map<void const *, HeapMirror> heaps;
     std::unordered_map<void const *, BufferMirror> buffers;
     std::unordered_map<void const *, ImageMirror> images;
     std::unordered_map<void const *, ExternalMirror> externals;
@@ -1219,6 +1256,14 @@ VkDescriptorSet VulkanDevice::allocateSet(VkDescriptorSetLayout const layout) {
 // with them.
 void VulkanDevice::collectGarbage() {
     retireCompleted();
+    for (auto it = heaps.begin(); it != heaps.end();) {
+        if (it->second.owner.expired()) {
+            bury(std::move(it->second));
+            it = heaps.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = buffers.begin(); it != buffers.end();) {
         if (it->second.owner.expired()) {
             bury(std::move(it->second));
@@ -1323,11 +1368,9 @@ void VulkanDevice::doDownloadBuffer(ResourceIdentity const &identity, ByteSpan c
     std::memcpy(bytes.data() + range.offset, slice.mapped, range.size);
 }
 
-void VulkanDevice::allocateImage(ImageMirror &mirror, ResourceIdentity const &identity, ImageFormat const &imageFormat,
-                                 std::optional<CompressedFormat> const compressed, Dim const dim, ivec3 const extent,
-                                 std::uint32_t const levels) {
+VkImageCreateInfo VulkanDevice::imageInfo(ImageFormat const &imageFormat, std::optional<CompressedFormat> const compressed,
+                                          Dim const dim, ivec3 const extent, std::uint32_t const levels) const {
     auto const format = compressed ? vkCompressedFormat(*compressed) : vkFormatOf(imageFormat);
-    auto const layers = layerCount(dim, extent);
     // The same image may be written as a storage image and read as a
     // sampled texture later, so request every usage the format supports.
     // Compressed images are only sampled.
@@ -1346,33 +1389,50 @@ void VulkanDevice::allocateImage(ImageMirror &mirror, ResourceIdentity const &id
         auto const name = compressed ? std::string{compressedFormatInfo(*compressed).name} : glslFormatQualifier(imageFormat);
         throw DeviceError{"image format " + name + " can be neither stored nor sampled on " + properties.deviceName};
     }
+    auto info = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+    info.imageType = dim == Dim::D3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = levelExtent(dim, extent, 0);
+    info.mipLevels = levels;
+    info.arrayLayers = layerCount(dim, extent);
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    return info;
+}
+
+void VulkanDevice::allocateImage(ImageMirror &mirror, ResourceIdentity const &identity, ImageFormat const &imageFormat,
+                                 std::optional<CompressedFormat> const compressed, Dim const dim, ivec3 const extent,
+                                 std::uint32_t const levels, std::optional<HeapRange> const &placement) {
+    auto const info = imageInfo(imageFormat, compressed, dim, extent, levels);
+    auto const layers = info.arrayLayers;
     if (mirror.image.get() != VK_NULL_HANDLE) {
         bury(std::move(mirror)); // queued commands may still use the old image
     }
     mirror = ImageMirror{};
-    mirror.usage = usage;
+    mirror.usage = info.usage;
     mirror.owner = identity.watch();
     mirror.format = imageFormat;
     mirror.compressed = compressed;
     mirror.dim = dim;
     mirror.extent = extent;
     mirror.levels = levels;
-    auto info = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
-    info.imageType = dim == Dim::D3 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-    info.format = format;
-    info.extent = levelExtent(dim, extent, 0);
-    info.mipLevels = levels;
-    info.arrayLayers = layers;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    info.usage = usage;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     auto image = VkImage{};
     check(vkCreateImage(device.handle, &info, nullptr, &image), "vkCreateImage");
     mirror.image = DeviceObject<VkImage>{device.handle, image, vkDestroyImage};
     auto requirements = VkMemoryRequirements{};
     vkGetImageMemoryRequirements(device.handle, image, &requirements);
+    if (placement) {
+        mirror.heap = heapMemory(*placement, requirements, "createImage");
+        check(vkBindImageMemory(device.handle, image, mirror.heap->get(), placement->offset), "vkBindImageMemory");
+        mirror.view = createView(mirror, 0, levels);
+        aliases.place(identity.key(), identity.watch(),
+                      detail::AliasTracker::Range{placement->heap->key(), placement->offset,
+                                                  static_cast<std::size_t>(requirements.size)});
+        return;
+    }
     mirror.memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     check(vkBindImageMemory(device.handle, image, mirror.memory.get(), 0), "vkBindImageMemory");
     mirror.view = createView(mirror, 0, levels);
@@ -1394,8 +1454,161 @@ void VulkanDevice::allocateImage(ImageMirror &mirror, ResourceIdentity const &id
 bool VulkanDevice::doCreateImage(ImageCreation const &request) {
     collectGarbage();
     allocateImage(images[request.identity->key()], *request.identity, request.format, request.compressed, request.dim,
-                  request.extent, request.levels);
+                  request.extent, request.levels, request.placement);
     return false;
+}
+
+PlacementSize VulkanDevice::placementOf(VkMemoryRequirements const &requirements) const {
+    // Buffers and optimally tiled images may share a heap: keeping every
+    // resource on whole granules keeps them off each other's pages.
+    auto const granularity = std::max<VkDeviceSize>(properties.limits.bufferImageGranularity, 1);
+    auto const bytes = (requirements.size + granularity - 1) / granularity * granularity;
+    return PlacementSize{static_cast<std::size_t>(bytes),
+                         static_cast<std::size_t>(std::max(requirements.alignment, granularity))};
+}
+
+PlacementSize VulkanDevice::doBufferPlacement(std::size_t const bytes) {
+    auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+    info.size = bytes;
+    info.usage = kBufferUsage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    auto buffer = VkBuffer{};
+    check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
+    auto const probe = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
+    auto requirements = VkMemoryRequirements{};
+    vkGetBufferMemoryRequirements(device.handle, probe.get(), &requirements);
+    return placementOf(requirements);
+}
+
+PlacementSize VulkanDevice::doImagePlacement(ImageCreation const &request) {
+    auto const info = imageInfo(request.format, request.compressed, request.dim, request.extent, request.levels);
+    auto image = VkImage{};
+    check(vkCreateImage(device.handle, &info, nullptr, &image), "vkCreateImage");
+    auto const probe = DeviceObject<VkImage>{device.handle, image, vkDestroyImage};
+    auto requirements = VkMemoryRequirements{};
+    vkGetImageMemoryRequirements(device.handle, probe.get(), &requirements);
+    return placementOf(requirements);
+}
+
+// Device-local memory that both buffers and (RGBA16F, the common case of
+// transient images) optimally tiled images can live in.
+bool VulkanDevice::doCreateHeap(HeapCreation const &request) {
+    collectGarbage();
+    auto bufferInfo = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+    bufferInfo.size = 256;
+    bufferInfo.usage = kBufferUsage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    auto buffer = VkBuffer{};
+    check(vkCreateBuffer(device.handle, &bufferInfo, nullptr, &buffer), "vkCreateBuffer");
+    auto const bufferProbe = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
+    auto bufferNeeds = VkMemoryRequirements{};
+    vkGetBufferMemoryRequirements(device.handle, bufferProbe.get(), &bufferNeeds);
+    auto const imageCreate = imageInfo(ImageFormat{Encoding::Float, false, 16, 4}, std::nullopt, Dim::D2, ivec3{64, 64, 1}, 1);
+    auto image = VkImage{};
+    check(vkCreateImage(device.handle, &imageCreate, nullptr, &image), "vkCreateImage");
+    auto const imageProbe = DeviceObject<VkImage>{device.handle, image, vkDestroyImage};
+    auto imageNeeds = VkMemoryRequirements{};
+    vkGetImageMemoryRequirements(device.handle, imageProbe.get(), &imageNeeds);
+    auto const both = bufferNeeds.memoryTypeBits & imageNeeds.memoryTypeBits;
+    auto typeBits = bufferNeeds.memoryTypeBits;
+    for (std::uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+        if ((both & (1u << i)) != 0
+            and (memoryProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+            typeBits = both;
+            break;
+        }
+    }
+    auto &heap = heaps[request.identity->key()];
+    heap.owner = request.identity->watch();
+    heap.memoryType = memoryType(typeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    heap.size = request.bytes;
+    auto info = vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+    info.allocationSize = request.bytes;
+    info.memoryTypeIndex = heap.memoryType;
+    auto memory = VkDeviceMemory{};
+    check(vkAllocateMemory(device.handle, &info, nullptr, &memory), "vkAllocateMemory (heap)");
+    heap.memory = std::make_shared<DeviceObject<VkDeviceMemory>>(device.handle, memory, vkFreeMemory);
+    return false;
+}
+
+std::shared_ptr<DeviceObject<VkDeviceMemory>> VulkanDevice::heapMemory(HeapRange const &placement,
+                                                                       VkMemoryRequirements const &requirements,
+                                                                       char const *what) const {
+    auto const &heap = heaps.at(placement.heap->key());
+    if ((requirements.memoryTypeBits & (1u << heap.memoryType)) == 0) {
+        throw DeviceError{std::string{what} + ": this resource cannot live in the memory of a heap on "
+                          + properties.deviceName + "; give it memory of its own"};
+    }
+    if (placement.offset % requirements.alignment != 0 or placement.offset + requirements.size > heap.size) {
+        throw DeviceError{std::string{what} + ": the placement is misaligned or leaves the heap"};
+    }
+    return heap.memory;
+}
+
+bool VulkanDevice::doCreateDeviceBuffer(BufferCreation const &request) {
+    collectGarbage();
+    auto &mirror = buffers[request.identity->key()];
+    mirror = BufferMirror{};
+    mirror.owner = request.identity->watch();
+    auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+    info.size = request.bytes;
+    info.usage = kBufferUsage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    auto buffer = VkBuffer{};
+    check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
+    mirror.buffer = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
+    auto requirements = VkMemoryRequirements{};
+    vkGetBufferMemoryRequirements(device.handle, buffer, &requirements);
+    if (request.placement) {
+        mirror.heap = heapMemory(*request.placement, requirements, "createDeviceBuffer");
+        check(vkBindBufferMemory(device.handle, buffer, mirror.heap->get(), request.placement->offset),
+              "vkBindBufferMemory");
+        aliases.place(request.identity->key(), request.identity->watch(),
+                      detail::AliasTracker::Range{request.placement->heap->key(), request.placement->offset,
+                                                  request.bytes});
+    } else {
+        mirror.memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkBindBufferMemory(device.handle, buffer, mirror.memory.get(), 0), "vkBindBufferMemory");
+    }
+    mirror.size = request.bytes;
+    return false;
+}
+
+void VulkanDevice::claim(VkCommandBuffer const cmd, void const *const key) {
+    if (not aliases.claim(key)) {
+        return;
+    }
+    auto const it = images.find(key);
+    if (it == images.end()) {
+        return; // buffers need no more than the barrier their accesses already got
+    }
+    auto const &mirror = it->second;
+    auto barrier = vkStruct<VkImageMemoryBarrier>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = mirror.image.get();
+    barrier.subresourceRange =
+        VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, mirror.levels, 0, layerCount(mirror.dim, mirror.extent)};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+}
+
+void VulkanDevice::doCopyBuffer(BufferCopy const &copy) {
+    auto const source = buffers.find(copy.source->key());
+    auto const target = buffers.find(copy.target->key());
+    if (source == buffers.end() or target == buffers.end()) {
+        throw DeviceError{"copyBuffer: a buffer was never uploaded to this device"};
+    }
+    auto const cmd = commandFor({access(copy.source->key(), copy.sourceOffset, copy.bytes, true, false),
+                                 access(copy.target->key(), copy.targetOffset, copy.bytes, false, true)});
+    claim(cmd, copy.source->key());
+    claim(cmd, copy.target->key());
+    auto const region = VkBufferCopy{copy.sourceOffset, copy.targetOffset, copy.bytes};
+    vkCmdCopyBuffer(cmd, source->second.handle(), target->second.handle(), 1, &region);
 }
 
 void VulkanDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
@@ -1416,8 +1629,10 @@ void VulkanDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
         region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(copy.extent.x),
                                         static_cast<std::uint32_t>(copy.extent.y), 1};
     }
-    auto const cmd = commandFor({detail::ResourceAccess{copy.buffer->key(), copy.offset, copy.bytes, true, false},
-                                 detail::ResourceAccess{copy.image->key(), 0, 0, false, true}});
+    auto const cmd = commandFor({access(copy.buffer->key(), copy.offset, copy.bytes, true, false),
+                                 access(copy.image->key(), 0, 0, false, true)});
+    claim(cmd, copy.buffer->key());
+    claim(cmd, copy.image->key());
     vkCmdCopyBufferToImage(cmd, buffer->second.handle(), mirror.image.get(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
@@ -2032,9 +2247,11 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
     imageInfos.reserve(reflection.resources.size());
     auto writes = std::vector<VkWriteDescriptorSet>{};
     auto accesses = std::vector<detail::ResourceAccess>{};
+    auto used = std::vector<void const *>{};
     auto const access = [&](void const *const key, std::optional<ByteRange> const &range, Access const how) {
-        accesses.push_back(detail::ResourceAccess{key, range ? range->offset : 0, range ? range->size : 0,
-                                                  how != Access::WriteOnly, how != Access::ReadOnly});
+        accesses.push_back(this->access(key, range ? range->offset : 0, range ? range->size : 0,
+                                        how != Access::WriteOnly, how != Access::ReadOnly));
+        used.push_back(key);
     };
     if (dispatch.indirect) {
         access(dispatch.indirect->identity->key(), ByteRange{dispatch.indirect->offset, sizeof(DispatchIndirectCommand)},
@@ -2118,6 +2335,9 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
     }
     if (hazards.needsBarrier(accesses)) {
         fullBarrier(cmd);
+    }
+    for (auto const *key : used) {
+        claim(cmd, key);
     }
     for (auto const image : frames) {
         acquireForeignFrame(cmd, image);

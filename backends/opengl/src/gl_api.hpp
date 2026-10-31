@@ -46,6 +46,7 @@ inline constexpr GLenum kGpuDisjoint = 0x8FBB;
     X(PFNGLBINDBUFFERPROC, glBindBuffer)                                                                               \
     X(PFNGLBUFFERDATAPROC, glBufferData)                                                                               \
     X(PFNGLBUFFERSUBDATAPROC, glBufferSubData)                                                                         \
+    X(PFNGLCOPYBUFFERSUBDATAPROC, glCopyBufferSubData)                                                                 \
     X(PFNGLMAPBUFFERRANGEPROC, glMapBufferRange)                                                                       \
     X(PFNGLUNMAPBUFFERPROC, glUnmapBuffer)                                                                             \
     X(PFNGLBINDBUFFERBASEPROC, glBindBufferBase)                                                                       \

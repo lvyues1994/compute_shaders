@@ -7,6 +7,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,7 @@
 #include <tc/buffer.hpp>
 #include <tc/builtins.hpp>
 #include <tc/compressed.hpp>
+#include <tc/device_buffer.hpp>
 #include <tc/external_image.hpp>
 #include <tc/image.hpp>
 #include <tc/kernel.hpp>
@@ -84,6 +86,10 @@ struct DeviceInfo {
     // submitWithFence() exports sync files and waitFor() waits on the
     // device; otherwise both wait on the host.
     bool syncFiles = false;
+    // Images created with a Placement share the heap's memory with the
+    // other resources placed there (Vulkan, CPU). Otherwise (OpenGL) each
+    // such image has memory of its own and only buffers alias.
+    bool placedImages = false;
     DeviceLimits limits;
 };
 
@@ -194,7 +200,15 @@ struct CompressedTransfer {
     std::uint32_t layers = 1;
 };
 
-// A device image to allocate (Device::createImage).
+// Bytes [offset, offset + the resource's size) of a heap.
+struct HeapRange {
+    ResourceIdentity const *heap = nullptr;
+    std::size_t offset = 0;
+    std::byte *host = nullptr; // those bytes on the host: the CPU backend's memory
+};
+
+// A device image to allocate (Device::createImage), or to measure
+// (Device::imagePlacement, `identity` nullptr).
 struct ImageCreation {
     ResourceIdentity const *identity = nullptr;
     ImageFormat format{};                       // unused when `compressed`
@@ -202,6 +216,33 @@ struct ImageCreation {
     Dim dim = Dim::D2;
     ivec3 extent{}; // of level 0; array layers in z
     std::uint32_t levels = 1;
+    std::optional<HeapRange> placement;
+    std::size_t hostBytes = 0; // of the CPU backend's MipChain, placed or not
+};
+
+// A device memory heap to allocate (Device::createHeap).
+struct HeapCreation {
+    ResourceIdentity const *identity = nullptr;
+    std::size_t bytes = 0;
+};
+
+// A device-only buffer to allocate (Device::createDeviceBuffer).
+struct BufferCreation {
+    ResourceIdentity const *identity = nullptr;
+    std::size_t bytes = 0;
+    std::optional<HeapRange> placement;
+};
+
+// Device::copyBuffer: `bytes` bytes from byte `sourceOffset` of one device
+// buffer to byte `targetOffset` of another (or of the same, not overlapping).
+struct BufferCopy {
+    ResourceIdentity const *source = nullptr;
+    std::size_t sourceOffset = 0;
+    ResourceIdentity const *target = nullptr;
+    std::size_t targetOffset = 0;
+    std::size_t bytes = 0;
+    ConstByteSpan sourceHost; // the whole buffers on the host: the CPU backend's working memory
+    ByteSpan targetHost;
 };
 
 // Device::copyBufferToImage: `bytes` bytes from byte `offset` of a device
@@ -424,28 +465,93 @@ struct Device {
     // An image only this device holds (see DeviceImage), with `levels` mip
     // levels (0: the full chain) and, for Dim::D2Array, `extent.z` layers.
     template <class G, Dim D, class P = typename GPUFormatTraits<G>::StoragePixel>
-    DeviceImage<G, D, P> createImage(typename DimTraits<D>::IndexType const extent, std::uint32_t levels = 1) {
-        static_assert(D != Dim::D1, "1D images are unavailable on OpenGL ES; use a buffer instead");
-        auto const extent3 = DimTraits<D>::toExtent3(extent);
-        auto const full = extent3.x > 0 and extent3.y > 0 and extent3.z > 0 ? fullMipLevels(D, extent3) : 0u;
-        levels = levels == 0 ? full : levels;
-        if (full == 0 or levels > full) {
-            throw DeviceError{"createImage: empty extent or more mip levels than it has"};
+    DeviceImage<G, D, P> createImage(typename DimTraits<D>::IndexType const extent, std::uint32_t const levels = 1) {
+        return makeImage<G, D, P>(extent, levels, nullptr);
+    }
+
+    // The same image in a heap, at `placement` (see Placement): it may
+    // share memory with other resources placed there. The offset must be
+    // a multiple of imagePlacement<G, D, P>(extent, levels).alignment.
+    template <class G, Dim D, class P = typename GPUFormatTraits<G>::StoragePixel>
+    DeviceImage<G, D, P> createImage(typename DimTraits<D>::IndexType const extent, std::uint32_t const levels,
+                                     Placement const &placement) {
+        return makeImage<G, D, P>(extent, levels, &placement);
+    }
+
+    // The bytes and offset alignment that createImage needs in a heap.
+    template <class G, Dim D, class P = typename GPUFormatTraits<G>::StoragePixel>
+    PlacementSize imagePlacement(typename DimTraits<D>::IndexType const extent, std::uint32_t const levels = 1) {
+        auto const request = imageRequest<G, D, P>(extent, levels, nullptr, "imagePlacement");
+        auto size = doImagePlacement(request);
+        size.alignment = std::max<std::size_t>(size.alignment, 16);
+        return size;
+    }
+
+    // A buffer only this device holds (see DeviceBuffer); its contents
+    // start undefined.
+    template <class T, Dim D = Dim::D1>
+    DeviceBuffer<T, D> createDeviceBuffer(typename DimTraits<D>::IndexType const extent) {
+        return makeDeviceBuffer<T, D>(extent, nullptr);
+    }
+
+    // The same buffer in a heap, at `placement` (see Placement). The offset
+    // must be a multiple of bufferPlacement<T, D>(extent).alignment.
+    template <class T, Dim D = Dim::D1>
+    DeviceBuffer<T, D> createDeviceBuffer(typename DimTraits<D>::IndexType const extent, Placement const &placement) {
+        return makeDeviceBuffer<T, D>(extent, &placement);
+    }
+
+    // The bytes and offset alignment that createDeviceBuffer needs in a heap.
+    template <class T, Dim D = Dim::D1>
+    PlacementSize bufferPlacement(typename DimTraits<D>::IndexType const extent) {
+        auto const bytes = static_cast<std::size_t>(DimTraits<D>::product(extent)) * sizeof(T);
+        if (bytes == 0) {
+            throw DeviceError{"bufferPlacement: empty extent"};
         }
-        if (auto const reason = detail::imageExceedsLimits(D, extent3, info().limits)) {
-            throw DeviceError{"createImage: " + *reason};
+        auto size = doBufferPlacement(bytes);
+        size.alignment = std::max<std::size_t>({size.alignment, alignof(T), 16});
+        return size;
+    }
+
+    // `bytes` of device memory to place resources in (see MemoryHeap).
+    MemoryHeap createHeap(std::size_t const bytes) {
+        if (bytes == 0) {
+            throw DeviceError{"createHeap: a heap cannot be empty"};
         }
-        auto state = std::make_shared<detail::DeviceImageState<P, D>>(extent, levels);
-        auto request = ImageCreation{};
-        request.identity = &state->identity;
-        request.format = GPUFormatTraits<G>::format;
-        request.dim = D;
-        request.extent = extent3;
-        request.levels = levels;
-        if (doCreateImage(request)) {
-            state->host = std::make_unique<MipChain<P, D>>(extent, levels);
+        auto state = std::make_shared<detail::HeapState>(bytes);
+        if (doCreateHeap(HeapCreation{&state->identity, bytes})) {
+            auto *const memory = static_cast<std::byte *>(::operator new(bytes, std::align_val_t{64}));
+            state->host = std::shared_ptr<std::byte>(
+                memory, [](std::byte *const block) { ::operator delete(block, std::align_val_t{64}); });
         }
-        return DeviceImage<G, D, P>{std::move(state)};
+        return MemoryHeap{std::move(state)};
+    }
+
+    // Copies `bytes` bytes on the device, in order with the work around it:
+    // from byte `sourceOffset` of `source` to byte `targetOffset` of
+    // `target`, each a BufferResource the device has (uploaded, or from
+    // createBuffer) or a DeviceBuffer. Offsets and size are multiples of 4;
+    // within one buffer the two ranges must not overlap.
+    template <class S, class T,
+              std::enable_if_t<detail::IsBufferLike<S>::value and detail::IsBufferLike<T>::value, int> = 0>
+    void copyBuffer(S const &source, std::size_t const sourceOffset, T const &target, std::size_t const targetOffset,
+                    std::size_t const bytes) {
+        auto const from = detail::bufferBytes(source);
+        auto const to = detail::bufferBytes(target);
+        if (bytes == 0 or bytes % 4 != 0 or sourceOffset % 4 != 0 or targetOffset % 4 != 0) {
+            throw DeviceError{"copyBuffer: offsets and size must be multiples of 4, and the size above 0"};
+        }
+        if (sourceOffset > from.size or bytes > from.size - sourceOffset or targetOffset > to.size
+            or bytes > to.size - targetOffset) {
+            throw DeviceError{"copyBuffer: " + std::to_string(bytes) + " bytes from byte " + std::to_string(sourceOffset)
+                              + " to byte " + std::to_string(targetOffset) + " leave the buffers"};
+        }
+        if (from.identity->key() == to.identity->key() and sourceOffset < targetOffset + bytes
+            and targetOffset < sourceOffset + bytes) {
+            throw DeviceError{"copyBuffer: the source and target ranges overlap"};
+        }
+        doCopyBuffer(BufferCopy{from.identity, sourceOffset, to.identity, targetOffset, bytes,
+                                ConstByteSpan{from.host.data(), from.host.size()}, to.host});
     }
 
     // A compressed image only this device holds (see DeviceCompressedImage),
@@ -495,11 +601,12 @@ struct Device {
     // image), in order with the work around it and without the host. From
     // byte `offset`, a multiple of 4 and of the texel size, the buffer holds
     // the texels in the GPU storage format (GPUFormatTraits<G>::StoragePixel)
-    // row after row and layer after layer.
-    template <class T, Dim BD, class G, Dim D, class P>
-    void copyBufferToImage(BufferResource<T, BD> const &buffer, std::size_t const offset,
-                           DeviceImage<G, D, P> const &image, std::uint32_t const level,
-                           std::uint32_t const firstLayer = 0, std::uint32_t const layers = 1) {
+    // row after row and layer after layer. The buffer may also be a
+    // DeviceBuffer.
+    template <class B, class G, Dim D, class P, std::enable_if_t<detail::IsBufferLike<B>::value, int> = 0>
+    void copyBufferToImage(B const &buffer, std::size_t const offset, DeviceImage<G, D, P> const &image,
+                           std::uint32_t const level, std::uint32_t const firstLayer = 0,
+                           std::uint32_t const layers = 1) {
         using Storage = typename GPUFormatTraits<G>::StoragePixel;
         if (not image or level >= image.levels()) {
             throw DeviceError{"copyBufferToImage: no image, or no mip level " + std::to_string(level)};
@@ -511,13 +618,14 @@ struct Device {
                               + " are outside the image, which has " + std::to_string(depth)};
         }
         auto const bytes = static_cast<std::size_t>(extent.x) * static_cast<std::size_t>(extent.y) * layers * sizeof(Storage);
-        auto const host = buffer.bytes();
+        auto const source = detail::bufferBytes(buffer);
+        auto const host = ConstByteSpan{source.host.data(), source.size};
         if (offset % 4 != 0 or offset % sizeof(Storage) != 0 or offset > host.size() or bytes > host.size() - offset) {
             throw DeviceError{"copyBufferToImage: " + std::to_string(bytes) + " bytes from byte " + std::to_string(offset)
                               + " are outside the buffer or misaligned"};
         }
         auto copy = BufferImageCopy{};
-        copy.buffer = &buffer.identity();
+        copy.buffer = source.identity;
         copy.offset = offset;
         copy.bytes = bytes;
         copy.host = host;
@@ -546,10 +654,10 @@ struct Device {
     // and of the block size, the buffer holds the blocks of the layers in
     // turn (DeviceCompressedImage::layerBytes(level) bytes each), each layer
     // in row-major order as in a KTX2 file.
-    template <class T, Dim BD, Dim D>
-    void copyBufferToImage(BufferResource<T, BD> const &buffer, std::size_t const offset,
-                           DeviceCompressedImage<D> const &image, std::uint32_t const level,
-                           std::uint32_t const firstLayer = 0, std::uint32_t const layers = 1) {
+    template <class B, Dim D, std::enable_if_t<detail::IsBufferLike<B>::value, int> = 0>
+    void copyBufferToImage(B const &buffer, std::size_t const offset, DeviceCompressedImage<D> const &image,
+                           std::uint32_t const level, std::uint32_t const firstLayer = 0,
+                           std::uint32_t const layers = 1) {
         if (not image or level >= image.levels()) {
             throw DeviceError{"copyBufferToImage: no image, or no mip level " + std::to_string(level)};
         }
@@ -560,14 +668,15 @@ struct Device {
         auto const blockBytes = compressedFormatInfo(image.format()).blockBytes;
         auto const layerBytes = image.layerBytes(level);
         auto const bytes = layerBytes * layers;
-        auto const host = buffer.bytes();
+        auto const source = detail::bufferBytes(buffer);
+        auto const host = ConstByteSpan{source.host.data(), source.size};
         if (offset % 4 != 0 or offset % blockBytes != 0 or offset > host.size() or bytes > host.size() - offset) {
             throw DeviceError{"copyBufferToImage: " + std::to_string(bytes) + " bytes from byte " + std::to_string(offset)
                               + " are outside the buffer or misaligned"};
         }
         auto const size = DimTraits<D>::toExtent3(image.extent(level));
         auto copy = BufferImageCopy{};
-        copy.buffer = &buffer.identity();
+        copy.buffer = source.identity;
         copy.offset = offset;
         copy.bytes = bytes;
         copy.host = host;
@@ -593,6 +702,7 @@ struct Device {
 
     template <class T, Dim D>
     void uploadBuffer(BufferResource<T, D> const &resource) {
+        requireHostData(resource, "uploadBuffer");
         doUploadBuffer(resource.identity(), resource.bytes(), ByteRange{0, resource.bytes().size()});
     }
 
@@ -600,11 +710,13 @@ struct Device {
     // never seen is uploaded whole.
     template <class T, Dim D>
     void uploadBuffer(BufferResource<T, D> const &resource, std::size_t const first, std::size_t const count) {
+        requireHostData(resource, "uploadBuffer");
         doUploadBuffer(resource.identity(), resource.bytes(), elementRange<T>(resource.size(), first, count, "upload"));
     }
 
     template <class T, Dim D>
     void downloadBuffer(BufferResource<T, D> &resource) {
+        requireHostData(resource, "downloadBuffer");
         doDownloadBuffer(resource.identity(), resource.bytes(), ByteRange{0, resource.bytes().size()});
     }
 
@@ -612,6 +724,7 @@ struct Device {
     // copy keeps its contents.
     template <class T, Dim D>
     void downloadBuffer(BufferResource<T, D> &resource, std::size_t const first, std::size_t const count) {
+        requireHostData(resource, "downloadBuffer");
         doDownloadBuffer(resource.identity(), resource.bytes(), elementRange<T>(resource.size(), first, count, "download"));
     }
 
@@ -916,6 +1029,19 @@ struct Device {
         doExecute(dispatch);
     }
 
+    // The same with arguments in a DeviceBuffer.
+    template <class K>
+    void executeIndirect(K &kernel, DeviceBuffer<DispatchIndirectCommand> const &arguments, std::size_t const index = 0) {
+        if (not arguments or index >= arguments.size()) {
+            throw DeviceError{"executeIndirect: argument " + std::to_string(index) + " is outside the buffer"};
+        }
+        auto const *host = arguments.hostView()->data();
+        auto dispatch = makeDispatch(kernel);
+        dispatch.indirect = IndirectArguments{&arguments.identity(), index * sizeof(DispatchIndirectCommand),
+                                              host != nullptr ? host + index : nullptr};
+        doExecute(dispatch);
+    }
+
 protected:
     // Allocates `bytes` of device memory mapped for the CPU and registers it
     // as the device mirror of `identity`; nullopt when the device cannot.
@@ -935,6 +1061,31 @@ protected:
     // the image needs host storage (the CPU backend).
     virtual bool doCreateImage(ImageCreation const &request) = 0;
     virtual void doCopyBufferToImage(BufferImageCopy const &copy) = 0;
+    // Allocates a heap and registers it under its identity; returns true
+    // when the device runs kernels on the host and the heap needs host
+    // memory (the CPU backend).
+    virtual bool doCreateHeap(HeapCreation const &request) {
+        (void)request;
+        throw DeviceError{"memory heaps are not supported by this backend"};
+    }
+    // Allocates a device-only buffer, in a heap when `placement` is set;
+    // returns true when it needs host storage (the CPU backend).
+    virtual bool doCreateDeviceBuffer(BufferCreation const &request) {
+        (void)request;
+        throw DeviceError{"device-only buffers are not supported by this backend"};
+    }
+    virtual PlacementSize doBufferPlacement(std::size_t bytes) {
+        (void)bytes;
+        throw DeviceError{"memory heaps are not supported by this backend"};
+    }
+    virtual PlacementSize doImagePlacement(ImageCreation const &request) {
+        (void)request;
+        throw DeviceError{"memory heaps are not supported by this backend"};
+    }
+    virtual void doCopyBuffer(BufferCopy const &copy) {
+        (void)copy;
+        throw DeviceError{"copyBuffer is not supported by this backend"};
+    }
     virtual void doUseKernel(KernelUse const &use) = 0;
     virtual void doBindBuffer(BufferBindRequest const &request) = 0;
     virtual void doBindImage(ImageBindRequest const &request) = 0;
@@ -979,6 +1130,113 @@ protected:
 private:
     bool timersOn = false;
     std::uint64_t submitted = 0;
+
+    template <class T, Dim D>
+    static void requireHostData(BufferResource<T, D> const &resource, char const *what) {
+        if (not resource.hasHostData()) {
+            throw DeviceError{std::string{what} + ": the buffer lives only on the device (a DeviceBuffer); copy it "
+                                                  "with copyBuffer or read it with a kernel"};
+        }
+    }
+
+    static HeapRange heapRange(Placement const &placement) noexcept {
+        auto *const host = placement.heap.shared()->host.get();
+        return HeapRange{&placement.heap.identity(), placement.offset, host != nullptr ? host + placement.offset : nullptr};
+    }
+
+    static void checkPlacement(Placement const &placement, PlacementSize const &size, char const *what) {
+        if (not placement.heap) {
+            throw DeviceError{std::string{what} + ": the placement has no heap"};
+        }
+        if (placement.offset % size.alignment != 0) {
+            throw DeviceError{std::string{what} + ": offset " + std::to_string(placement.offset)
+                              + " is not a multiple of " + std::to_string(size.alignment)};
+        }
+        if (placement.offset > placement.heap.size() or size.bytes > placement.heap.size() - placement.offset) {
+            throw DeviceError{std::string{what} + ": " + std::to_string(size.bytes) + " bytes from byte "
+                              + std::to_string(placement.offset) + " leave the " + std::to_string(placement.heap.size())
+                              + "-byte heap"};
+        }
+    }
+
+    template <class G, Dim D, class P>
+    ImageCreation imageRequest(typename DimTraits<D>::IndexType const extent, std::uint32_t levels,
+                               ResourceIdentity const *identity, char const *what) {
+        static_assert(D != Dim::D1, "1D images are unavailable on OpenGL ES; use a buffer instead");
+        auto const extent3 = DimTraits<D>::toExtent3(extent);
+        auto const full = extent3.x > 0 and extent3.y > 0 and extent3.z > 0 ? fullMipLevels(D, extent3) : 0u;
+        levels = levels == 0 ? full : levels;
+        if (full == 0 or levels > full) {
+            throw DeviceError{std::string{what} + ": empty extent or more mip levels than it has"};
+        }
+        if (auto const reason = detail::imageExceedsLimits(D, extent3, info().limits)) {
+            throw DeviceError{std::string{what} + ": " + *reason};
+        }
+        auto request = ImageCreation{};
+        request.identity = identity;
+        request.format = GPUFormatTraits<G>::format;
+        request.dim = D;
+        request.extent = extent3;
+        request.levels = levels;
+        request.hostBytes = MipChain<P, D>::bytesFor(extent, levels);
+        return request;
+    }
+
+    template <class G, Dim D, class P>
+    DeviceImage<G, D, P> makeImage(typename DimTraits<D>::IndexType const extent, std::uint32_t const levels,
+                                   Placement const *placement) {
+        auto request = imageRequest<G, D, P>(extent, levels, nullptr, "createImage");
+        if (placement != nullptr) {
+            checkPlacement(*placement, imagePlacement<G, D, P>(extent, request.levels), "createImage");
+            request.placement = heapRange(*placement);
+        }
+        auto state = std::make_shared<detail::DeviceImageState<P, D>>(extent, request.levels);
+        request.identity = &state->identity;
+        if (doCreateImage(request)) {
+            if (placement == nullptr) {
+                state->host = std::make_unique<MipChain<P, D>>(extent, request.levels);
+            } else {
+                auto const &heap = placement->heap.shared();
+                auto memory = ExternalMemory{heap->host.get() + placement->offset, request.hostBytes, heap};
+                state->host = std::make_unique<MipChain<P, D>>(extent, request.levels, std::move(memory));
+            }
+        }
+        if (placement != nullptr) {
+            state->heap = placement->heap.shared();
+        }
+        return DeviceImage<G, D, P>{std::move(state)};
+    }
+
+    template <class T, Dim D>
+    DeviceBuffer<T, D> makeDeviceBuffer(typename DimTraits<D>::IndexType const extent, Placement const *placement) {
+        auto const count = static_cast<std::size_t>(DimTraits<D>::product(extent));
+        auto const bytes = count * sizeof(T);
+        if (bytes == 0) {
+            throw DeviceError{"createDeviceBuffer: empty extent"};
+        }
+        auto const identity = ResourceIdentity::create();
+        auto request = BufferCreation{&identity, bytes, std::nullopt};
+        if (placement != nullptr) {
+            checkPlacement(*placement, bufferPlacement<T, D>(extent), "createDeviceBuffer");
+            request.placement = heapRange(*placement);
+        }
+        auto view = BufferResource<T, D>::hostless(extent, identity);
+        if (doCreateDeviceBuffer(request)) {
+            if (placement == nullptr) {
+                auto elements = std::make_shared<std::vector<T>>(count);
+                auto *const data = reinterpret_cast<std::byte *>(elements->data());
+                view = BufferResource<T, D>::wrap(extent, ExternalMemory{data, bytes, std::move(elements)}, identity);
+            } else {
+                auto const &heap = placement->heap.shared();
+                view = BufferResource<T, D>::wrap(
+                    extent, ExternalMemory{heap->host.get() + placement->offset, bytes, heap}, identity);
+            }
+        }
+        auto state = std::make_shared<detail::DeviceBufferState<T, D>>(
+            std::move(view), placement != nullptr ? placement->heap.shared() : nullptr);
+        state->offset = placement != nullptr ? placement->offset : 0;
+        return DeviceBuffer<T, D>{std::move(state)};
+    }
 
     template <class T>
     static ByteRange elementRange(std::size_t const size, std::size_t const first, std::size_t const count,

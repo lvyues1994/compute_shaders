@@ -60,7 +60,7 @@ kernel 头文件 (C++17)
 
 | 目录 | 内容 |
 |---|---|
-| `tc/` | 头文件 DSL：`vec`/swizzle、`mat`、GLSL 内建函数（含 pack/unpack、位操作、原子操作、子组操作）、`BufferResource`/`BufferBinding`、`TableResource`/`TableBinding` 与布局 `Aos`/`Soa<P>`、`Encoded` 与编码器、像素与图像格式、`half`、`ImageBinding`、`TextureBinding`、`MipChain`、`CompressedImage`、`DeviceImage`、`DeviceCompressedImage`、`ExternalImage`、`Shared`/`barrier()`、`Uniform`、`Device` 抽象（含 `Submission`、`SyncFence`、`DeviceLimits`）、`ProgramRegistry` |
+| `tc/` | 头文件 DSL：`vec`/swizzle、`mat`、GLSL 内建函数（含 pack/unpack、位操作、原子操作、子组操作）、`BufferResource`/`BufferBinding`、`TableResource`/`TableBinding` 与布局 `Aos`/`Soa<P>`、`Encoded` 与编码器、像素与图像格式、`half`、`ImageBinding`、`TextureBinding`、`MipChain`、`CompressedImage`、`DeviceImage`、`DeviceCompressedImage`、`DeviceBuffer`、`MemoryHeap`、`ExternalImage`、`Shared`/`barrier()`、`Uniform`、`Device` 抽象（含 `Submission`、`SyncFence`、`DeviceLimits`）、`ProgramRegistry` |
 | `backends/cpu` `opengl` `vulkan` | 各后端，各自一个工厂函数 `tc::<backend>::createDevice(config)` |
 | `backends/devices` | 按名字创建后端：`tc::createDevice({"vulkan", "llvmpipe"})` |
 | `transpiler/` | `tc-transpile` 主机工具 |
@@ -236,6 +236,32 @@ material.albedo.attach(atlas);                                            // Com
 - `copyBufferToImage` 在设备的时间线上执行，与前后的 dispatch 之间照常按需插入屏障：先用 kernel 生成 buffer，再拷进图像，结果是正确的。buffer 里按 GPU 存储格式逐行、逐层紧密排列（压缩格式按块），起始偏移必须是 4 和一个像素（或一个块）字节数的倍数。Vulkan 用 `vkCmdCopyBufferToImage`，GL 用 pixel unpack buffer 加 `glTexSubImage` / `glCompressedTexSubImage`，CPU 后端直接拷贝（压缩块同时解码）。
 - GPU 后端在 `createImage` 时就分配图像，CPU 后端持有唯一一份数据（CPU 后端的"设备内存"就是主机内存）。
 - `DeviceLimits::imageDimension2D` / `imageDimension3D` / `imageArrayLayers` 给出图像尺寸和数组层数的上限（GLES 3.1 与 Vulkan 至少 2048 / 256 / 256），超出时 `createImage` 报 `DeviceError`。
+
+### 只在设备上的 buffer、内存堆与别名
+
+`BufferResource` 在主机上总有一份数据。只被 kernel 读写的中间 buffer 用 `device->createDeviceBuffer<T>(n)`，它是 buffer 版的 `DeviceImage`：没有主机副本，`BufferBinding` 照常 `attach`，`copyBufferToImage` 和 `executeIndirect` 也接受它，`uploadBuffer` / `downloadBuffer` 报 `DeviceError`。`device->copyBuffer(源, 源偏移, 目标, 目标偏移, 字节数)` 在设备时间线上拷贝，两端可以是 `BufferResource`（上传过的，或 `createBuffer` 分配的）或 `DeviceBuffer`，偏移和大小是 4 的倍数。
+
+生命周期不重叠的资源可以放进同一个内存堆、共用内存：
+
+```cpp
+auto const forLists = device->bufferPlacement<uvec2>(n);                     // {bytes, alignment}
+auto const forColour = device->imagePlacement<gpu::RGBA16F, Dim::D2>(extent);
+auto heap = device->createHeap(std::max(forLists.bytes, forColour.bytes));
+auto lists = device->createDeviceBuffer<uvec2>(n, tc::Placement{heap, 0});
+auto colour = device->createImage<gpu::RGBA16F, Dim::D2>(extent, 1, tc::Placement{heap, 0});  // 与 lists 重叠
+```
+
+- 同一个堆里字节区间重叠的资源互为别名。用到其中一个之后，与它重叠的其他资源内容未定义；一个资源在自己第一次被写之前内容也未定义。偏移必须是 `bufferPlacement` / `imagePlacement` 给出的对齐的倍数。
+- 屏障跟踪对放置的资源按“堆加字节区间”记录访问，所以后一个别名的第一次写自动排在前一个别名的最后一次访问之后。Vulkan 上图像的字节换了使用者时，tc 在它下一次被用到之前把它从 `UNDEFINED` 转到 `GENERAL`。
+- 堆和放置的资源都是值；资源持有它的堆，堆在自己和其中所有资源的最后一份副本都释放、设备也不再使用时才释放。
+
+| 后端 | 堆 | buffer | 图像（`DeviceInfo::placedImages`） |
+|---|---|---|---|
+| `vulkan` | 一次 `vkAllocateMemory`，对齐计入 `bufferImageGranularity` | `vkBindBufferMemory` 到偏移 | 别名，`vkBindImageMemory` 到偏移 |
+| `opengl` / `gles` | 一个 GL buffer | 它的一段（`glBindBufferRange`） | 不别名：各自分配，堆只装 buffer |
+| `cpu` | 一块主机内存 | 别名 | 别名 |
+
+CPU 后端在一段字节换了使用者时把它填成 `0xCD`，读到别名旧内容这类错误在 CPU 上每次都会出现。
 
 ## 子组与 64 位整数
 
@@ -449,7 +475,7 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 一次转译产出三种方言和 SPIR-V；Vulkan 的 uniform 自动放进 push constant 块，偏移由转译器计算并写入反射数据。
 - 增加了 std430 布局检查和 binding 读写推断。
 - 增加了表（紧凑字流、AOS/SOA、字段编码），思路来自上文提到的知乎文章；布局和编码器写成普通 C++，由转译器照常转译。
-- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
+- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像和 buffer、内存堆与资源别名、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
 
 ## 已知限制
 

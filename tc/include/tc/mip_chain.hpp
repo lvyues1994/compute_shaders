@@ -30,6 +30,33 @@ struct MipChain {
         }
     }
 
+    // The levels one after another in `memory`, each from a multiple of 16
+    // bytes (bytesFor() is the size): a placed device image on the CPU
+    // backend, whose memory belongs to a heap.
+    MipChain(IndexType const extent, std::uint32_t const levels, ExternalMemory memory) : id(ResourceIdentity::create()) {
+        auto const extent3 = DimTraits<D>::toExtent3(extent);
+        assert(levels >= 1 and levels <= fullMipLevels(D, extent3) and memory.size >= bytesFor(extent, levels));
+        chain.reserve(levels);
+        auto offset = std::size_t{0};
+        for (std::uint32_t level = 0; level < levels; ++level) {
+            auto const size = DimTraits<D>::fromExtent3(mipExtent(D, extent3, level));
+            auto const bytes = static_cast<std::size_t>(DimTraits<D>::product(size)) * sizeof(P);
+            chain.push_back(Level::wrap(size, ExternalMemory{memory.data + offset, bytes, memory.owner},
+                                        ResourceIdentity::create()));
+            offset += (bytes + 15) / 16 * 16;
+        }
+    }
+
+    static std::size_t bytesFor(IndexType const extent, std::uint32_t const levels) noexcept {
+        auto const extent3 = DimTraits<D>::toExtent3(extent);
+        auto total = std::size_t{0};
+        for (std::uint32_t level = 0; level < levels; ++level) {
+            auto const size = DimTraits<D>::fromExtent3(mipExtent(D, extent3, level));
+            total += (static_cast<std::size_t>(DimTraits<D>::product(size)) * sizeof(P) + 15) / 16 * 16;
+        }
+        return total;
+    }
+
     MipChain(MipChain const &other) : chain(other.chain), id(ResourceIdentity::create()) {}
     MipChain &operator=(MipChain const &other) {
         if (this != &other) {

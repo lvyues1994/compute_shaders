@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <tc/detail/aliasing.hpp>
 #include <tc/detail/hazards.hpp>
 
 #include "egl_context.hpp"
@@ -183,9 +184,18 @@ struct BufferMirror {
     std::weak_ptr<void const> owner;
     GlObject buffer;
     std::shared_ptr<MappedBuffer> mapped; // set for createBuffer() allocations instead of `buffer`
+    std::shared_ptr<GlObject> heap;       // set for placed device buffers: bytes [offset, offset + size) of it
+    std::size_t offset = 0;
     std::size_t size = 0;
 
-    GLuint handle() const noexcept { return mapped ? mapped->buffer : buffer.get(); }
+    GLuint handle() const noexcept { return mapped ? mapped->buffer : heap ? heap->get() : buffer.get(); }
+};
+
+// A memory heap: one buffer whose ranges are the placed device buffers.
+struct HeapMirror {
+    std::weak_ptr<void const> owner;
+    std::shared_ptr<GlObject> buffer;
+    std::size_t size = 0;
 };
 
 struct ImageMirror {
@@ -298,6 +308,22 @@ protected:
     void doDownloadImage(ImageTransfer const &transfer) override;
     bool doCreateImage(ImageCreation const &request) override;
     void doCopyBufferToImage(BufferImageCopy const &copy) override;
+    bool doCreateHeap(HeapCreation const &request) override;
+    bool doCreateDeviceBuffer(BufferCreation const &request) override;
+    PlacementSize doBufferPlacement(std::size_t const bytes) override {
+        return PlacementSize{(bytes + 3) / 4 * 4, std::max<std::size_t>(limits.storageBufferOffsetAlignment, 16)};
+    }
+    // Images get memory of their own (DeviceInfo::placedImages is false);
+    // the size only lets callers lay out heaps the same way everywhere.
+    PlacementSize doImagePlacement(ImageCreation const &request) override {
+        auto bytes = std::size_t{0};
+        for (std::uint32_t level = 0; level < request.levels; ++level) {
+            auto const extent = mipExtent(request.dim, request.extent, level);
+            bytes += static_cast<std::size_t>(extent.x) * extent.y * extent.z * request.format.bytesPerTexel();
+        }
+        return PlacementSize{(bytes + 255) / 256 * 256, 256};
+    }
+    void doCopyBuffer(BufferCopy const &copy) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
@@ -348,6 +374,7 @@ private:
 
     std::shared_ptr<EglContext> egl; // declared first: destroyed after every GL object
     OpenGLApi api;
+    std::unordered_map<void const *, HeapMirror> heaps;
     std::unordered_map<void const *, BufferMirror> buffers;
     std::unordered_map<void const *, ImageMirror> images;
     std::unordered_map<void const *, ExternalMirror> externals;
@@ -371,11 +398,17 @@ private:
     DeviceLimits limits;
     // Shader writes are incoherent: a glMemoryBarrier goes before a command
     // that uses what an earlier dispatch wrote (or writes what it read).
+    // Placed buffers are tracked by their bytes of the heap.
     detail::HazardTracker hazards;
+    detail::AliasTracker aliases;
     void barrierBefore(std::vector<detail::ResourceAccess> const &accesses) {
         if (hazards.needsBarrier(accesses)) {
             gl().glMemoryBarrier(GL_ALL_BARRIER_BITS);
         }
+    }
+    detail::ResourceAccess access(void const *const key, std::size_t const offset, std::size_t const size,
+                                  bool const read, bool const write) const {
+        return aliases.access(key, offset, size, read, write);
     }
     std::vector<GlObject> idleQueries;
     std::vector<PendingTiming> pendingTimings;
@@ -559,8 +592,12 @@ std::vector<KernelTiming> OpenGLDevice::doTakeTimings(std::uint64_t const last) 
     return result;
 }
 
-// Drops device mirrors whose host resource no longer exists.
+// Drops device mirrors whose host resource no longer exists. A heap's
+// buffer lives on while placed buffers use it.
 void OpenGLDevice::collectGarbage() {
+    for (auto it = heaps.begin(); it != heaps.end();) {
+        it = it->second.owner.expired() ? heaps.erase(it) : std::next(it);
+    }
     for (auto it = buffers.begin(); it != buffers.end();) {
         it = it->second.owner.expired() ? buffers.erase(it) : std::next(it);
     }
@@ -733,6 +770,58 @@ bool OpenGLDevice::doCreateImage(ImageCreation const &request) {
     return false;
 }
 
+bool OpenGLDevice::doCreateHeap(HeapCreation const &request) {
+    egl->makeCurrent();
+    collectGarbage();
+    auto &heap = heaps[request.identity->key()];
+    heap.owner = request.identity->watch();
+    heap.buffer = std::make_shared<GlObject>(makeBuffer(gl()));
+    heap.size = request.bytes;
+    gl().glBindBuffer(GL_SHADER_STORAGE_BUFFER, heap.buffer->get());
+    gl().glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(request.bytes), nullptr, GL_DYNAMIC_COPY);
+    checkGl(gl(), "createHeap");
+    return false;
+}
+
+bool OpenGLDevice::doCreateDeviceBuffer(BufferCreation const &request) {
+    egl->makeCurrent();
+    collectGarbage();
+    auto mirror = BufferMirror{};
+    mirror.owner = request.identity->watch();
+    mirror.size = request.bytes;
+    if (request.placement) {
+        mirror.heap = heaps.at(request.placement->heap->key()).buffer;
+        mirror.offset = request.placement->offset;
+        aliases.place(request.identity->key(), request.identity->watch(),
+                      detail::AliasTracker::Range{request.placement->heap->key(), mirror.offset, request.bytes});
+    } else {
+        mirror.buffer = makeBuffer(gl());
+        gl().glBindBuffer(GL_SHADER_STORAGE_BUFFER, mirror.buffer.get());
+        gl().glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(request.bytes), nullptr, GL_DYNAMIC_COPY);
+    }
+    buffers[request.identity->key()] = std::move(mirror);
+    checkGl(gl(), "createDeviceBuffer");
+    return false;
+}
+
+void OpenGLDevice::doCopyBuffer(BufferCopy const &copy) {
+    egl->makeCurrent();
+    auto const source = buffers.find(copy.source->key());
+    auto const target = buffers.find(copy.target->key());
+    if (source == buffers.end() or target == buffers.end()) {
+        throw DeviceError{"copyBuffer: a buffer was never uploaded to this device"};
+    }
+    barrierBefore({access(copy.source->key(), copy.sourceOffset, copy.bytes, true, false),
+                   access(copy.target->key(), copy.targetOffset, copy.bytes, false, true)});
+    gl().glBindBuffer(GL_COPY_READ_BUFFER, source->second.handle());
+    gl().glBindBuffer(GL_COPY_WRITE_BUFFER, target->second.handle());
+    gl().glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER,
+                             static_cast<GLintptr>(source->second.offset + copy.sourceOffset),
+                             static_cast<GLintptr>(target->second.offset + copy.targetOffset),
+                             static_cast<GLsizeiptr>(copy.bytes));
+    checkGl(gl(), "copyBuffer");
+}
+
 // glTexSubImage from a pixel unpack buffer: the copy stays on the GPU.
 void OpenGLDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
     egl->makeCurrent();
@@ -741,10 +830,11 @@ void OpenGLDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
         throw DeviceError{"copyBufferToImage: the buffer was never uploaded to this device (or changed size)"};
     }
     auto &mirror = images.at(copy.image->key());
-    barrierBefore({detail::ResourceAccess{copy.buffer->key(), copy.offset, copy.bytes, true, false},
-                   detail::ResourceAccess{copy.image->key(), 0, 0, false, true}});
+    barrierBefore({access(copy.buffer->key(), copy.offset, copy.bytes, true, false),
+                   access(copy.image->key(), 0, 0, false, true)});
     auto const target = textureTarget(mirror.dim);
-    auto const *offset = reinterpret_cast<void const *>(static_cast<std::uintptr_t>(copy.offset));
+    auto const *offset =
+        reinterpret_cast<void const *>(static_cast<std::uintptr_t>(buffer->second.offset + copy.offset));
     gl().glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer->second.handle());
     gl().glBindTexture(target, mirror.texture.get());
     gl().glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -1203,23 +1293,25 @@ void OpenGLDevice::doExecute(Dispatch const &dispatch) {
     }
     auto const &reflection = current->reflection;
     checkLimits(reflection, dispatch.indirect ? std::nullopt : std::optional<uvec3>{dispatch.workGroups});
+    auto indirectOffset = std::size_t{0};
     if (dispatch.indirect) {
         auto const it = buffers.find(dispatch.indirect->identity->key());
         if (it == buffers.end() or it->second.size < dispatch.indirect->offset + sizeof(DispatchIndirectCommand)) {
             throw DeviceError{"executeIndirect: the argument buffer was never uploaded to this device"};
         }
         gl().glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, it->second.handle());
+        indirectOffset = it->second.offset + dispatch.indirect->offset;
     }
     auto const program = programForBoundExternals(*current);
     gl().glUseProgram(program);
     auto accesses = std::vector<detail::ResourceAccess>{};
-    auto const access = [&](void const *const key, std::optional<ByteRange> const &range, Access const how) {
-        accesses.push_back(detail::ResourceAccess{key, range ? range->offset : 0, range ? range->size : 0,
-                                                  how != Access::WriteOnly, how != Access::ReadOnly});
+    auto const use = [&](void const *const key, std::optional<ByteRange> const &range, Access const how) {
+        accesses.push_back(access(key, range ? range->offset : 0, range ? range->size : 0, how != Access::WriteOnly,
+                                  how != Access::ReadOnly));
     };
     if (dispatch.indirect) {
-        access(dispatch.indirect->identity->key(), ByteRange{dispatch.indirect->offset, sizeof(DispatchIndirectCommand)},
-               Access::ReadOnly);
+        use(dispatch.indirect->identity->key(), ByteRange{dispatch.indirect->offset, sizeof(DispatchIndirectCommand)},
+            Access::ReadOnly);
     }
     for (auto const &slot : reflection.resources) {
         auto const name = std::string{slot.name} + "' (binding " + std::to_string(slot.binding) + ")";
@@ -1228,13 +1320,16 @@ void OpenGLDevice::doExecute(Dispatch const &dispatch) {
             if (bound == boundBuffers.end()) {
                 throw DeviceError{"execute: buffer '" + name + " is not bound"};
             }
-            access(bound->second.key, bound->second.range, slot.access);
-            auto const handle = buffers.at(bound->second.key).handle();
-            if (auto const &range = bound->second.range) {
-                gl().glBindBufferRange(GL_SHADER_STORAGE_BUFFER, slot.binding, handle,
-                                       static_cast<GLintptr>(range->offset), static_cast<GLsizeiptr>(range->size));
+            use(bound->second.key, bound->second.range, slot.access);
+            auto const &mirror = buffers.at(bound->second.key);
+            auto const &range = bound->second.range;
+            if (range or mirror.heap) {
+                auto const offset = mirror.offset + (range ? range->offset : 0);
+                auto const size = range ? range->size : mirror.size;
+                gl().glBindBufferRange(GL_SHADER_STORAGE_BUFFER, slot.binding, mirror.handle(),
+                                       static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size));
             } else {
-                gl().glBindBufferBase(GL_SHADER_STORAGE_BUFFER, slot.binding, handle);
+                gl().glBindBufferBase(GL_SHADER_STORAGE_BUFFER, slot.binding, mirror.handle());
             }
         } else if (slot.kind == ResourceKind::SampledTexture) {
             auto const bound = boundTextures.find(slot.binding);
@@ -1242,14 +1337,14 @@ void OpenGLDevice::doExecute(Dispatch const &dispatch) {
                 throw DeviceError{"execute: texture '" + name + " is not bound"};
             }
             auto const &texture = bound->second;
-            access(texture.key, std::nullopt, Access::ReadOnly);
+            use(texture.key, std::nullopt, Access::ReadOnly);
             bindTextureUnit(slot.binding, images.at(texture.key), texture.filter, texture.wrap, texture.mip);
         } else if (slot.kind == ResourceKind::ExternalImage) {
             auto const bound = boundExternalImages.find(slot.binding);
             if (bound == boundExternalImages.end()) {
                 throw DeviceError{"execute: external image '" + name + " is not bound"};
             }
-            access(bound->second, std::nullopt, slot.access);
+            use(bound->second, std::nullopt, slot.access);
             gl().glBindImageTexture(slot.binding, externalImages.at(bound->second).texture->texture(), 0, GL_FALSE, 0,
                                     imageAccess(slot.access), glFormatOf(slot.imageFormat).internalFormat);
         } else if (slot.kind == ResourceKind::ExternalTexture) {
@@ -1261,7 +1356,7 @@ void OpenGLDevice::doExecute(Dispatch const &dispatch) {
             if (bound == boundImages.end()) {
                 throw DeviceError{"execute: image '" + name + " is not bound"};
             }
-            access(bound->second.key, std::nullopt, slot.access);
+            use(bound->second.key, std::nullopt, slot.access);
             auto &mirror = images.at(bound->second.key);
             auto const [texture, level] = imageLevel(mirror, bound->second.level);
             gl().glBindImageTexture(slot.binding, texture, level, isLayered(mirror.dim) ? GL_TRUE : GL_FALSE, 0,
@@ -1277,7 +1372,7 @@ void OpenGLDevice::doExecute(Dispatch const &dispatch) {
     }
     auto const record = [&] {
         if (dispatch.indirect) {
-            gl().glDispatchComputeIndirect(static_cast<GLintptr>(dispatch.indirect->offset));
+            gl().glDispatchComputeIndirect(static_cast<GLintptr>(indirectOffset));
         } else {
             gl().glDispatchCompute(dispatch.workGroups.x, dispatch.workGroups.y, dispatch.workGroups.z);
         }

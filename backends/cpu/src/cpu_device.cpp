@@ -3,11 +3,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <tc/detail/aliasing.hpp>
 
 namespace tc::cpu {
 
@@ -28,6 +32,7 @@ struct CpuDevice final : Device {
         result.deviceName = "host (" + std::to_string(executor->concurrency()) + " threads)";
         result.unifiedMemory = true;
         result.timers = true;
+        result.placedImages = true;
         auto constexpr unlimited = std::numeric_limits<std::uint32_t>::max();
         auto &limits = result.limits;
         limits.storageBuffers = unlimited;
@@ -62,16 +67,33 @@ protected:
     // Kernels sample the decoded copy.
     void doUploadCompressed(CompressedTransfer const &transfer) override { transfer.image->decode(); }
     void doDownloadImage(ImageTransfer const &) override {}
-    // Device images live on the host here; execute() has already finished
-    // the work before a copy.
-    bool doCreateImage(ImageCreation const &) override { return true; }
+    // Device images, device buffers and heaps live on the host here;
+    // execute() has already finished the work before a copy.
+    bool doCreateImage(ImageCreation const &request) override {
+        place(*request.identity, request.placement, request.hostBytes);
+        return true;
+    }
+    bool doCreateHeap(HeapCreation const &) override { return true; }
+    bool doCreateDeviceBuffer(BufferCreation const &request) override {
+        place(*request.identity, request.placement, request.bytes);
+        return true;
+    }
+    PlacementSize doBufferPlacement(std::size_t const bytes) override { return PlacementSize{bytes, 16}; }
+    PlacementSize doImagePlacement(ImageCreation const &request) override { return PlacementSize{request.hostBytes, 16}; }
     void doCopyBufferToImage(BufferImageCopy const &copy) override {
+        use(copy.buffer->key());
+        use(copy.image->key());
         copy.writeHost(ConstByteSpan{copy.host.data() + copy.offset, copy.bytes});
     }
+    void doCopyBuffer(BufferCopy const &copy) override {
+        use(copy.source->key());
+        use(copy.target->key());
+        std::memmove(copy.targetHost.data() + copy.targetOffset, copy.sourceHost.data() + copy.sourceOffset, copy.bytes);
+    }
     void doUseKernel(KernelUse const &) override { writtenFrames.clear(); }
-    void doBindBuffer(BufferBindRequest const &) override {}
-    void doBindImage(ImageBindRequest const &) override {}
-    void doBindTexture(TextureBindRequest const &) override {}
+    void doBindBuffer(BufferBindRequest const &request) override { use(request.identity->key()); }
+    void doBindImage(ImageBindRequest const &request) override { use(request.identity->key()); }
+    void doBindTexture(TextureBindRequest const &request) override { use(request.identity->key()); }
     void doBindExternalTexture(ExternalTextureBindRequest const &request) override { request.image->snapshot(); }
     // Kernels read and write the CPU copy; every execute() stores it back.
     void doBindExternalImage(ExternalImageBindRequest const &request) override {
@@ -88,10 +110,29 @@ protected:
 private:
     void run(Dispatch const &dispatch, uvec3 groups) const;
 
+    void place(ResourceIdentity const &identity, std::optional<HeapRange> const &placement, std::size_t const bytes) {
+        if (placement) {
+            aliases.place(identity.key(), identity.watch(),
+                          detail::AliasTracker::Range{placement->heap->key(), placement->offset, bytes});
+            hostBytes[identity.key()] = placement->host;
+        }
+    }
+
+    // A placed resource that an alias used since its own last use holds
+    // garbage, as it may on a GPU: reading what another resource left
+    // there then fails here every time.
+    void use(void const *const key) {
+        if (aliases.claim(key)) {
+            std::memset(hostBytes.at(key), 0xCD, aliases.rangeOf(key)->bytes);
+        }
+    }
+
     std::shared_ptr<ParallelExecutor> executor;
     std::uint32_t subgroupSize;
     std::vector<ExternalImage *> writtenFrames;
     std::vector<KernelTiming> timings;
+    detail::AliasTracker aliases;
+    std::unordered_map<void const *, std::byte *> hostBytes; // of placed resources
 };
 
 void CpuDevice::doExecute(Dispatch const &dispatch) {

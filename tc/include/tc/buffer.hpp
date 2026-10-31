@@ -68,19 +68,33 @@ struct BufferResource {
         return resource;
     }
 
+    // The extent and identity of a buffer whose elements exist only on a GPU
+    // (a DeviceBuffer there): data() is nullptr and nothing may be read or
+    // written on the host.
+    static BufferResource hostless(IndexType const extent_, ResourceIdentity identity) {
+        auto resource = BufferResource{extent_, std::move(identity), Adopt{}};
+        resource.count = static_cast<std::size_t>(Traits::product(extent_));
+        resource.external = true;
+        return resource;
+    }
+
     BufferResource(BufferResource const &other) : BufferResource(other.extentValue, ResourceIdentity::create()) {
-        std::copy(other.begin(), other.end(), first);
+        if (other.first != nullptr) {
+            std::copy(other.begin(), other.end(), first);
+        }
     }
 
     BufferResource &operator=(BufferResource const &other) {
         if (this != &other) {
-            if (count != other.count) {
+            if (count != other.count or first == nullptr) {
                 auto copy = BufferResource{other};
                 copy.id = std::move(id);
                 *this = std::move(copy);
             } else {
                 extentValue = other.extentValue;
-                std::copy(other.begin(), other.end(), first);
+                if (other.first != nullptr) {
+                    std::copy(other.begin(), other.end(), first);
+                }
             }
         }
         return *this;
@@ -124,6 +138,8 @@ struct BufferResource {
 
     // True when the elements live in device-mapped or imported memory.
     bool usesExternalMemory() const noexcept { return external; }
+    // False for the hostless() view of a buffer that lives only on a GPU.
+    bool hasHostData() const noexcept { return first != nullptr or count == 0; }
 
     ByteSpan bytes() noexcept { return ByteSpan{reinterpret_cast<std::byte *>(first), count * sizeof(T)}; }
     ConstByteSpan bytes() const noexcept {
@@ -153,6 +169,9 @@ private:
     ResourceIdentity id;
 };
 
+template <class T, Dim D>
+struct DeviceBuffer;
+
 // A shader storage buffer binding: `layout(std430, binding = Binding) buffer
 // { T name[]; }`. On the CPU it forwards element access to the attached
 // resource; on the GPU the backend binds the resource's device mirror.
@@ -171,12 +190,16 @@ struct BufferBinding {
     // The kernel sees only elements [first, first + count) of the resource,
     // as element 0 onwards (glBindBufferRange). On GPU backends the byte
     // offset must be a multiple of DeviceLimits::storageBufferOffsetAlignment.
+    // DeviceBuffer (tc/device_buffer.hpp) attaches through its hostView().
     void attach(Resource &resource_, std::size_t const first_, std::size_t const count_) noexcept {
         assert(first_ + count_ <= resource_.size());
         resource = &resource_;
         first = first_;
         count = count_;
     }
+    // Defined in tc/device_buffer.hpp.
+    void attach(DeviceBuffer<T, Dim::D1> const &buffer) noexcept;
+    void attach(DeviceBuffer<T, Dim::D1> const &buffer, std::size_t first_, std::size_t count_) noexcept;
 
     Resource *attachedResource() const noexcept { return resource; }
     bool isRange() const noexcept { return count != kWhole; }

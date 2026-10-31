@@ -26,6 +26,8 @@ struct DeviceImageState {
     // The image itself on the CPU backend, which runs kernels on the host;
     // empty on GPU devices.
     std::unique_ptr<MipChain<P, D>> host;
+    // The heap of a placed image (a detail::HeapState): keeps its memory alive.
+    std::shared_ptr<void const> heap;
 };
 
 } // namespace detail
