@@ -189,13 +189,42 @@ struct VulkanContext {
     bool etc2 = false;
     bool astc = false;
     std::uint32_t subgroupSize = 0; // with every GL_KHR_shader_subgroup operation in compute shaders; else 0
+    bool timelineSemaphores = false;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     std::uint32_t queueFamily = 0;
     DeviceOwner device;
     VkQueue queue = VK_NULL_HANDLE;
+    // The transfer queue, when the device has a second queue for it.
+    std::optional<std::uint32_t> transferFamily;
+    std::uint32_t transferIndex = 0;
+    VkQueue transferQueue = VK_NULL_HANDLE;
 };
+
+// A queue for TransferQueue: of a family that only copies (a DMA engine)
+// with whole-texel copy granularity, else the second queue of the compute
+// family; nullopt when there is neither.
+std::optional<std::pair<std::uint32_t, std::uint32_t>> transferQueueOf(VkPhysicalDevice const physical,
+                                                                       std::uint32_t const computeFamily) {
+    auto count = std::uint32_t{0};
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, nullptr);
+    auto families = std::vector<VkQueueFamilyProperties>(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, families.data());
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto const flags = families[i].queueFlags;
+        auto const &granularity = families[i].minImageTransferGranularity;
+        if ((flags & VK_QUEUE_TRANSFER_BIT) != 0 and (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == 0
+            and families[i].queueCount > 0 and granularity.width == 1 and granularity.height == 1
+            and granularity.depth == 1) {
+            return std::pair{i, 0u};
+        }
+    }
+    if (families[computeFamily].queueCount >= 2) {
+        return std::pair{computeFamily, 1u};
+    }
+    return std::nullopt;
+}
 
 // A buffer in host-visible device memory, persistently mapped.
 struct MappedBuffer {
@@ -399,8 +428,9 @@ struct StagingSlice {
 // Submission may outlive the VulkanDevice. Fences are never reset, so any
 // thread may query or wait.
 struct FenceCompletion final : Submission::Completion {
-    FenceCompletion(std::shared_ptr<VulkanContext> context_, DeviceObject<VkFence> fence_) noexcept
-        : context(std::move(context_)), fence(std::move(fence_)) {}
+    FenceCompletion(std::shared_ptr<VulkanContext> context_, DeviceObject<VkFence> fence_, VkSemaphore const timeline_,
+                    std::uint64_t const value_) noexcept
+        : context(std::move(context_)), fence(std::move(fence_)), timeline(timeline_), value(value_) {}
 
     bool isComplete() const override {
         if (signaled.load(std::memory_order_acquire)) {
@@ -426,6 +456,10 @@ struct FenceCompletion final : Submission::Completion {
 
     std::shared_ptr<VulkanContext> context; // declared first: destroyed after the fence
     DeviceObject<VkFence> fence;
+    // The timeline semaphore the submission signals with `value`, so the
+    // other queue can wait for it; VK_NULL_HANDLE without a transfer queue.
+    VkSemaphore timeline;
+    std::uint64_t value;
     mutable std::atomic<bool> signaled{false};
 };
 
@@ -455,7 +489,8 @@ struct Batch {
 
 // A device object released while queued work may still use it.
 struct Grave {
-    std::uint64_t serial = 0; // destroyed once this batch has completed
+    std::uint64_t serial = 0;         // destroyed once this batch has completed
+    std::uint64_t transferSerial = 0; // and this batch of the transfer queue
     std::shared_ptr<void> object;
 };
 
@@ -463,13 +498,7 @@ struct VulkanDevice final : Device {
     explicit VulkanDevice(VulkanDeviceConfig const &config);
     VulkanDevice(VulkanDevice const &) = delete;
     VulkanDevice &operator=(VulkanDevice const &) = delete;
-    ~VulkanDevice() override {
-        try {
-            flush();
-        } catch (DeviceError const &error) {
-            std::fprintf(stderr, "[vulkan] queued work failed at shutdown: %s\n", error.what());
-        }
-    }
+    ~VulkanDevice() override;
 
     DeviceInfo info() const override {
         auto const memory = sharedMemoryType();
@@ -481,6 +510,7 @@ struct VulkanDevice final : Device {
         result.timers = timestampBits > 0 and properties.limits.timestampPeriod > 0.0f;
         result.syncFiles = context->syncFdImport and context->syncFdExport;
         result.placedImages = true;
+        result.separateTransfers = transferQueue != nullptr;
         auto const &supported = properties.limits;
         auto &limits = result.limits;
         limits.storageBuffers = supported.maxPerStageDescriptorStorageBuffers;
@@ -553,6 +583,8 @@ protected:
     void doBindExternalImage(ExternalImageBindRequest const &request) override;
 #endif
     void doWaitFor(SyncFence fence) override;
+    void doWaitForSubmission(Submission const &submission) override;
+    TransferQueue &doTransfers() override;
     FencedSubmission doSubmitWithFence() override;
     void doSetUniform(UniformWrite const &write) override;
     void doExecute(Dispatch const &dispatch) override;
@@ -563,7 +595,22 @@ protected:
 private:
     static constexpr std::uint32_t kQueryCapacity = 256;
 
+    struct Transfers; // the TransferQueue on the device's second queue
+
     VkFormatFeatureFlags formatFeatures(VkFormat format) const;
+    // Buffers and images both queues use are shared between their queue
+    // families, so neither has to hand them over.
+    template <class Info>
+    void shareAcrossQueues(Info &info) const {
+        if (concurrentFamilies[0] != concurrentFamilies[1]) {
+            info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            info.queueFamilyIndexCount = 2;
+            info.pQueueFamilyIndices = concurrentFamilies.data();
+        }
+    }
+    DeviceObject<VkSemaphore> makeTimelineSemaphore();
+    // The region of a copyBufferToImage, from byte `offset` of its buffer.
+    static VkBufferImageCopy regionOf(BufferImageCopy const &copy);
     VkSampler samplerFor(Filter filter, Wrap wrap, Mip mip);
     DeviceObject<VkImageView> createView(ImageMirror const &mirror, std::uint32_t first, std::uint32_t count) const;
     // The image tc creates for this format and shape: every usage the format
@@ -667,7 +714,196 @@ private:
 
     std::uint32_t timestampBits = 0; // of the compute queue family; 0: no timestamps
     std::vector<KernelTiming> timings;
+
+    // With a transfer queue: each batch signals its serial on `mainTimeline`,
+    // and batches wait for transfer batches through theirs.
+    std::array<std::uint32_t, 2> concurrentFamilies{};
+    DeviceObject<VkSemaphore> mainTimeline;
+    std::vector<std::pair<VkSemaphore, std::uint64_t>> pendingTimelineWaits; // for the next submission
+    std::unique_ptr<Transfers> transferQueue;
 };
+
+// Copies on the device's second queue, in batches like the device's own,
+// each signalling its serial on `timeline`.
+struct VulkanDevice::Transfers final : TransferQueue {
+    explicit Transfers(VulkanDevice &device_) : TransferQueue(device_), device(device_) {
+        auto const handle = device.device.handle;
+        auto poolInfo = vkStruct<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = *device.context->transferFamily;
+        auto rawPool = VkCommandPool{};
+        check(vkCreateCommandPool(handle, &poolInfo, nullptr, &rawPool), "vkCreateCommandPool (transfers)");
+        pool = DeviceObject<VkCommandPool>{handle, rawPool, vkDestroyCommandPool};
+        timeline = device.makeTimelineSemaphore();
+    }
+
+    // The last batch that may use what is recorded or sent now.
+    std::uint64_t latestSerial() const noexcept { return recording != nullptr ? recording->serial : nextSerial - 1; }
+    std::uint64_t completed() const noexcept { return completedSerial; }
+
+    // Recycles finished batches; returns the serial every batch up to which has completed.
+    std::uint64_t retire() {
+        while (not inFlight.empty() and inFlight.front()->completion->isComplete()) {
+            completedSerial = inFlight.front()->serial;
+            inFlight.front()->completion.reset();
+            idle.push_back(std::move(inFlight.front()));
+            inFlight.pop_front();
+        }
+        return completedSerial;
+    }
+
+    void flush() {
+        doSubmit();
+        for (auto const &batch : inFlight) {
+            batch->completion->wait();
+        }
+        retire();
+    }
+
+protected:
+    void doCopyBuffer(BufferCopy const &copy) override {
+        auto const source = device.buffers.find(copy.source->key());
+        auto const target = device.buffers.find(copy.target->key());
+        if (source == device.buffers.end() or target == device.buffers.end()) {
+            throw DeviceError{"copyBuffer: a buffer was never uploaded to this device"};
+        }
+        auto const cmd = commandFor({device.access(copy.source->key(), copy.sourceOffset, copy.bytes, true, false),
+                                     device.access(copy.target->key(), copy.targetOffset, copy.bytes, false, true)});
+        device.claim(cmd, copy.source->key());
+        device.claim(cmd, copy.target->key());
+        auto const region = VkBufferCopy{copy.sourceOffset, copy.targetOffset, copy.bytes};
+        vkCmdCopyBuffer(cmd, source->second.handle(), target->second.handle(), 1, &region);
+    }
+
+    void doCopyBufferToImage(BufferImageCopy const &copy) override {
+        auto const buffer = device.buffers.find(copy.buffer->key());
+        if (buffer == device.buffers.end() or buffer->second.size < copy.offset + copy.bytes) {
+            throw DeviceError{"copyBufferToImage: the buffer was never uploaded to this device (or changed size)"};
+        }
+        auto const &mirror = device.images.at(copy.image->key());
+        auto const region = regionOf(copy);
+        auto const cmd = commandFor({device.access(copy.buffer->key(), copy.offset, copy.bytes, true, false),
+                                     device.access(copy.image->key(), 0, 0, false, true)});
+        device.claim(cmd, copy.buffer->key());
+        device.claim(cmd, copy.image->key());
+        vkCmdCopyBufferToImage(cmd, buffer->second.handle(), mirror.image.get(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    }
+
+    void doWaitFor(Submission const &submission) override {
+        auto const *completion = dynamic_cast<FenceCompletion const *>(completionOf(submission));
+        if (completion != nullptr and completion->timeline == device.mainTimeline.get()) {
+            doSubmit(); // copies queued before this call do not wait
+            pendingWaits.emplace_back(completion->timeline, completion->value);
+        }
+    }
+
+    Submission doSubmit() override {
+        if (recording == nullptr) {
+            if (pendingWaits.empty()) {
+                return inFlight.empty() ? Submission{} : Submission{inFlight.back()->completion};
+            }
+            recordingBatch(); // an empty batch carries the waits
+        }
+        auto &batch = *recording;
+        hostVisibleBarrier(batch.commandBuffer);
+        check(vkEndCommandBuffer(batch.commandBuffer), "vkEndCommandBuffer (transfers)");
+        auto const handle = device.device.handle;
+        auto fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
+        auto rawFence = VkFence{};
+        check(vkCreateFence(handle, &fenceInfo, nullptr, &rawFence), "vkCreateFence");
+        auto fence = DeviceObject<VkFence>{handle, rawFence, vkDestroyFence};
+        auto waits = std::vector<VkSemaphore>{};
+        auto waitValues = std::vector<std::uint64_t>{};
+        for (auto const &[semaphore, value] : pendingWaits) {
+            waits.push_back(semaphore);
+            waitValues.push_back(value);
+        }
+        auto const stages = std::vector<VkPipelineStageFlags>(waits.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        auto const signal = timeline.get();
+        auto timelines = vkStruct<VkTimelineSemaphoreSubmitInfo>(VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+        timelines.waitSemaphoreValueCount = static_cast<std::uint32_t>(waitValues.size());
+        timelines.pWaitSemaphoreValues = waitValues.data();
+        timelines.signalSemaphoreValueCount = 1;
+        timelines.pSignalSemaphoreValues = &batch.serial;
+        auto info = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+        info.pNext = &timelines;
+        info.waitSemaphoreCount = static_cast<std::uint32_t>(waits.size());
+        info.pWaitSemaphores = waits.data();
+        info.pWaitDstStageMask = stages.data();
+        info.commandBufferCount = 1;
+        info.pCommandBuffers = &batch.commandBuffer;
+        info.signalSemaphoreCount = 1;
+        info.pSignalSemaphores = &signal;
+        check(vkQueueSubmit(device.context->transferQueue, 1, &info, rawFence), "vkQueueSubmit (transfers)");
+        pendingWaits.clear();
+        batch.completion = std::make_shared<FenceCompletion>(device.context, std::move(fence), signal, batch.serial);
+        auto submission = Submission{batch.completion};
+        inFlight.push_back(std::move(recording));
+        return submission;
+    }
+
+private:
+    struct Batch {
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE; // from `pool`
+        std::uint64_t serial = 0;
+        std::shared_ptr<FenceCompletion> completion; // set while in flight
+    };
+
+    Batch &recordingBatch() {
+        if (recording != nullptr) {
+            return *recording;
+        }
+        retire();
+        if (idle.empty()) {
+            auto batch = std::make_unique<Batch>();
+            auto info = vkStruct<VkCommandBufferAllocateInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
+            info.commandPool = pool.get();
+            info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            info.commandBufferCount = 1;
+            check(vkAllocateCommandBuffers(device.device.handle, &info, &batch->commandBuffer), "vkAllocateCommandBuffers");
+            idle.push_back(std::move(batch));
+        }
+        recording = std::move(idle.back());
+        idle.pop_back();
+        recording->serial = nextSerial++;
+        check(vkResetCommandBuffer(recording->commandBuffer, 0), "vkResetCommandBuffer");
+        auto begin = vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(recording->commandBuffer, &begin), "vkBeginCommandBuffer");
+        return *recording;
+    }
+
+    VkCommandBuffer commandFor(std::vector<detail::ResourceAccess> const &accesses) {
+        auto const cmd = recordingBatch().commandBuffer;
+        if (hazards.needsBarrier(accesses)) {
+            fullBarrier(cmd);
+        }
+        return cmd;
+    }
+
+    VulkanDevice &device;
+    DeviceObject<VkCommandPool> pool; // declared before the batches: frees their command buffers after them
+    DeviceObject<VkSemaphore> timeline;
+    std::unique_ptr<Batch> recording;
+    std::deque<std::unique_ptr<Batch>> inFlight;
+    std::vector<std::unique_ptr<Batch>> idle;
+    std::uint64_t nextSerial = 1;
+    std::uint64_t completedSerial = 0;
+    detail::HazardTracker hazards;
+    std::vector<std::pair<VkSemaphore, std::uint64_t>> pendingWaits; // for the next batch
+};
+
+VulkanDevice::~VulkanDevice() {
+    try {
+        flush();
+    } catch (DeviceError const &error) {
+        std::fprintf(stderr, "[vulkan] queued work failed at shutdown: %s\n", error.what());
+    }
+}
+
+TransferQueue &VulkanDevice::doTransfers() {
+    return transferQueue != nullptr ? *transferQueue : Device::doTransfers();
+}
 
 VulkanDevice::VulkanDevice(VulkanDeviceConfig const &config) {
     createInstance(config);
@@ -680,6 +916,21 @@ VulkanDevice::VulkanDevice(VulkanDeviceConfig const &config) {
     auto pool = VkCommandPool{};
     check(vkCreateCommandPool(device.handle, &poolInfo, nullptr, &pool), "vkCreateCommandPool");
     commandPool = DeviceObject<VkCommandPool>{device.handle, pool, vkDestroyCommandPool};
+    concurrentFamilies = {queueFamily, context->transferFamily.value_or(queueFamily)};
+    if (context->transferQueue != VK_NULL_HANDLE) {
+        mainTimeline = makeTimelineSemaphore();
+        transferQueue = std::make_unique<Transfers>(*this);
+    }
+}
+
+DeviceObject<VkSemaphore> VulkanDevice::makeTimelineSemaphore() {
+    auto type = vkStruct<VkSemaphoreTypeCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    auto info = vkStruct<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
+    info.pNext = &type;
+    auto semaphore = VkSemaphore{};
+    check(vkCreateSemaphore(device.handle, &info, nullptr, &semaphore), "vkCreateSemaphore (timeline)");
+    return DeviceObject<VkSemaphore>{device.handle, semaphore, vkDestroySemaphore};
 }
 
 void VulkanDevice::createInstance(VulkanDeviceConfig const &config) {
@@ -687,14 +938,17 @@ void VulkanDevice::createInstance(VulkanDeviceConfig const &config) {
     app.pApplicationName = "tc";
     app.pEngineName = "tc";
     // Vulkan 1.1 when the loader has it: sampler YCbCr conversion (external
-    // frames) is core there. Everything else needs only 1.0.
+    // frames) is core there; 1.2 adds timeline semaphores (the transfer
+    // queue). Everything else needs only 1.0.
     auto const enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
         vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
     auto loaderVersion = std::uint32_t{VK_API_VERSION_1_0};
     if (enumerateVersion != nullptr) {
         enumerateVersion(&loaderVersion);
     }
-    context->apiVersion = loaderVersion >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
+    context->apiVersion = loaderVersion >= VK_API_VERSION_1_2   ? VK_API_VERSION_1_2
+                        : loaderVersion >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1
+                                                              : VK_API_VERSION_1_0;
     app.apiVersion = context->apiVersion;
     auto extensions = std::vector<char const *>{};
     auto layers = std::vector<char const *>{};
@@ -766,12 +1020,6 @@ void VulkanDevice::createLogicalDevice() {
     context->astc = supported.textureCompressionASTC_LDR == VK_TRUE;
     features.shaderStorageImageExtendedFormats = supported.shaderStorageImageExtendedFormats;
 
-    auto const priority = 1.0f;
-    auto queueInfo = vkStruct<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
-    queueInfo.queueFamilyIndex = queueFamily;
-    queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &priority;
-
     auto extensions = std::vector<char const *>{};
     if (hasDeviceExtension(physical, "VK_KHR_portability_subset")) {
         extensions.push_back("VK_KHR_portability_subset");
@@ -793,12 +1041,28 @@ void VulkanDevice::createLogicalDevice() {
             context->subgroupSize = subgroups.subgroupSize;
         }
     }
-    // 64-bit atomics on buffer elements (core in Vulkan 1.2, an extension
-    // for the 1.1 API tc asks for).
+    // 64-bit atomics on buffer elements and timeline semaphores: Vulkan 1.2
+    // features. With a 1.1 API, 64-bit atomics are an extension.
+    auto const vulkan12 = context->apiVersion >= VK_API_VERSION_1_2 and properties.apiVersion >= VK_API_VERSION_1_2;
+    auto vulkan12Features = vkStruct<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
     auto atomicInt64 =
         vkStruct<VkPhysicalDeviceShaderAtomicInt64Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES);
     void *chain = nullptr;
-    if (vulkan11 and context->int64 and hasDeviceExtension(physical, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
+    if (vulkan12) {
+        auto supported12 = vkStruct<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+        auto features2 = vkStruct<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+        features2.pNext = &supported12;
+        vkGetPhysicalDeviceFeatures2(physical, &features2);
+        if (context->int64 and supported12.shaderBufferInt64Atomics == VK_TRUE) {
+            vulkan12Features.shaderBufferInt64Atomics = VK_TRUE;
+            context->int64Atomics = true;
+        }
+        if (supported12.timelineSemaphore == VK_TRUE) {
+            vulkan12Features.timelineSemaphore = VK_TRUE;
+            context->timelineSemaphores = true;
+        }
+        chain = &vulkan12Features;
+    } else if (vulkan11 and context->int64 and hasDeviceExtension(physical, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
         auto features2 = vkStruct<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
         features2.pNext = &atomicInt64;
         vkGetPhysicalDeviceFeatures2(physical, &features2);
@@ -847,13 +1111,32 @@ void VulkanDevice::createLogicalDevice() {
             extensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
         }
     }
-    info.queueCreateInfoCount = 1;
-    info.pQueueCreateInfos = &queueInfo;
+    // The transfer queue needs timeline semaphores to wait across queues.
+    auto const transfer = context->timelineSemaphores ? transferQueueOf(physical, queueFamily) : std::nullopt;
+    float const priorities[] = {1.0f, 1.0f};
+    auto queueInfos = std::vector<VkDeviceQueueCreateInfo>{};
+    auto queueInfo = vkStruct<VkDeviceQueueCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
+    queueInfo.queueFamilyIndex = queueFamily;
+    queueInfo.queueCount = transfer and transfer->first == queueFamily ? 2 : 1;
+    queueInfo.pQueuePriorities = priorities;
+    queueInfos.push_back(queueInfo);
+    if (transfer and transfer->first != queueFamily) {
+        queueInfo.queueFamilyIndex = transfer->first;
+        queueInfo.queueCount = 1;
+        queueInfos.push_back(queueInfo);
+    }
+    info.queueCreateInfoCount = static_cast<std::uint32_t>(queueInfos.size());
+    info.pQueueCreateInfos = queueInfos.data();
     info.pEnabledFeatures = &features;
     info.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
     info.ppEnabledExtensionNames = extensions.data();
     check(vkCreateDevice(physical, &info, nullptr, &device.handle), "vkCreateDevice");
     vkGetDeviceQueue(device.handle, queueFamily, 0, &queue);
+    if (transfer) {
+        context->transferFamily = transfer->first;
+        context->transferIndex = transfer->second;
+        vkGetDeviceQueue(device.handle, transfer->first, transfer->second, &context->transferQueue);
+    }
     if (context->syncFdImport or context->syncFdExport) {
         getSemaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device.handle, "vkGetSemaphoreFdKHR"));
         importSemaphoreFd =
@@ -929,6 +1212,7 @@ std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity co
     info.size = bytes;
     info.usage = kBufferUsage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    shareAcrossQueues(info);
     auto buffer = VkBuffer{};
     check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
     allocation->buffer = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
@@ -1030,7 +1314,7 @@ VkCommandBuffer VulkanDevice::commandFor(std::vector<detail::ResourceAccess> con
 Submission VulkanDevice::submitBatch(DeviceObject<VkSemaphore> signal) {
     auto const signalHandle = signal.get();
     if (recordingNow == nullptr) {
-        if (pendingWaits.empty() and signalHandle == VK_NULL_HANDLE) {
+        if (pendingWaits.empty() and pendingTimelineWaits.empty() and signalHandle == VK_NULL_HANDLE) {
             return inFlight.empty() ? Submission{} : Submission{inFlight.back()->completion};
         }
         recordingBatch(); // an empty batch carries the semaphores
@@ -1042,39 +1326,77 @@ Submission VulkanDevice::submitBatch(DeviceObject<VkSemaphore> signal) {
     auto rawFence = VkFence{};
     check(vkCreateFence(device.handle, &fenceInfo, nullptr, &rawFence), "vkCreateFence");
     auto fence = DeviceObject<VkFence>{device.handle, rawFence, vkDestroyFence};
+    // Binary semaphores first (their values are ignored), then the timelines.
     auto waits = std::vector<VkSemaphore>{};
+    auto waitValues = std::vector<std::uint64_t>{};
     for (auto const &semaphore : pendingWaits) {
         waits.push_back(semaphore.get());
+        waitValues.push_back(0);
+    }
+    for (auto const &[semaphore, value] : pendingTimelineWaits) {
+        waits.push_back(semaphore);
+        waitValues.push_back(value);
+    }
+    auto signals = std::vector<VkSemaphore>{};
+    auto signalValues = std::vector<std::uint64_t>{};
+    if (signalHandle != VK_NULL_HANDLE) {
+        signals.push_back(signalHandle);
+        signalValues.push_back(0);
+    }
+    if (mainTimeline.get() != VK_NULL_HANDLE) {
+        signals.push_back(mainTimeline.get());
+        signalValues.push_back(batch.serial);
     }
     auto const stages = std::vector<VkPipelineStageFlags>(waits.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    auto timelines = vkStruct<VkTimelineSemaphoreSubmitInfo>(VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+    timelines.waitSemaphoreValueCount = static_cast<std::uint32_t>(waitValues.size());
+    timelines.pWaitSemaphoreValues = waitValues.data();
+    timelines.signalSemaphoreValueCount = static_cast<std::uint32_t>(signalValues.size());
+    timelines.pSignalSemaphoreValues = signalValues.data();
     auto info = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+    info.pNext = mainTimeline.get() != VK_NULL_HANDLE ? &timelines : nullptr;
     info.waitSemaphoreCount = static_cast<std::uint32_t>(waits.size());
     info.pWaitSemaphores = waits.data();
     info.pWaitDstStageMask = stages.data();
     info.commandBufferCount = 1;
     info.pCommandBuffers = &batch.commandBuffer;
-    info.signalSemaphoreCount = signalHandle != VK_NULL_HANDLE ? 1 : 0;
-    info.pSignalSemaphores = &signalHandle;
+    info.signalSemaphoreCount = static_cast<std::uint32_t>(signals.size());
+    info.pSignalSemaphores = signals.data();
     check(vkQueueSubmit(queue, 1, &info, rawFence), "vkQueueSubmit");
     for (auto &semaphore : pendingWaits) {
         batch.semaphores.push_back(std::move(semaphore));
     }
     pendingWaits.clear();
+    pendingTimelineWaits.clear();
     if (signalHandle != VK_NULL_HANDLE) {
         batch.semaphores.push_back(std::move(signal));
     }
-    batch.completion = std::make_shared<FenceCompletion>(context, std::move(fence));
+    batch.completion = std::make_shared<FenceCompletion>(context, std::move(fence), mainTimeline.get(), batch.serial);
     auto submission = Submission{batch.completion};
     inFlight.push_back(std::move(recordingNow));
     return submission;
 }
 
 void VulkanDevice::flush() {
+    if (transferQueue != nullptr) {
+        transferQueue->flush();
+    }
     submitBatch();
     for (auto const &batch : inFlight) {
         batch->completion->wait();
     }
     retireCompleted();
+}
+
+// Waits for a transfer submission go into the next batch; work recorded
+// before this call is sent first, so it does not wait.
+void VulkanDevice::doWaitForSubmission(Submission const &submission) {
+    auto const *completion = dynamic_cast<FenceCompletion const *>(completionOf(submission));
+    if (completion == nullptr or transferQueue == nullptr or completion->timeline == mainTimeline.get()) {
+        return; // this timeline's own work is in order already
+    }
+    submitBatch();
+    pendingTimelineWaits.emplace_back(completion->timeline, completion->value);
 }
 
 // Recycles the batches the device has finished, in order, and destroys what
@@ -1096,17 +1418,23 @@ void VulkanDevice::retireCompleted() {
         idleBatches.push_back(std::move(inFlight.front()));
         inFlight.pop_front();
     }
-    auto const done = std::remove_if(graveyard.begin(), graveyard.end(),
-                                     [&](Grave const &grave) { return grave.serial <= completedSerial; });
+    auto const transfersDone = transferQueue != nullptr ? transferQueue->retire() : std::uint64_t{0};
+    auto const done = std::remove_if(graveyard.begin(), graveyard.end(), [&](Grave const &grave) {
+        return grave.serial <= completedSerial and grave.transferSerial <= transfersDone;
+    });
     graveyard.erase(done, graveyard.end());
 }
 
-// Keeps `object` until every batch that may use it has completed.
+// Keeps `object` until every batch of either queue that may use it has
+// completed.
 template <class T>
 void VulkanDevice::bury(T &&object) {
     auto const serial = recordingNow != nullptr ? recordingNow->serial : nextSerial - 1;
-    if (serial > completedSerial) {
-        graveyard.push_back(Grave{serial, std::make_shared<std::decay_t<T>>(std::forward<T>(object))});
+    auto const transferSerial = transferQueue != nullptr ? transferQueue->latestSerial() : std::uint64_t{0};
+    auto const transfersDone = transferQueue != nullptr ? transferQueue->completed() : std::uint64_t{0};
+    if (serial > completedSerial or transferSerial > transfersDone) {
+        graveyard.push_back(
+            Grave{serial, transferSerial, std::make_shared<std::decay_t<T>>(std::forward<T>(object))});
     }
 }
 
@@ -1328,6 +1656,7 @@ void VulkanDevice::doUploadBuffer(ResourceIdentity const &identity, ConstByteSpa
         info.size = bytes.size();
         info.usage = kBufferUsage;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        shareAcrossQueues(info);
         auto buffer = VkBuffer{};
         check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
         mirror.buffer = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
@@ -1399,6 +1728,7 @@ VkImageCreateInfo VulkanDevice::imageInfo(ImageFormat const &imageFormat, std::o
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    shareAcrossQueues(info);
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     return info;
 }
@@ -1472,6 +1802,7 @@ PlacementSize VulkanDevice::doBufferPlacement(std::size_t const bytes) {
     info.size = bytes;
     info.usage = kBufferUsage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    shareAcrossQueues(info);
     auto buffer = VkBuffer{};
     check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
     auto const probe = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
@@ -1498,6 +1829,7 @@ bool VulkanDevice::doCreateHeap(HeapCreation const &request) {
     bufferInfo.size = 256;
     bufferInfo.usage = kBufferUsage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    shareAcrossQueues(bufferInfo);
     auto buffer = VkBuffer{};
     check(vkCreateBuffer(device.handle, &bufferInfo, nullptr, &buffer), "vkCreateBuffer");
     auto const bufferProbe = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
@@ -1554,6 +1886,7 @@ bool VulkanDevice::doCreateDeviceBuffer(BufferCreation const &request) {
     info.size = request.bytes;
     info.usage = kBufferUsage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    shareAcrossQueues(info);
     auto buffer = VkBuffer{};
     check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer");
     mirror.buffer = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
@@ -1611,12 +1944,7 @@ void VulkanDevice::doCopyBuffer(BufferCopy const &copy) {
     vkCmdCopyBuffer(cmd, source->second.handle(), target->second.handle(), 1, &region);
 }
 
-void VulkanDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
-    auto const buffer = buffers.find(copy.buffer->key());
-    if (buffer == buffers.end() or buffer->second.size < copy.offset + copy.bytes) {
-        throw DeviceError{"copyBufferToImage: the buffer was never uploaded to this device (or changed size)"};
-    }
-    auto const &mirror = images.at(copy.image->key());
+VkBufferImageCopy VulkanDevice::regionOf(BufferImageCopy const &copy) {
     auto region = VkBufferImageCopy{};
     region.bufferOffset = copy.offset;
     if (copy.dim == Dim::D3) {
@@ -1625,10 +1953,21 @@ void VulkanDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
         region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(copy.extent.x),
                                         static_cast<std::uint32_t>(copy.extent.y), copy.layers};
     } else {
-        region.imageSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, copy.level, copy.firstLayer, copy.layers};
+        region.imageSubresource =
+            VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, copy.level, copy.firstLayer, copy.layers};
         region.imageExtent = VkExtent3D{static_cast<std::uint32_t>(copy.extent.x),
                                         static_cast<std::uint32_t>(copy.extent.y), 1};
     }
+    return region;
+}
+
+void VulkanDevice::doCopyBufferToImage(BufferImageCopy const &copy) {
+    auto const buffer = buffers.find(copy.buffer->key());
+    if (buffer == buffers.end() or buffer->second.size < copy.offset + copy.bytes) {
+        throw DeviceError{"copyBufferToImage: the buffer was never uploaded to this device (or changed size)"};
+    }
+    auto const &mirror = images.at(copy.image->key());
+    auto const region = regionOf(copy);
     auto const cmd = commandFor({access(copy.buffer->key(), copy.offset, copy.bytes, true, false),
                                  access(copy.image->key(), 0, 0, false, true)});
     claim(cmd, copy.buffer->key());

@@ -90,6 +90,10 @@ struct DeviceInfo {
     // other resources placed there (Vulkan, CPU). Otherwise (OpenGL) each
     // such image has memory of its own and only buffers alias.
     bool placedImages = false;
+    // Device::transfers() runs on a hardware queue of its own, next to the
+    // dispatches (Vulkan with a transfer queue family or a second compute
+    // queue). Otherwise its copies join the device's timeline in call order.
+    bool separateTransfers = false;
     DeviceLimits limits;
 };
 
@@ -122,14 +126,17 @@ struct Submission {
             completion->wait();
         }
     }
-    // Counts the submissions of one device from 1; 0 for a default Submission.
+    // Counts the submissions of one device (or of its transfer queue) from
+    // 1; 0 for a default Submission.
     std::uint64_t sequence() const noexcept { return number; }
 
 private:
     friend struct Device;
+    friend struct TransferQueue;
 
     std::shared_ptr<Completion const> completion;
     std::uint64_t number = 0;
+    void const *origin = nullptr; // the device whose timeline (or transfer queue) did the work
 };
 
 // What Device::submitWithFence() returns: the submission for the host, and
@@ -434,7 +441,194 @@ inline std::optional<std::string> imageExceedsLimits(Dim const dim, ivec3 const 
     return std::nullopt;
 }
 
+// The request of Device::copyBuffer and TransferQueue::copyBuffer.
+template <class S, class T>
+BufferCopy bufferCopy(S const &source, std::size_t const sourceOffset, T const &target, std::size_t const targetOffset,
+                      std::size_t const bytes) {
+    auto const from = bufferBytes(source);
+    auto const to = bufferBytes(target);
+    if (bytes == 0 or bytes % 4 != 0 or sourceOffset % 4 != 0 or targetOffset % 4 != 0) {
+        throw DeviceError{"copyBuffer: offsets and size must be multiples of 4, and the size above 0"};
+    }
+    if (sourceOffset > from.size or bytes > from.size - sourceOffset or targetOffset > to.size
+        or bytes > to.size - targetOffset) {
+        throw DeviceError{"copyBuffer: " + std::to_string(bytes) + " bytes from byte " + std::to_string(sourceOffset)
+                          + " to byte " + std::to_string(targetOffset) + " leave the buffers"};
+    }
+    if (from.identity->key() == to.identity->key() and sourceOffset < targetOffset + bytes
+        and targetOffset < sourceOffset + bytes) {
+        throw DeviceError{"copyBuffer: the source and target ranges overlap"};
+    }
+    return BufferCopy{from.identity, sourceOffset, to.identity, targetOffset, bytes,
+                      ConstByteSpan{from.host.data(), from.host.size()}, to.host};
+}
+
+// The request of copyBufferToImage into a device image.
+template <class B, class G, Dim D, class P>
+BufferImageCopy imageCopy(B const &buffer, std::size_t const offset, DeviceImage<G, D, P> const &image,
+                          std::uint32_t const level, std::uint32_t const firstLayer, std::uint32_t const layers) {
+    using Storage = typename GPUFormatTraits<G>::StoragePixel;
+    if (not image or level >= image.levels()) {
+        throw DeviceError{"copyBufferToImage: no image, or no mip level " + std::to_string(level)};
+    }
+    auto const extent = DimTraits<D>::toExtent3(image.extent(level));
+    auto const depth = static_cast<std::uint32_t>(extent.z);
+    if (layers == 0 or firstLayer >= depth or layers > depth - firstLayer) {
+        throw DeviceError{"copyBufferToImage: layers " + std::to_string(firstLayer) + " + " + std::to_string(layers)
+                          + " are outside the image, which has " + std::to_string(depth)};
+    }
+    auto const bytes = static_cast<std::size_t>(extent.x) * static_cast<std::size_t>(extent.y) * layers * sizeof(Storage);
+    auto const source = bufferBytes(buffer);
+    auto const host = ConstByteSpan{source.host.data(), source.size};
+    if (offset % 4 != 0 or offset % sizeof(Storage) != 0 or offset > host.size() or bytes > host.size() - offset) {
+        throw DeviceError{"copyBufferToImage: " + std::to_string(bytes) + " bytes from byte " + std::to_string(offset)
+                          + " are outside the buffer or misaligned"};
+    }
+    auto copy = BufferImageCopy{};
+    copy.buffer = source.identity;
+    copy.offset = offset;
+    copy.bytes = bytes;
+    copy.host = host;
+    copy.image = &image.identity();
+    copy.format = GPUFormatTraits<G>::format;
+    copy.dim = D;
+    copy.extent = extent;
+    copy.level = level;
+    copy.firstLayer = firstLayer;
+    copy.layers = layers;
+    if (auto *chain = image.shared()->host.get()) {
+        auto *first = chain->level(level).data()
+                    + static_cast<std::size_t>(firstLayer) * static_cast<std::size_t>(extent.x * extent.y);
+        copy.writeHost = [first](ConstByteSpan const texels) {
+            for (std::size_t i = 0; i < texels.size() / sizeof(Storage); ++i) {
+                auto texel = Storage{};
+                std::memcpy(&texel, texels.data() + i * sizeof(Storage), sizeof(Storage));
+                first[i] = convertPixel<P>(texel);
+            }
+        };
+    }
+    return copy;
+}
+
+// The request of copyBufferToImage into a compressed device image.
+template <class B, Dim D>
+BufferImageCopy imageCopy(B const &buffer, std::size_t const offset, DeviceCompressedImage<D> const &image,
+                          std::uint32_t const level, std::uint32_t const firstLayer, std::uint32_t const layers) {
+    if (not image or level >= image.levels()) {
+        throw DeviceError{"copyBufferToImage: no image, or no mip level " + std::to_string(level)};
+    }
+    if (layers == 0 or firstLayer >= image.layers() or layers > image.layers() - firstLayer) {
+        throw DeviceError{"copyBufferToImage: layers " + std::to_string(firstLayer) + " + " + std::to_string(layers)
+                          + " are outside the image, which has " + std::to_string(image.layers())};
+    }
+    auto const blockBytes = compressedFormatInfo(image.format()).blockBytes;
+    auto const layerBytes = image.layerBytes(level);
+    auto const bytes = layerBytes * layers;
+    auto const source = bufferBytes(buffer);
+    auto const host = ConstByteSpan{source.host.data(), source.size};
+    if (offset % 4 != 0 or offset % blockBytes != 0 or offset > host.size() or bytes > host.size() - offset) {
+        throw DeviceError{"copyBufferToImage: " + std::to_string(bytes) + " bytes from byte " + std::to_string(offset)
+                          + " are outside the buffer or misaligned"};
+    }
+    auto const size = DimTraits<D>::toExtent3(image.extent(level));
+    auto copy = BufferImageCopy{};
+    copy.buffer = source.identity;
+    copy.offset = offset;
+    copy.bytes = bytes;
+    copy.host = host;
+    copy.image = &image.identity();
+    copy.compressed = image.format();
+    copy.dim = D;
+    copy.extent = ivec3{size.x, size.y, static_cast<std::int32_t>(image.layers())};
+    copy.level = level;
+    copy.firstLayer = firstLayer;
+    copy.layers = layers;
+    if (auto *chain = image.shared()->host.get()) {
+        auto *first = chain->level(level).data() + static_cast<std::size_t>(firstLayer) * size.x * size.y;
+        copy.writeHost = [first, size, layerBytes, format = image.format()](ConstByteSpan const blocks) {
+            auto const *data = reinterpret_cast<std::uint8_t const *>(blocks.data());
+            for (std::size_t layer = 0; layer * layerBytes < blocks.size(); ++layer) {
+                decodeCompressed(format, ivec2{size.x, size.y}, data + layer * layerBytes, layerBytes,
+                                 first + layer * static_cast<std::size_t>(size.x * size.y));
+            }
+        };
+    }
+    return copy;
+}
+
 } // namespace detail
+
+struct Device;
+
+// A second timeline of a device for copies (Device::transfers()): work on
+// it runs next to the device's dispatches, on a queue of its own where the
+// device has one (DeviceInfo::separateTransfers), and completes in its own
+// order. Use it from the device's thread.
+//
+// The two timelines are ordered only where one waits for the other: before
+// one timeline reads or writes a resource the other one wrote (or writes
+// one the other reads), it waits for that submission, with waitFor() here
+// or Device::waitFor(Submission). Unordered access to one resource from
+// both is undefined. Where the device has no second queue, the copies go
+// into its own timeline in call order and the waits have nothing to do.
+struct TransferQueue {
+    virtual ~TransferQueue() = default;
+
+    // As Device::copyBuffer.
+    template <class S, class T,
+              std::enable_if_t<detail::IsBufferLike<S>::value and detail::IsBufferLike<T>::value, int> = 0>
+    void copyBuffer(S const &source, std::size_t const sourceOffset, T const &target, std::size_t const targetOffset,
+                    std::size_t const bytes) {
+        doCopyBuffer(detail::bufferCopy(source, sourceOffset, target, targetOffset, bytes));
+    }
+
+    // As Device::copyBufferToImage, into a device image or compressed device image.
+    template <class B, class I, std::enable_if_t<detail::IsBufferLike<B>::value, int> = 0>
+    void copyBufferToImage(B const &buffer, std::size_t const offset, I const &image, std::uint32_t const level,
+                           std::uint32_t const firstLayer = 0, std::uint32_t const layers = 1) {
+        doCopyBufferToImage(detail::imageCopy(buffer, offset, image, level, firstLayer, layers));
+    }
+
+    // Copies queued after this call wait on the device for `submission`:
+    // a submission of this device's timeline (Device::submit), e.g. the
+    // last frame that samples what a copy overwrites. A submission of
+    // another device is waited for on the host.
+    void waitFor(Submission const &submission) {
+        if (submission.origin == owner) {
+            doWaitFor(submission);
+        } else {
+            submission.wait();
+        }
+    }
+
+    // Sends the copies queued so far and returns without waiting.
+    Submission submit() {
+        auto submission = doSubmit();
+        if (submission.origin == nullptr) {
+            submission.origin = owner;
+            submission.number = ++submitted;
+        }
+        return submission;
+    }
+
+protected:
+    explicit TransferQueue(Device const &owner_) noexcept : owner(&owner_) {}
+
+    virtual void doCopyBuffer(BufferCopy const &copy) = 0;
+    virtual void doCopyBufferToImage(BufferImageCopy const &copy) = 0;
+    // `submission` comes from the owning device.
+    virtual void doWaitFor(Submission const &submission) = 0;
+    // A Submission whose origin is unset gets this queue's next number.
+    virtual Submission doSubmit() = 0;
+
+    static Submission::Completion const *completionOf(Submission const &submission) noexcept {
+        return submission.completion.get();
+    }
+
+private:
+    void const *owner;
+    std::uint64_t submitted = 0;
+};
 
 // A compute device. The public template API mirrors the talk:
 //
@@ -536,22 +730,7 @@ struct Device {
               std::enable_if_t<detail::IsBufferLike<S>::value and detail::IsBufferLike<T>::value, int> = 0>
     void copyBuffer(S const &source, std::size_t const sourceOffset, T const &target, std::size_t const targetOffset,
                     std::size_t const bytes) {
-        auto const from = detail::bufferBytes(source);
-        auto const to = detail::bufferBytes(target);
-        if (bytes == 0 or bytes % 4 != 0 or sourceOffset % 4 != 0 or targetOffset % 4 != 0) {
-            throw DeviceError{"copyBuffer: offsets and size must be multiples of 4, and the size above 0"};
-        }
-        if (sourceOffset > from.size or bytes > from.size - sourceOffset or targetOffset > to.size
-            or bytes > to.size - targetOffset) {
-            throw DeviceError{"copyBuffer: " + std::to_string(bytes) + " bytes from byte " + std::to_string(sourceOffset)
-                              + " to byte " + std::to_string(targetOffset) + " leave the buffers"};
-        }
-        if (from.identity->key() == to.identity->key() and sourceOffset < targetOffset + bytes
-            and targetOffset < sourceOffset + bytes) {
-            throw DeviceError{"copyBuffer: the source and target ranges overlap"};
-        }
-        doCopyBuffer(BufferCopy{from.identity, sourceOffset, to.identity, targetOffset, bytes,
-                                ConstByteSpan{from.host.data(), from.host.size()}, to.host});
+        doCopyBuffer(detail::bufferCopy(source, sourceOffset, target, targetOffset, bytes));
     }
 
     // A compressed image only this device holds (see DeviceCompressedImage),
@@ -607,47 +786,7 @@ struct Device {
     void copyBufferToImage(B const &buffer, std::size_t const offset, DeviceImage<G, D, P> const &image,
                            std::uint32_t const level, std::uint32_t const firstLayer = 0,
                            std::uint32_t const layers = 1) {
-        using Storage = typename GPUFormatTraits<G>::StoragePixel;
-        if (not image or level >= image.levels()) {
-            throw DeviceError{"copyBufferToImage: no image, or no mip level " + std::to_string(level)};
-        }
-        auto const extent = DimTraits<D>::toExtent3(image.extent(level));
-        auto const depth = static_cast<std::uint32_t>(extent.z);
-        if (layers == 0 or firstLayer >= depth or layers > depth - firstLayer) {
-            throw DeviceError{"copyBufferToImage: layers " + std::to_string(firstLayer) + " + " + std::to_string(layers)
-                              + " are outside the image, which has " + std::to_string(depth)};
-        }
-        auto const bytes = static_cast<std::size_t>(extent.x) * static_cast<std::size_t>(extent.y) * layers * sizeof(Storage);
-        auto const source = detail::bufferBytes(buffer);
-        auto const host = ConstByteSpan{source.host.data(), source.size};
-        if (offset % 4 != 0 or offset % sizeof(Storage) != 0 or offset > host.size() or bytes > host.size() - offset) {
-            throw DeviceError{"copyBufferToImage: " + std::to_string(bytes) + " bytes from byte " + std::to_string(offset)
-                              + " are outside the buffer or misaligned"};
-        }
-        auto copy = BufferImageCopy{};
-        copy.buffer = source.identity;
-        copy.offset = offset;
-        copy.bytes = bytes;
-        copy.host = host;
-        copy.image = &image.identity();
-        copy.format = GPUFormatTraits<G>::format;
-        copy.dim = D;
-        copy.extent = extent;
-        copy.level = level;
-        copy.firstLayer = firstLayer;
-        copy.layers = layers;
-        if (auto *chain = image.shared()->host.get()) {
-            auto *first = chain->level(level).data()
-                        + static_cast<std::size_t>(firstLayer) * static_cast<std::size_t>(extent.x * extent.y);
-            copy.writeHost = [first](ConstByteSpan const texels) {
-                for (std::size_t i = 0; i < texels.size() / sizeof(Storage); ++i) {
-                    auto texel = Storage{};
-                    std::memcpy(&texel, texels.data() + i * sizeof(Storage), sizeof(Storage));
-                    first[i] = convertPixel<P>(texel);
-                }
-            };
-        }
-        doCopyBufferToImage(copy);
+        doCopyBufferToImage(detail::imageCopy(buffer, offset, image, level, firstLayer, layers));
     }
 
     // The same for a compressed image: from byte `offset`, a multiple of 4
@@ -658,46 +797,7 @@ struct Device {
     void copyBufferToImage(B const &buffer, std::size_t const offset, DeviceCompressedImage<D> const &image,
                            std::uint32_t const level, std::uint32_t const firstLayer = 0,
                            std::uint32_t const layers = 1) {
-        if (not image or level >= image.levels()) {
-            throw DeviceError{"copyBufferToImage: no image, or no mip level " + std::to_string(level)};
-        }
-        if (layers == 0 or firstLayer >= image.layers() or layers > image.layers() - firstLayer) {
-            throw DeviceError{"copyBufferToImage: layers " + std::to_string(firstLayer) + " + " + std::to_string(layers)
-                              + " are outside the image, which has " + std::to_string(image.layers())};
-        }
-        auto const blockBytes = compressedFormatInfo(image.format()).blockBytes;
-        auto const layerBytes = image.layerBytes(level);
-        auto const bytes = layerBytes * layers;
-        auto const source = detail::bufferBytes(buffer);
-        auto const host = ConstByteSpan{source.host.data(), source.size};
-        if (offset % 4 != 0 or offset % blockBytes != 0 or offset > host.size() or bytes > host.size() - offset) {
-            throw DeviceError{"copyBufferToImage: " + std::to_string(bytes) + " bytes from byte " + std::to_string(offset)
-                              + " are outside the buffer or misaligned"};
-        }
-        auto const size = DimTraits<D>::toExtent3(image.extent(level));
-        auto copy = BufferImageCopy{};
-        copy.buffer = source.identity;
-        copy.offset = offset;
-        copy.bytes = bytes;
-        copy.host = host;
-        copy.image = &image.identity();
-        copy.compressed = image.format();
-        copy.dim = D;
-        copy.extent = ivec3{size.x, size.y, static_cast<std::int32_t>(image.layers())};
-        copy.level = level;
-        copy.firstLayer = firstLayer;
-        copy.layers = layers;
-        if (auto *chain = image.shared()->host.get()) {
-            auto *first = chain->level(level).data() + static_cast<std::size_t>(firstLayer) * size.x * size.y;
-            copy.writeHost = [first, size, layerBytes, format = image.format()](ConstByteSpan const blocks) {
-                auto const *data = reinterpret_cast<std::uint8_t const *>(blocks.data());
-                for (std::size_t layer = 0; layer * layerBytes < blocks.size(); ++layer) {
-                    decodeCompressed(format, ivec2{size.x, size.y}, data + layer * layerBytes, layerBytes,
-                                     first + layer * static_cast<std::size_t>(size.x * size.y));
-                }
-            };
-        }
-        doCopyBufferToImage(copy);
+        doCopyBufferToImage(detail::imageCopy(buffer, offset, image, level, firstLayer, layers));
     }
 
     template <class T, Dim D>
@@ -918,12 +1018,27 @@ struct Device {
     // the compositor gives back (ASurfaceTransactionStats_getPreviousReleaseFenceFd).
     void waitFor(SyncFence fence) { doWaitFor(std::move(fence)); }
 
+    // Work queued after this call waits on the device for `submission` of
+    // this device's transfer queue (see TransferQueue); a submission of
+    // another device is waited for on the host.
+    void waitFor(Submission const &submission) {
+        if (submission.origin == this) {
+            doWaitForSubmission(submission);
+        } else {
+            submission.wait();
+        }
+    }
+
+    // The device's second timeline for copies (see TransferQueue).
+    TransferQueue &transfers() { return doTransfers(); }
+
     // Submits the queued work like submit() and also returns a fence the
     // device signals when it is done, for the next user of the external
     // images it writes (the acquire fence of ASurfaceTransaction_setBuffer).
     FencedSubmission submitWithFence() {
         auto result = doSubmitWithFence();
         result.submission.number = ++submitted;
+        result.submission.origin = this;
         return result;
     }
 
@@ -967,6 +1082,7 @@ struct Device {
     Submission submit() {
         auto submission = doSubmit();
         submission.number = ++submitted;
+        submission.origin = this;
         return submission;
     }
 
@@ -1096,6 +1212,19 @@ protected:
         throw DeviceError{"external images are only available on Android"};
     }
     virtual void doWaitFor(SyncFence fence) { fence.wait(); }
+    // `submission` comes from this device: its own timeline, which is in
+    // order already, or its transfer queue.
+    virtual void doWaitForSubmission(Submission const &submission) { (void)submission; }
+    // The default transfer queue records into this device's own timeline.
+    virtual TransferQueue &doTransfers() {
+        if (sharedTransfers == nullptr) {
+            sharedTransfers = std::make_unique<SharedTransfers>(*this);
+        }
+        return *sharedTransfers;
+    }
+    static Submission::Completion const *completionOf(Submission const &submission) noexcept {
+        return submission.completion.get();
+    }
     virtual void doUploadCompressed(CompressedTransfer const &transfer) {
         throw DeviceError{std::string{"compressed format "} + compressedFormatInfo(transfer.format).name
                           + " is not supported by this backend"};
@@ -1128,8 +1257,21 @@ protected:
     }
 
 private:
+    // Copies in call order on the device's own timeline.
+    struct SharedTransfers final : TransferQueue {
+        explicit SharedTransfers(Device &device_) noexcept : TransferQueue(device_), device(device_) {}
+
+        void doCopyBuffer(BufferCopy const &copy) override { device.doCopyBuffer(copy); }
+        void doCopyBufferToImage(BufferImageCopy const &copy) override { device.doCopyBufferToImage(copy); }
+        void doWaitFor(Submission const &) override {}
+        Submission doSubmit() override { return device.submit(); }
+
+        Device &device;
+    };
+
     bool timersOn = false;
     std::uint64_t submitted = 0;
+    std::unique_ptr<SharedTransfers> sharedTransfers;
 
     template <class T, Dim D>
     static void requireHostData(BufferResource<T, D> const &resource, char const *what) {

@@ -26,6 +26,7 @@ add_executable(tc_equivalence_tests
     reload_tests.cpp
     compressed_tests.cpp
     memory_tests.cpp
+    transfer_tests.cpp
     kernels/feature_kernels.hpp
     kernels/dispatch_kernels.hpp
     kernels/texture_kernels.hpp

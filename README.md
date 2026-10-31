@@ -35,7 +35,7 @@ device->downloadBuffer(c);
 | CPU | `cpu` | 所有平台 | kernel struct 本身，工作组分配到多线程 |
 | OpenGL 4.3 core | `opengl` | 桌面 Linux（EGL，无窗口） | `#version 430` GLSL |
 | OpenGL ES 3.1 | `gles` | Android、桌面（EGL） | `#version 310 es` GLSL |
-| Vulkan 1.0（外部帧和子组需要 1.1） | `vulkan` | Linux、Android；Windows 与 macOS（MoltenVK）未验证 | SPIR-V |
+| Vulkan 1.0（外部帧和子组需要 1.1，独立的传输队列需要 1.2） | `vulkan` | Linux、Android；Windows 与 macOS（MoltenVK）未验证 | SPIR-V |
 
 在 Linux（RTX 5070 Ti + Mesa llvmpipe/lavapipe）上，所有示例和等价性测试在 CPU、GL、GLES、Vulkan 上结果一致；设备没有的可选能力（子组、64 位整数、某些压缩格式）对应的测试会跳过，见下文"设备能力"。`--device llvmpipe` 可以选软件实现。
 
@@ -329,6 +329,23 @@ device->executeIndirect(shade, args);                               // 读 args[
 
 **按需屏障**：后端记录每次 dispatch 和传输读写了哪些资源的哪段字节，只在真正有读后写、写后读或写后写冲突时才插入屏障（Vulkan 的 pipeline barrier，GL 的 `glMemoryBarrier`）。互不相关的连续 dispatch 之间没有屏障，可以重叠执行。
 
+**传输队列**：`device->transfers()` 是设备的第二条时间线，只做拷贝（`copyBuffer`、`copyBufferToImage`，参数与设备上的同名函数相同），在设备有独立队列时与 dispatch 同时执行。两条时间线只在等待处排序：一条时间线读写另一条写过的资源（或写另一条在读的资源）之前，先等那次提交。
+
+```cpp
+auto &transfers = device->transfers();
+transfers.waitFor(lastFrame);                        // 设备上等主时间线的一次提交，比如被覆盖的层已经没人采样
+transfers.copyBufferToImage(staging, offset, pool, level, layer);
+auto const copied = transfers.submit();              // 不等待
+device->waitFor(copied);                             // 之后排队的 dispatch 在设备上等这次拷贝
+```
+
+| 后端 | 传输队列（`DeviceInfo::separateTransfers`） |
+|---|---|
+| `vulkan` | 只做传输的队列族（拷贝引擎），否则计算队列族的第二个队列；用 Vulkan 1.2 的 timeline semaphore 互相等待，两条队列都用到的资源以 `CONCURRENT` 方式共享。都没有（lavapipe 只有一个队列）时同下 |
+| `opengl` / `gles` / `cpu` | 拷贝按调用顺序进入设备自己的时间线，等待什么也不做 |
+
+传输队列在设备的线程上使用。`waitFor` 收到别的设备的提交时在主机上等待。
+
 **CPU 线程**：CPU 后端默认使用自己的常驻线程池。引擎可以实现 `tc::cpu::ParallelExecutor`（`concurrency()` 和 `bulk(count, task)` 两个函数），通过 `CpuDeviceConfig::executor` 交给 CPU 后端，让 kernel 和引擎共用线程；`tc::cpu::makeThreadPool(n)` 返回 tc 自带的实现，可以由多个设备共享。
 
 ## 开发时重新加载 kernel
@@ -475,7 +492,7 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 一次转译产出三种方言和 SPIR-V；Vulkan 的 uniform 自动放进 push constant 块，偏移由转译器计算并写入反射数据。
 - 增加了 std430 布局检查和 binding 读写推断。
 - 增加了表（紧凑字流、AOS/SOA、字段编码），思路来自上文提到的知乎文章；布局和编码器写成普通 C++，由转译器照常转译。
-- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像和 buffer、内存堆与资源别名、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
+- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像和 buffer、内存堆与资源别名、传输队列、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
 
 ## 已知限制
 
