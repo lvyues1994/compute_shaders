@@ -3,7 +3,11 @@
 #include <EGL/eglext.h>
 
 #include <algorithm>
+#include <map>
+#include <mutex>
+#include <sstream>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace tc::opengl {
@@ -84,19 +88,74 @@ std::string apiName(OpenGLApi const api) {
     return api == OpenGLApi::Desktop ? "OpenGL 4.3 core" : "OpenGL ES 3.1";
 }
 
+struct DisplayUse {
+    int leases = 0;
+    bool terminates = true;
+};
+
+struct DisplayRegistry {
+    std::mutex mutex;
+    std::map<EGLDisplay, DisplayUse> uses;
+};
+
+DisplayRegistry &displayRegistry() {
+    static auto registry = DisplayRegistry{};
+    return registry;
+}
+
 } // namespace
+
+std::string eglFailure(char const *const call) {
+    auto stream = std::ostringstream{};
+    stream << call << " failed (EGL error 0x" << std::hex << eglGetError() << ")";
+    return stream.str();
+}
+
+std::optional<DisplayLease> DisplayLease::acquire(EGLDisplay const display) {
+    auto &registry = displayRegistry();
+    auto const lock = std::lock_guard<std::mutex>{registry.mutex};
+    auto &use = registry.uses[display];
+    if (use.leases == 0) {
+        use.terminates = eglQueryString(display, EGL_VENDOR) == nullptr;
+        auto major = EGLint{0};
+        auto minor = EGLint{0};
+        if (eglInitialize(display, &major, &minor) != EGL_TRUE) {
+            registry.uses.erase(display);
+            return std::nullopt;
+        }
+    }
+    ++use.leases;
+    return DisplayLease{display};
+}
+
+DisplayLease::DisplayLease(DisplayLease &&other) noexcept : display(std::exchange(other.display, EGL_NO_DISPLAY)) {}
+
+DisplayLease::~DisplayLease() {
+    if (display == EGL_NO_DISPLAY) {
+        return;
+    }
+    auto &registry = displayRegistry();
+    auto const lock = std::lock_guard<std::mutex>{registry.mutex};
+    auto const use = registry.uses.find(display);
+    if (--use->second.leases > 0) {
+        return;
+    }
+    if (use->second.terminates) {
+        eglTerminate(display);
+    }
+    registry.uses.erase(use);
+}
 
 std::unique_ptr<EglContext> EglContext::create(OpenGLDeviceConfig const &config) {
     auto tried = std::string{};
     for (auto const &candidate : displayCandidates()) {
-        auto egl = std::unique_ptr<EglContext>{new EglContext{}};
-        egl->display = candidate.display;
-        auto major = EGLint{0};
-        auto minor = EGLint{0};
-        if (eglInitialize(egl->display, &major, &minor) != EGL_TRUE) {
-            egl->display = EGL_NO_DISPLAY;
+        auto lease = DisplayLease::acquire(candidate.display);
+        if (not lease) {
             continue;
         }
+        auto egl = std::unique_ptr<EglContext>{new EglContext{}};
+        egl->lease.emplace(std::move(*lease));
+        egl->display = candidate.display;
         auto const api = config.api == OpenGLApi::Desktop ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
         auto const renderable = config.api == OpenGLApi::Desktop ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT;
         if (eglBindAPI(api) != EGL_TRUE) {
@@ -168,13 +227,12 @@ EglContext::~EglContext() {
     if (surface != EGL_NO_SURFACE) {
         eglDestroySurface(display, surface);
     }
-    eglTerminate(display);
 }
 
 void EglContext::makeCurrent() const {
     if (eglGetCurrentContext() != context
         and eglMakeCurrent(display, surface, surface, context) != EGL_TRUE) {
-        throw DeviceError{"eglMakeCurrent failed"};
+        throw DeviceError{eglFailure("eglMakeCurrent")};
     }
 }
 

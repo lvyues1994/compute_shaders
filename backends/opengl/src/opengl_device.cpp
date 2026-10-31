@@ -256,7 +256,7 @@ struct EglFenceCompletion final : Submission::Completion {
         }
         auto status = EGLint{0};
         if (egl->sync().getAttribute(egl->eglDisplay(), sync, EGL_SYNC_STATUS_KHR, &status) != EGL_TRUE) {
-            throw DeviceError{"eglGetSyncAttribKHR failed"};
+            throw DeviceError{eglFailure("eglGetSyncAttribKHR")};
         }
         if (status != EGL_SIGNALED_KHR) {
             return false;
@@ -270,7 +270,7 @@ struct EglFenceCompletion final : Submission::Completion {
             return;
         }
         if (egl->sync().clientWait(egl->eglDisplay(), sync, 0, EGL_FOREVER_KHR) != EGL_CONDITION_SATISFIED_KHR) {
-            throw DeviceError{"eglClientWaitSyncKHR failed"};
+            throw DeviceError{eglFailure("eglClientWaitSyncKHR")};
         }
         signaled.store(true, std::memory_order_release);
     }
@@ -1233,7 +1233,7 @@ FencedSubmission OpenGLDevice::doSubmitWithFence() {
     EGLint const attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID, EGL_NONE};
     auto const fence = sync.create(egl->eglDisplay(), EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
     if (fence == EGL_NO_SYNC_KHR) {
-        throw DeviceError{"eglCreateSyncKHR (native fence) failed"};
+        throw DeviceError{eglFailure("eglCreateSyncKHR (native fence)")};
     }
     gl().glFlush(); // the descriptor exists once the fence is flushed
     auto const fd = sync.dupNativeFence(egl->eglDisplay(), fence);
@@ -1461,7 +1461,7 @@ Submission OpenGLDevice::doSubmit() {
     }
     auto const fence = sync.create(egl->eglDisplay(), EGL_SYNC_FENCE_KHR, nullptr);
     if (fence == EGL_NO_SYNC_KHR) {
-        throw DeviceError{"eglCreateSyncKHR failed"};
+        throw DeviceError{eglFailure("eglCreateSyncKHR")};
     }
     gl().glFlush();
     return Submission{std::make_shared<EglFenceCompletion>(egl, fence)};

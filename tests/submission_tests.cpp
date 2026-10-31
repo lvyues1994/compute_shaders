@@ -151,6 +151,35 @@ TEST_P(Equivalence, SubmissionsCanBeAwaitedAnywhere) {
     EXPECT_TRUE(last.isComplete());
 }
 
+// Devices made and dropped beside this one, on its display or passing over it to find
+// another, leave it working.
+TEST_P(Equivalence, OtherDevicesComeAndGo) {
+    for (auto const *const name : {"", "llvmpipe"}) {
+        auto request = DeviceRequest{};
+        request.backend = GetParam().backend;
+        request.deviceNameContains = name;
+        try {
+            createDevice(request).reset();
+        } catch (DeviceError const &) {
+        }
+    }
+    auto values = BufferResource<vec4>{kSlice};
+    auto out = gpu->createBuffer<vec4>(kSlice);
+    gpu->uploadBuffer(values);
+    gpu->uploadBuffer(out);
+    auto kernel = tests::ScaleRange{};
+    kernel.in.attach(values);
+    kernel.out.attach(out);
+    kernel.factor = 3.0f;
+    gpu->useKernel(kernel);
+    gpu->bindBuffer(kernel.in);
+    gpu->bindBuffer(kernel.out);
+    gpu->setUniform(kernel.factor);
+    gpu->execute(kernel, uvec3{1u, 1u, 1u});
+    gpu->submitWithFence().submission.wait();
+    EXPECT_EQ(out[3], vec4{64.0f});
+}
+
 TEST(Submission, DefaultIsComplete) {
     auto const done = Submission{};
     EXPECT_TRUE(done.isComplete());
