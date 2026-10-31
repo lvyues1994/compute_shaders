@@ -176,6 +176,78 @@ TEST_P(Equivalence, RayQueriesHitTheSameTriangles) {
     EXPECT_EQ(actual[6].ids[3].x, 0xFFFFFFFFu) << "rebuilt with one instance";
 }
 
+// Instance 0 is a gap: it refers to no bottom level (reference 0) or, `masked`, to the
+// quad with mask 2, which the rays' cull mask 1 leaves out. Instance 1 is the quad moved
+// by 3 along x. One ray down at each.
+std::vector<uvec4> traceGap(Device &device, bool const masked) {
+    auto scene = Scene{};
+    device.uploadBuffer(scene.positions);
+    device.uploadBuffer(scene.indices);
+    auto const blas = device.createBottomLevel({TriangleGeometry::of(scene.positions, 0, 4, scene.indices, 0, 2)});
+    auto moved = mat4{1.0f};
+    moved[3] = vec4{3.0f, 0.0f, 0.0f, 1.0f};
+    auto instances = BufferResource<TopLevelInstance>{2};
+    instances[0] = masked ? makeInstance(mat4{1.0f}, blas.reference(), 7u, 2u) : makeInstance(mat4{1.0f}, uvec2{0u, 0u}, 7u);
+    instances[1] = makeInstance(moved, blas.reference(), 8u);
+    device.uploadBuffer(instances);
+    auto const tlas = device.createTopLevel(2);
+    device.buildTopLevel(tlas, instances, 0, 2);
+
+    auto rays = BufferResource<vec4>{4};
+    rays[0] = vec4{0.3f, 0.2f, 5.0f, 100.0f};
+    rays[1] = vec4{0.0f, 0.0f, -1.0f, 0.0f};
+    rays[2] = vec4{3.3f, 0.2f, 5.0f, 100.0f};
+    rays[3] = vec4{0.0f, 0.0f, -1.0f, 0.0f};
+    auto hits = BufferResource<vec4>{2};
+    auto ids = BufferResource<uvec4>{2};
+    device.uploadBuffer(rays);
+    device.uploadBuffer(hits);
+    device.uploadBuffer(ids);
+    auto trace = tests::TraceRays{};
+    trace.scene.attach(tlas);
+    trace.rays.attach(rays);
+    trace.hits.attach(hits);
+    trace.ids.attach(ids);
+    trace.flags = gl_RayFlagsNoneEXT;
+    trace.cullMask = 1u;
+    device.useKernel(trace);
+    device.bindAccelerationStructure(trace.scene);
+    device.bindBuffer(trace.rays);
+    device.bindBuffer(trace.hits);
+    device.bindBuffer(trace.ids);
+    device.setUniform(trace.flags);
+    device.setUniform(trace.cullMask);
+    device.execute(trace, uvec3{1u, 1u, 1u});
+    device.downloadBuffer(ids);
+    return contents(ids);
+}
+
+// As in Vulkan, an instance without a bottom level is inactive; it keeps its place, so
+// the instance index of those after it does not change.
+TEST_P(Equivalence, InstancesWithoutBottomLevelsAreInactive) {
+    if (not uses(gpu->info().limits.features, KernelFeature::RayQuery)) {
+        GTEST_SKIP() << gpu->info().deviceName << " (" << gpu->info().backend << ") has no ray queries";
+    }
+    if (gpu->info().deviceName.find("llvmpipe") != std::string::npos) {
+        GTEST_SKIP() << "lavapipe (Mesa 25.2) hits nothing after an inactive instance";
+    }
+    auto const [expected, actual] = runBoth<std::vector<uvec4>>([](Device &device) { return traceGap(device, false); });
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(actual[0].x, 0xFFFFFFFFu) << "instance 0 is not hit";
+    EXPECT_EQ(actual[1], (uvec4{8u, 1u, 0u, 0u})) << "instance 1 keeps its index";
+}
+
+// The gap every device keeps: an instance whose mask the rays' cull mask leaves out.
+TEST_P(Equivalence, InstancesOutsideTheCullMaskAreNeverHit) {
+    if (not uses(gpu->info().limits.features, KernelFeature::RayQuery)) {
+        GTEST_SKIP() << gpu->info().deviceName << " (" << gpu->info().backend << ") has no ray queries";
+    }
+    auto const [expected, actual] = runBoth<std::vector<uvec4>>([](Device &device) { return traceGap(device, true); });
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(actual[0].x, 0xFFFFFFFFu) << "instance 0 is not hit";
+    EXPECT_EQ(actual[1], (uvec4{8u, 1u, 0u, 0u})) << "instance 1 keeps its index";
+}
+
 TEST(RayQuery, TopLevelsNeedLiveBottomLevels) {
     auto device = cpu::createDevice();
     auto instances = BufferResource<TopLevelInstance>{1};

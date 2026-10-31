@@ -125,6 +125,9 @@ protected:
             auto instance = TopLevelInstance{};
             std::memcpy(&instance, request.host.data() + request.offset + i * sizeof instance, sizeof instance);
             auto const reference = std::uint64_t{instance.reference.x} | std::uint64_t{instance.reference.y} << 32;
+            if (reference == 0) {
+                continue; // inactive, as in Vulkan
+            }
             auto const found = bottomLevels.find(reference);
             auto blas = found != bottomLevels.end() ? found->second.lock() : nullptr;
             if (blas == nullptr) {

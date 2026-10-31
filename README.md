@@ -327,6 +327,7 @@ device->bindAccelerationStructure(kernel.scene);
 - 底层（`BottomLevelAS`）是一个或多个几何的三角形：位置是 buffer 里的 xyz（`vec4`、`vec3`，或每 3 个 `float` 一个点），索引是 `uint`，从几何的第一个顶点算起；几何可以标成不透明以外，`rayQueryProceedEXT` 在它们的三角形上停下，由 kernel 决定。
 - 顶层（`TopLevelAS`）有固定的容量，`buildTopLevel` 每次从一个 `TopLevelInstance` 的 buffer 重建。`TopLevelInstance` 与 `VkAccelerationStructureInstanceKHR` 逐字节相同（按行存放的 3×4 变换、24 位自定义索引加 8 位掩码、标志、`uvec2` 形式的底层引用 `BottomLevelAS::reference()`），kernel 能通过 `BufferBinding<TopLevelInstance>` 写它，顶层就整个在 GPU 上更新；主机上用 `makeInstance` 填。
 - 构建在设备时间线上，与前后的 dispatch 按读写关系排序。顶层不持有它引用的底层：顶层还可能被追踪期间，底层必须活着。
+- 底层引用为 0 的实例不参与追踪，和 Vulkan 一样，它照样占着自己的位置，后面实例的 `InstanceId` 不变。lavapipe（Mesa 25.2.8）上，排在有效实例前面的这种实例（掩码为 0 的实例也一样）会让后面的实例都不被命中；要在所有设备上留空位，就引用一个有效的底层，掩码用射线的 cull mask 里没有的位。
 - 正反面在物体空间里判定：从射线起点看，三角形的三个角逆时针排列就是正面，实例变换（包括镜像）不改变它；`instanceTriangleFlipFacing` 翻转它。这是本机 NVIDIA 和 lavapipe 的 Vulkan 驱动给出的结果，CPU 后端与它一致。
 
 | 后端 | 光线查询 |
