@@ -85,6 +85,17 @@ KernelArtifact makeArtifact(KernelModel const &model, GlslBody const &body, Shad
         resource.filter = tc::Filter::Linear;
         artifact.resources.push_back(resource);
     }
+    for (auto const &structure : model.accelerationStructures) {
+        auto resource = ResourceArtifact{};
+        resource.name = structure.name;
+        resource.binding = structure.binding;
+        resource.kind = tc::ResourceKind::AccelerationStructure;
+        resource.access = tc::Access::ReadOnly;
+        artifact.resources.push_back(resource);
+    }
+    if (not model.accelerationStructures.empty()) {
+        artifact.features |= static_cast<std::uint32_t>(tc::KernelFeature::RayQuery);
+    }
     for (auto const &uniform : model.uniforms) {
         auto slot = UniformArtifact{};
         slot.name = uniform.name;

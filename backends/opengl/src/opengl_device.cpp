@@ -300,9 +300,9 @@ protected:
     void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes, ByteRange range) override;
     void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes, ByteRange range) override;
     std::optional<std::string> doCheckKernel(KernelProgram const &program) const override {
-        if (api == OpenGLApi::ES and program.glslEs.empty()) {
-            return "kernel '" + std::string{program.name} + "' cannot run on OpenGL ES: "
-                 + std::string{program.esUnavailableReason};
+        if ((api == OpenGLApi::ES ? program.glslEs : program.glslDesktop).empty()) {
+            return "kernel '" + std::string{program.name} + "' cannot run on OpenGL"
+                 + (api == OpenGLApi::ES ? " ES" : "") + ": " + std::string{program.esUnavailableReason};
         }
         return std::nullopt;
     }
@@ -1074,7 +1074,8 @@ ProgramObject &OpenGLDevice::programFor(std::string_view const name) {
     }
     auto const source = api == OpenGLApi::ES ? reflection->glslEs : reflection->glslDesktop;
     if (source.empty()) {
-        throw DeviceError{"kernel '" + key + "' cannot run on OpenGL ES: " + std::string{reflection->esUnavailableReason}};
+        throw DeviceError{"kernel '" + key + "' cannot run on OpenGL" + (api == OpenGLApi::ES ? " ES" : "") + ": "
+                          + std::string{reflection->esUnavailableReason}};
     }
     if (auto const reason = exceedsLimits(*reflection, limits)) {
         throw DeviceError{*reason};

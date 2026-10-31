@@ -22,7 +22,8 @@ enum class ResourceKind : std::uint8_t {
     StorageImage,
     SampledTexture,
     ExternalTexture,
-    ExternalImage, // a platform frame bound as a storage image
+    ExternalImage,         // a platform frame bound as a storage image
+    AccelerationStructure, // a top-level acceleration structure for ray queries
 };
 
 enum class Access : std::uint8_t {
@@ -68,6 +69,7 @@ enum class KernelFeature : std::uint32_t {
     Subgroups = 1u << 1,     // subgroup built-ins
     Int64 = 1u << 2,         // 64-bit integer arithmetic
     Int64Atomics = 1u << 3,  // 64-bit atomics on buffer elements
+    RayQuery = 1u << 4,      // ray queries through acceleration structures
 };
 
 constexpr std::uint32_t operator|(KernelFeature const a, KernelFeature const b) noexcept {

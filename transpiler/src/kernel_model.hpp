@@ -100,6 +100,13 @@ struct ExternalTextureModel {
     clang::FieldDecl const *field = nullptr;
 };
 
+// AccelerationStructureBinding: `uniform accelerationStructureEXT`.
+struct AccelerationStructureModel {
+    std::string name;
+    std::uint32_t binding = 0;
+    clang::FieldDecl const *field = nullptr;
+};
+
 struct SharedModel {
     std::string name;
     clang::QualType type;
@@ -128,6 +135,7 @@ struct KernelModel {
     std::vector<ImageModel> images;
     std::vector<TextureModel> textures;
     std::vector<ExternalTextureModel> externalTextures;
+    std::vector<AccelerationStructureModel> accelerationStructures;
     std::vector<SharedModel> shared;
     std::vector<UniformModel> uniforms;
     std::uint32_t pushConstantSize = 0;
@@ -153,6 +161,15 @@ struct KernelModel {
         }
         for (auto const &texture : externalTextures) {
             if (texture.field == field) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isAccelerationStructure(clang::FieldDecl const *field) const {
+        for (auto const &structure : accelerationStructures) {
+            if (structure.field == field) {
                 return true;
             }
         }

@@ -21,7 +21,11 @@ bool isTcDecl(clang::Decl const *decl) {
 }
 
 bool isTcValueRecord(clang::RecordDecl const *record) {
-    return record != nullptr and record->getQualifiedNameAsString() == "tc::DispatchIndirectCommand";
+    if (record == nullptr) {
+        return false;
+    }
+    auto const name = record->getQualifiedNameAsString();
+    return name == "tc::DispatchIndirectCommand" or name == "tc::TopLevelInstance";
 }
 
 clang::QualType bareType(clang::QualType const type) {

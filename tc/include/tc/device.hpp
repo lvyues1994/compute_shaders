@@ -26,6 +26,7 @@
 #include <tc/kernel.hpp>
 #include <tc/mat.hpp>
 #include <tc/program.hpp>
+#include <tc/ray_query.hpp>
 #include <tc/span.hpp>
 #include <tc/subgroup.hpp>
 #include <tc/sync_fence.hpp>
@@ -73,6 +74,12 @@ struct DeviceLimits {
     std::uint32_t imageDimension2D = 0; // width and height of 2D images and array layers
     std::uint32_t imageDimension3D = 0; // width, height and depth of 3D images
     std::uint32_t imageArrayLayers = 0;
+    // With KernelFeature::RayQuery: acceleration structures of one kernel,
+    // and the largest structures the device builds.
+    std::uint32_t accelerationStructures = 0;
+    std::uint64_t maxInstances = 0;  // of a top level
+    std::uint64_t maxTriangles = 0;  // of a bottom level
+    std::uint64_t maxGeometries = 0; // of a bottom level
 };
 
 struct DeviceInfo {
@@ -244,6 +251,77 @@ struct BufferCreation {
     ResourceIdentity const *identity = nullptr;
     std::size_t bytes = 0;
     std::optional<HeapRange> placement;
+};
+
+// Triangles of a bottom-level acceleration structure (Device::createBottomLevel):
+// corner positions are xyz floats `stride` bytes apart in a buffer the
+// device has, picked by uint indices three per triangle, which count from
+// the first vertex. The buffers must stay alive until the build has run.
+struct TriangleGeometry {
+    ResourceIdentity const *positions = nullptr;
+    std::size_t positionOffset = 0; // bytes to the first vertex
+    std::uint32_t stride = 16;
+    std::uint32_t vertexCount = 0;
+    ConstByteSpan positionHost; // the whole buffers on the host: the CPU backend's working memory
+    ResourceIdentity const *indices = nullptr;
+    std::size_t indexOffset = 0; // bytes to the first index
+    std::uint32_t triangleCount = 0;
+    ConstByteSpan indexHost;
+    bool opaque = true; // else rayQueryProceedEXT stops at its triangles
+
+    // Vertices [firstVertex, firstVertex + vertexCount) of `positions`, a
+    // BufferResource or DeviceBuffer of vec4 or vec3 (xyz used) or of
+    // float (three per vertex), and triangleCount triangles from element
+    // `firstIndex` of `indices`, a buffer of uint.
+    template <class P, class I>
+    static TriangleGeometry of(P const &positions, std::size_t const firstVertex, std::size_t const vertexCount,
+                               I const &indices, std::size_t const firstIndex, std::size_t const triangleCount,
+                               bool const opaque = true) {
+        using Position = typename P::value_type;
+        static_assert(std::is_same_v<Position, vec4> or std::is_same_v<Position, vec3> or std::is_same_v<Position, float>,
+                      "positions are vec4, vec3 or float triples");
+        static_assert(std::is_same_v<typename I::value_type, uint>, "indices are uint");
+        auto const stride = std::is_same_v<Position, float> ? 3 * sizeof(float) : sizeof(Position);
+        auto const vertexBytes = detail::bufferBytes(positions);
+        auto const indexBytes = detail::bufferBytes(indices);
+        auto geometry = TriangleGeometry{};
+        geometry.positions = vertexBytes.identity;
+        geometry.positionOffset = firstVertex * stride;
+        geometry.stride = static_cast<std::uint32_t>(stride);
+        geometry.vertexCount = static_cast<std::uint32_t>(vertexCount);
+        geometry.positionHost = ConstByteSpan{vertexBytes.host.data(), vertexBytes.size};
+        geometry.indices = indexBytes.identity;
+        geometry.indexOffset = firstIndex * sizeof(uint);
+        geometry.triangleCount = static_cast<std::uint32_t>(triangleCount);
+        geometry.indexHost = ConstByteSpan{indexBytes.host.data(), indexBytes.size};
+        geometry.opaque = opaque;
+        return geometry;
+    }
+};
+
+struct BottomLevelBuild {
+    detail::AccelerationState *state = nullptr; // the backend sets `reference` (and the CPU backend `host`)
+    std::vector<TriangleGeometry> const *geometries = nullptr;
+    BuildOptions options;
+};
+
+struct TopLevelCreation {
+    detail::AccelerationState *state = nullptr; // `count` is the capacity
+    BuildOptions options;
+};
+
+// Device::buildTopLevel: `count` TopLevelInstance from byte `offset` of a buffer.
+struct TopLevelBuild {
+    detail::AccelerationState *state = nullptr;
+    ResourceIdentity const *instances = nullptr;
+    std::size_t offset = 0;
+    std::uint32_t count = 0;
+    ConstByteSpan host; // the whole buffer on the host: the CPU backend's working memory
+};
+
+struct AccelerationBindRequest {
+    std::uint32_t binding = 0;
+    ResourceIdentity const *identity = nullptr;
 };
 
 // A buffer in memory another device exported (Device::importBuffer). The
@@ -745,6 +823,76 @@ struct Device {
         return DeviceBuffer<T>{std::move(state)};
     }
 
+    // A bottom-level acceleration structure of `geometries`, built on the
+    // device's timeline after the work that wrote their buffers (see
+    // BottomLevelAS). Needs KernelFeature::RayQuery.
+    BottomLevelAS createBottomLevel(std::vector<TriangleGeometry> const &geometries, BuildOptions const &options = {}) {
+        auto const limits = info().limits;
+        requireRayQueries("createBottomLevel");
+        if (geometries.empty() or geometries.size() > limits.maxGeometries) {
+            throw DeviceError{"createBottomLevel: " + std::to_string(geometries.size()) + " geometries; this device takes 1 to "
+                              + std::to_string(limits.maxGeometries)};
+        }
+        auto triangles = std::uint64_t{0};
+        for (auto const &geometry : geometries) {
+            auto const vertexEnd = geometry.positionOffset
+                                 + std::uint64_t{geometry.vertexCount} * geometry.stride;
+            auto const indexEnd = geometry.indexOffset + std::uint64_t{geometry.triangleCount} * 3 * sizeof(uint);
+            if (geometry.positions == nullptr or geometry.indices == nullptr or geometry.vertexCount == 0
+                or geometry.triangleCount == 0 or geometry.stride < 3 * sizeof(float) or geometry.stride % 4 != 0
+                or vertexEnd > geometry.positionHost.size() or indexEnd > geometry.indexHost.size()) {
+                throw DeviceError{"createBottomLevel: a geometry is empty or leaves its buffers"};
+            }
+            triangles += geometry.triangleCount;
+        }
+        if (triangles > limits.maxTriangles) {
+            throw DeviceError{"createBottomLevel: " + std::to_string(triangles) + " triangles; this device takes "
+                              + std::to_string(limits.maxTriangles)};
+        }
+        auto state = std::make_shared<detail::AccelerationState>();
+        state->count = static_cast<std::uint32_t>(triangles);
+        doCreateBottomLevel(BottomLevelBuild{state.get(), &geometries, options});
+        return BottomLevelAS{std::move(state)};
+    }
+
+    // A top-level acceleration structure of up to `maxInstances` instances;
+    // nothing is hit until buildTopLevel.
+    TopLevelAS createTopLevel(std::uint32_t const maxInstances, BuildOptions const &options = {}) {
+        requireRayQueries("createTopLevel");
+        if (maxInstances == 0 or maxInstances > info().limits.maxInstances) {
+            throw DeviceError{"createTopLevel: " + std::to_string(maxInstances) + " instances; this device takes 1 to "
+                              + std::to_string(info().limits.maxInstances)};
+        }
+        auto state = std::make_shared<detail::AccelerationState>();
+        state->count = maxInstances;
+        doCreateTopLevel(TopLevelCreation{state.get(), options});
+        return TopLevelAS{std::move(state)};
+    }
+
+    // Rebuilds `tlas` from instances [first, first + count) of `instances`,
+    // a BufferResource the device has or a DeviceBuffer of TopLevelInstance,
+    // on the device's timeline after the work that wrote them.
+    template <class B, std::enable_if_t<detail::IsBufferLike<B>::value, int> = 0>
+    void buildTopLevel(TopLevelAS const &tlas, B const &instances, std::size_t const first, std::uint32_t const count) {
+        static_assert(std::is_same_v<typename B::value_type, TopLevelInstance>, "instances are TopLevelInstance");
+        if (not tlas or count > tlas.capacity() or first > instances.size() or count > instances.size() - first) {
+            throw DeviceError{"buildTopLevel: " + std::to_string(count) + " instances from " + std::to_string(first)
+                              + " leave the buffer or the structure's capacity"};
+        }
+        auto const bytes = detail::bufferBytes(instances);
+        doBuildTopLevel(TopLevelBuild{tlas.shared().get(), bytes.identity, first * sizeof(TopLevelInstance), count,
+                                      ConstByteSpan{bytes.host.data(), bytes.size}});
+    }
+
+    template <std::uint32_t B>
+    void bindAccelerationStructure(AccelerationStructureBinding<B> const &binding) {
+        auto const *structure = binding.attachedStructure();
+        if (structure == nullptr) {
+            throw DeviceError{"binding " + std::to_string(B) + " has no attached TopLevelAS"};
+        }
+        doBindAccelerationStructure(AccelerationBindRequest{B, &structure->identity});
+    }
+
     // `bytes` of device memory to place resources in (see MemoryHeap).
     MemoryHeap createHeap(std::size_t const bytes) {
         if (bytes == 0) {
@@ -1244,6 +1392,23 @@ protected:
         (void)request;
         throw DeviceError{"this device cannot import memory of other devices"};
     }
+    // Acceleration structures; only devices with KernelFeature::RayQuery get here.
+    virtual void doCreateBottomLevel(BottomLevelBuild const &request) {
+        (void)request;
+        throw DeviceError{"acceleration structures are not supported by this backend"};
+    }
+    virtual void doCreateTopLevel(TopLevelCreation const &request) {
+        (void)request;
+        throw DeviceError{"acceleration structures are not supported by this backend"};
+    }
+    virtual void doBuildTopLevel(TopLevelBuild const &request) {
+        (void)request;
+        throw DeviceError{"acceleration structures are not supported by this backend"};
+    }
+    virtual void doBindAccelerationStructure(AccelerationBindRequest const &request) {
+        (void)request;
+        throw DeviceError{"acceleration structures are not supported by this backend"};
+    }
     virtual void doUseKernel(KernelUse const &use) = 0;
     virtual void doBindBuffer(BufferBindRequest const &request) = 0;
     virtual void doBindImage(ImageBindRequest const &request) = 0;
@@ -1314,6 +1479,13 @@ private:
     bool timersOn = false;
     std::uint64_t submitted = 0;
     std::unique_ptr<SharedTransfers> sharedTransfers;
+
+    void requireRayQueries(char const *what) const {
+        if (not uses(info().limits.features, KernelFeature::RayQuery)) {
+            throw DeviceError{std::string{what} + ": " + info().backend + " device '" + info().deviceName
+                              + "' has no ray queries"};
+        }
+    }
 
     template <class T, Dim D>
     static void requireHostData(BufferResource<T, D> const &resource, char const *what) {

@@ -288,6 +288,55 @@ GPU 设备在 `DeviceLimits::features` 含 `KernelFeature::Subgroups` 时才能�
 
 `tc::i64` / `tc::u64`（即 `long long`）转译为 GLSL 的 `int64_t` / `uint64_t`，可以用在 buffer 元素、局部变量和运算中，buffer 里的 64 位元素也可以做原子操作。`std::int64_t` 在 Linux 上是 `long`，和 `std::size_t` 一样在 GPU 上仍是 32 位，转译器会对这样的局部变量给出警告。用到它们的 kernel 需要 `KernelFeature::Int64`，原子操作还需要 `KernelFeature::Int64Atomics`。GLSL ES 没有 64 位整数，这类 kernel 在 `gles` 后端上会被拒绝。
 
+## 光线查询
+
+kernel 可以用 `GL_EXT_ray_query` 在加速结构里追踪光线，函数和常量沿用 GLSL 的名字：
+
+```cpp
+struct TC_KERNEL Trace {
+    static constexpr char fileLocation[] = "trace";
+    uvec3 local_size{64, 1, 1};
+    AccelerationStructureBinding<0> scene;            // uniform accelerationStructureEXT
+    BufferBinding<vec4, 1> hits;
+
+    void main() {
+        rayQueryEXT query;                            // 只能是局部变量
+        rayQueryInitializeEXT(query, scene, gl_RayFlagsNoneEXT, 0xFFu, origin, 0.0f, direction, 1e30f);
+        while (rayQueryProceedEXT(query)) {           // 只在不透明标记以外的三角形上停下
+            if (keeps(rayQueryGetIntersectionPrimitiveIndexEXT(query, false))) {
+                rayQueryConfirmIntersectionEXT(query);
+            }
+        }
+        if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+            hits[i] = vec4(rayQueryGetIntersectionBarycentricsEXT(query, true), rayQueryGetIntersectionTEXT(query, true), 0.0f);
+        }
+    }
+};
+```
+
+```cpp
+auto const blas = device->createBottomLevel({tc::TriangleGeometry::of(positions, firstVertex, vertexCount,
+                                                                      indices, firstIndex, triangleCount)});
+auto const tlas = device->createTopLevel(maxInstances);
+device->buildTopLevel(tlas, instances, 0, count);   // instances：TopLevelInstance 的 buffer，可以由 kernel 写
+kernel.scene.attach(tlas);
+device->bindAccelerationStructure(kernel.scene);
+```
+
+- 支持的函数：`rayQueryInitializeEXT`、`rayQueryProceedEXT`、`rayQueryTerminateEXT`、`rayQueryConfirmIntersectionEXT`，以及候选和已提交交点的 `rayQueryGetIntersection` 系列：`Type`、`T`、`Barycentrics`、`FrontFace`、`InstanceCustomIndex`、`InstanceId`、`PrimitiveIndex`、`GeometryIndex`、`ObjectToWorld`、`WorldToObject`；射线标志 `gl_RayFlags*EXT`。没有 AABB 几何。用到它们的 kernel 需要 `KernelFeature::RayQuery`，转译器自动记下，不需要声明。
+- 底层（`BottomLevelAS`）是一个或多个几何的三角形：位置是 buffer 里的 xyz（`vec4`、`vec3`，或每 3 个 `float` 一个点），索引是 `uint`，从几何的第一个顶点算起；几何可以标成不透明以外，`rayQueryProceedEXT` 在它们的三角形上停下，由 kernel 决定。
+- 顶层（`TopLevelAS`）有固定的容量，`buildTopLevel` 每次从一个 `TopLevelInstance` 的 buffer 重建。`TopLevelInstance` 与 `VkAccelerationStructureInstanceKHR` 逐字节相同（按行存放的 3×4 变换、24 位自定义索引加 8 位掩码、标志、`uvec2` 形式的底层引用 `BottomLevelAS::reference()`），kernel 能通过 `BufferBinding<TopLevelInstance>` 写它，顶层就整个在 GPU 上更新；主机上用 `makeInstance` 填。
+- 构建在设备时间线上，与前后的 dispatch 按读写关系排序。顶层不持有它引用的底层：顶层还可能被追踪期间，底层必须活着。
+- 正反面在物体空间里判定：从射线起点看，三角形的三个角逆时针排列就是正面，实例变换（包括镜像）不改变它；`instanceTriangleFlipFacing` 翻转它。这是本机 NVIDIA 和 lavapipe 的 Vulkan 驱动给出的结果，CPU 后端与它一致。
+
+| 后端 | 光线查询 |
+|---|---|
+| `vulkan` | Vulkan 1.2 加 `VK_KHR_acceleration_structure`、`VK_KHR_ray_query`、`VK_KHR_deferred_host_operations`；这类 kernel 编成 SPIR-V 1.5（`#version 460`）。有它时所有 buffer 都带设备地址 |
+| `opengl` / `gles` | 没有；这类 kernel 只生成 Vulkan 版本，`checkKernel` 报告原因，创建加速结构抛 `DeviceError` |
+| `cpu` | 在主机上建 BVH（分箱 SAH），按距离由近到远遍历，候选的顺序因此与 GPU 不同，最近的交点相同 |
+
+本机 RTX 5070 Ti 和 lavapipe 上，测试场景里每条射线的交点（实例、几何、三角形、正反面）与 CPU 相同，t 和重心坐标相差不到 1e-4。
+
 ## 中等精度
 
 ```cpp
@@ -510,7 +559,7 @@ adb shell rm -rf /data/local/tmp/tc_compute
 - 一次转译产出三种方言和 SPIR-V；Vulkan 的 uniform 自动放进 push constant 块，偏移由转译器计算并写入反射数据。
 - 增加了 std430 布局检查和 binding 读写推断。
 - 增加了表（紧凑字流、AOS/SOA、字段编码），思路来自上文提到的知乎文章；布局和编码器写成普通 C++，由转译器照常转译。
-- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像和 buffer、内存堆与资源别名、传输队列、导入其他设备的内存、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
+- 增加了 kernel 模板、间接调度、mip / 数组 / 16 位浮点 / 压缩纹理（含压缩纹理数组）、只在设备上的图像和 buffer、内存堆与资源别名、传输队列、导入其他设备的内存、光线查询与加速结构、子组与 64 位整数、中等精度、异步提交与按需屏障、按提交取计时、外部帧写入与 sync file、开发时重新加载，以及可替换的 CPU 线程池。
 
 ## 已知限制
 

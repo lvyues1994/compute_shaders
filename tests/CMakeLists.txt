@@ -27,11 +27,13 @@ add_executable(tc_equivalence_tests
     compressed_tests.cpp
     memory_tests.cpp
     transfer_tests.cpp
+    ray_query_tests.cpp
     kernels/feature_kernels.hpp
     kernels/dispatch_kernels.hpp
     kernels/texture_kernels.hpp
     kernels/subgroup_kernels.hpp
-    kernels/memory_kernels.hpp)
+    kernels/memory_kernels.hpp
+    kernels/ray_query_kernels.hpp)
 target_include_directories(tc_equivalence_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/examples ${PROJECT_SOURCE_DIR}/examples/common/include)
 # A plain Vulkan device exports the memory the import tests share.
@@ -48,6 +50,7 @@ tc_add_kernels(tc_equivalence_tests HEADERS
     kernels/texture_kernels.hpp
     kernels/subgroup_kernels.hpp
     kernels/memory_kernels.hpp
+    kernels/ray_query_kernels.hpp
     ${PROJECT_SOURCE_DIR}/examples/game_of_life/game_of_life.hpp
     ${PROJECT_SOURCE_DIR}/examples/raytracer/raytracer.hpp
     ${PROJECT_SOURCE_DIR}/examples/nv12_to_rgba/nv12_to_rgba.hpp

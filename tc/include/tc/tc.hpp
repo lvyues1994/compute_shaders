@@ -21,6 +21,7 @@
 #include <tc/mat.hpp>
 #include <tc/mip_chain.hpp>
 #include <tc/pixel.hpp>
+#include <tc/ray_query.hpp>
 #include <tc/shared.hpp>
 #include <tc/subgroup.hpp>
 #include <tc/table.hpp>

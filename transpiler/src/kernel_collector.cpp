@@ -326,6 +326,14 @@ bool classifyField(clang::FieldDecl const *field, KernelModel &model, clang::AST
         model.externalTextures.push_back(texture);
         return true;
     }
+    if (auto const *spec = asTcSpecialization(field->getType(), "AccelerationStructureBinding")) {
+        auto structure = AccelerationStructureModel{};
+        structure.name = name;
+        structure.binding = static_cast<std::uint32_t>(templateIntArg(spec, 0));
+        structure.field = field;
+        model.accelerationStructures.push_back(structure);
+        return true;
+    }
     if (auto const *spec = asTcSpecialization(field->getType(), "Uniform")) {
         auto const valueType = templateTypeArg(spec, 0);
         auto const type = uniformTypeOf(valueType);
@@ -381,6 +389,9 @@ bool checkUniqueSlots(KernelModel const &model, Diagnostics &diags) {
     }
     for (auto const &texture : model.externalTextures) {
         claim(texture.binding, texture.field);
+    }
+    for (auto const &structure : model.accelerationStructures) {
+        claim(structure.binding, structure.field);
     }
     auto locations = std::map<std::uint32_t, clang::FieldDecl const *>{};
     for (auto const &uniform : model.uniforms) {

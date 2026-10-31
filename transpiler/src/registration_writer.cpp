@@ -80,6 +80,8 @@ std::string resourceSlot(ResourceArtifact const &resource) {
     text += "        slot.access = " + std::string{accessName(resource.access)} + ";\n";
     if (resource.kind == tc::ResourceKind::ExternalTexture) {
         text += "        slot.kind = tc::ResourceKind::ExternalTexture;\n";
+    } else if (resource.kind == tc::ResourceKind::AccelerationStructure) {
+        text += "        slot.kind = tc::ResourceKind::AccelerationStructure;\n";
     } else if (resource.kind != tc::ResourceKind::StorageBuffer) {
         auto const isTexture = resource.kind == tc::ResourceKind::SampledTexture;
         text += isTexture ? "        slot.kind = tc::ResourceKind::SampledTexture;\n"

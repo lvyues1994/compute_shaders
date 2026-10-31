@@ -20,6 +20,8 @@ char const *featureName(KernelFeature const feature) {
         return "64-bit integers";
     case KernelFeature::Int64Atomics:
         return "64-bit atomics";
+    case KernelFeature::RayQuery:
+        return "ray queries";
     }
     return "an optional feature";
 }
@@ -30,6 +32,7 @@ std::optional<std::string> exceedsLimits(KernelProgram const &program, DeviceLim
     auto buffers = std::uint32_t{0};
     auto images = std::uint32_t{0};
     auto textures = std::uint32_t{0};
+    auto structures = std::uint32_t{0};
     for (auto const &slot : program.resources) {
         switch (slot.kind) {
         case ResourceKind::StorageBuffer:
@@ -43,7 +46,13 @@ std::optional<std::string> exceedsLimits(KernelProgram const &program, DeviceLim
         case ResourceKind::ExternalTexture:
             ++textures;
             break;
+        case ResourceKind::AccelerationStructure:
+            ++structures;
+            break;
         }
+    }
+    if (structures > limits.accelerationStructures and uses(limits.features, KernelFeature::RayQuery)) {
+        return over(program, "acceleration structures", structures, limits.accelerationStructures);
     }
     if (buffers > limits.storageBuffers) {
         return over(program, "storage buffers", buffers, limits.storageBuffers);
@@ -73,7 +82,7 @@ std::optional<std::string> exceedsLimits(KernelProgram const &program, DeviceLim
                     *limits.pushConstantBytes);
     }
     for (auto const feature : {KernelFeature::Double, KernelFeature::Subgroups, KernelFeature::Int64,
-                               KernelFeature::Int64Atomics}) {
+                               KernelFeature::Int64Atomics, KernelFeature::RayQuery}) {
         if (uses(program.features, feature) and not uses(limits.features, feature)) {
             return "kernel '" + std::string{program.name} + "' uses " + featureName(feature)
                  + ", which this device does not support";

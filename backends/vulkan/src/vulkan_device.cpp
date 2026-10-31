@@ -192,6 +192,16 @@ struct VulkanContext {
     bool timelineSemaphores = false;
     bool memoryImport = false; // opaque fds of other devices' memory (VK_KHR_external_memory_fd)
     std::optional<GpuIdentity> gpu;
+    // Ray queries: VK_KHR_acceleration_structure and VK_KHR_ray_query, with
+    // buffer device addresses.
+    bool rayQuery = false;
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationProperties{};
+    PFN_vkGetAccelerationStructureBuildSizesKHR getBuildSizes = nullptr;
+    PFN_vkCreateAccelerationStructureKHR createStructure = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR destroyStructure = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR buildStructures = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR structureAddress = nullptr;
+    PFN_vkGetBufferDeviceAddress bufferAddress = nullptr;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
@@ -269,6 +279,20 @@ struct ImageMirror {
     std::uint32_t levels = 1;
     VkImageUsageFlags usage = 0;
     std::optional<CompressedFormat> compressed; // a block-compressed texture: `format` is unused
+};
+
+// An acceleration structure and the buffer it lives in; a top level keeps
+// the scratch memory of its builds.
+struct StructureMirror {
+    std::weak_ptr<void const> owner;
+    DeviceObject<VkDeviceMemory> memory;
+    DeviceObject<VkBuffer> buffer;
+    DeviceObject<VkAccelerationStructureKHR> structure;
+    DeviceObject<VkDeviceMemory> scratchMemory;
+    DeviceObject<VkBuffer> scratch;
+    VkDeviceAddress scratchAddress = 0;
+    bool topLevel = false;
+    std::uint64_t serial = 0; // a bottom level's byte of the bottom-levels hazard key
 };
 
 std::uint32_t layerCount(Dim const dim, ivec3 const extent) {
@@ -399,6 +423,8 @@ VkDescriptorType descriptorType(ResourceKind const kind) {
     case ResourceKind::SampledTexture:
     case ResourceKind::ExternalTexture:
         return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    case ResourceKind::AccelerationStructure:
+        return VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     }
     return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 }
@@ -557,6 +583,14 @@ struct VulkanDevice final : Device {
                 }
             }
         }
+        if (context->rayQuery) {
+            auto const &acceleration = context->accelerationProperties;
+            limits.features |= static_cast<std::uint32_t>(KernelFeature::RayQuery);
+            limits.accelerationStructures = acceleration.maxPerStageDescriptorAccelerationStructures;
+            limits.maxInstances = acceleration.maxInstanceCount;
+            limits.maxTriangles = acceleration.maxPrimitiveCount;
+            limits.maxGeometries = acceleration.maxGeometryCount;
+        }
         return result;
     }
 
@@ -581,6 +615,10 @@ protected:
     PlacementSize doImagePlacement(ImageCreation const &request) override;
     void doCopyBuffer(BufferCopy const &copy) override;
     void doImportBuffer(BufferImport const &request) override;
+    void doCreateBottomLevel(BottomLevelBuild const &request) override;
+    void doCreateTopLevel(TopLevelCreation const &request) override;
+    void doBuildTopLevel(TopLevelBuild const &request) override;
+    void doBindAccelerationStructure(AccelerationBindRequest const &request) override;
     void doUseKernel(KernelUse const &use) override;
     void doBindBuffer(BufferBindRequest const &request) override;
     void doBindImage(ImageBindRequest const &request) override;
@@ -616,6 +654,17 @@ private:
         }
     }
     DeviceObject<VkSemaphore> makeTimelineSemaphore();
+    // Memory that buffers with device addresses may use (ray queries).
+    static VkMemoryAllocateFlagsInfo addressableMemory() {
+        auto flags = vkStruct<VkMemoryAllocateFlagsInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        return flags;
+    }
+    VkDeviceAddress addressOf(VkBuffer buffer) const;
+    // A device-local buffer with a device address, for acceleration structures and their scratch.
+    void addressedBuffer(VkDeviceSize size, VkBufferUsageFlags usage, DeviceObject<VkBuffer> &buffer,
+                         DeviceObject<VkDeviceMemory> &memory);
+    void createStructure(StructureMirror &mirror, VkAccelerationStructureTypeKHR type, VkDeviceSize size);
     // The region of a copyBufferToImage, from byte `offset` of its buffer.
     static VkBufferImageCopy regionOf(BufferImageCopy const &copy);
     VkSampler samplerFor(Filter filter, Wrap wrap, Mip mip);
@@ -704,6 +753,12 @@ private:
     PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
     std::unordered_map<void const *, HeapMirror> heaps;
     std::unordered_map<void const *, BufferMirror> buffers;
+    std::unordered_map<void const *, StructureMirror> structures;
+    VkBufferUsageFlags bufferUsage = kBufferUsage; // plus device addresses with ray queries
+    // A top-level build and a ray query read every bottom level, which the
+    // hazard tracker sees as one key with a byte per bottom level.
+    char bottomLevelsTag = 0;
+    std::uint64_t bottomLevelSerial = 0;
     std::unordered_map<void const *, ImageMirror> images;
     std::unordered_map<void const *, ExternalMirror> externals;
     std::unordered_map<void const *, ExternalImageMirror> externalImages;
@@ -717,6 +772,7 @@ private:
     std::map<std::uint32_t, BoundTexture> boundTextures;
     std::map<std::uint32_t, void const *> boundExternals;
     std::map<std::uint32_t, void const *> boundExternalImages;
+    std::map<std::uint32_t, void const *> boundStructures;
     std::map<std::uint32_t, bool> uniformsSet;
     std::array<std::byte, 256> pushConstants{};
 
@@ -931,6 +987,10 @@ VulkanDevice::VulkanDevice(VulkanDeviceConfig const &config) {
     check(vkCreateCommandPool(device.handle, &poolInfo, nullptr, &pool), "vkCreateCommandPool");
     commandPool = DeviceObject<VkCommandPool>{device.handle, pool, vkDestroyCommandPool};
     concurrentFamilies = {queueFamily, context->transferFamily.value_or(queueFamily)};
+    if (context->rayQuery) {
+        bufferUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                     | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    }
     if (context->transferQueue != VK_NULL_HANDLE) {
         mainTimeline = makeTimelineSemaphore();
         transferQueue = std::make_unique<Transfers>(*this);
@@ -1073,8 +1133,18 @@ void VulkanDevice::createLogicalDevice() {
     auto atomicInt64 =
         vkStruct<VkPhysicalDeviceShaderAtomicInt64Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES);
     void *chain = nullptr;
+    auto accelerationFeatures = vkStruct<VkPhysicalDeviceAccelerationStructureFeaturesKHR>(
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+    auto rayQueryFeatures =
+        vkStruct<VkPhysicalDeviceRayQueryFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR);
     if (vulkan12) {
+        auto supportedRayQuery =
+            vkStruct<VkPhysicalDeviceRayQueryFeaturesKHR>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR);
+        auto supportedAcceleration = vkStruct<VkPhysicalDeviceAccelerationStructureFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+        supportedAcceleration.pNext = &supportedRayQuery;
         auto supported12 = vkStruct<VkPhysicalDeviceVulkan12Features>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+        supported12.pNext = &supportedAcceleration;
         auto features2 = vkStruct<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
         features2.pNext = &supported12;
         vkGetPhysicalDeviceFeatures2(physical, &features2);
@@ -1087,6 +1157,27 @@ void VulkanDevice::createLogicalDevice() {
             context->timelineSemaphores = true;
         }
         chain = &vulkan12Features;
+        if (supported12.bufferDeviceAddress == VK_TRUE and supportedAcceleration.accelerationStructure == VK_TRUE
+            and supportedRayQuery.rayQuery == VK_TRUE
+            and hasDeviceExtension(physical, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)
+            and hasDeviceExtension(physical, VK_KHR_RAY_QUERY_EXTENSION_NAME)
+            and hasDeviceExtension(physical, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+            vulkan12Features.bufferDeviceAddress = VK_TRUE;
+            accelerationFeatures.accelerationStructure = VK_TRUE;
+            rayQueryFeatures.rayQuery = VK_TRUE;
+            accelerationFeatures.pNext = &rayQueryFeatures;
+            vulkan12Features.pNext = &accelerationFeatures;
+            extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+            extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+            extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+            context->rayQuery = true;
+            context->accelerationProperties = vkStruct<VkPhysicalDeviceAccelerationStructurePropertiesKHR>(
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR);
+            auto properties2 = vkStruct<VkPhysicalDeviceProperties2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
+            properties2.pNext = &context->accelerationProperties;
+            vkGetPhysicalDeviceProperties2(physical, &properties2);
+            context->accelerationProperties.pNext = nullptr;
+        }
     } else if (vulkan11 and context->int64 and hasDeviceExtension(physical, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
         auto features2 = vkStruct<VkPhysicalDeviceFeatures2>(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
         features2.pNext = &atomicInt64;
@@ -1162,6 +1253,23 @@ void VulkanDevice::createLogicalDevice() {
         context->transferIndex = transfer->second;
         vkGetDeviceQueue(device.handle, transfer->first, transfer->second, &context->transferQueue);
     }
+    if (context->rayQuery) {
+        auto const load = [&](char const *name) { return vkGetDeviceProcAddr(device.handle, name); };
+        context->getBuildSizes = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+            load("vkGetAccelerationStructureBuildSizesKHR"));
+        context->createStructure =
+            reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(load("vkCreateAccelerationStructureKHR"));
+        context->destroyStructure =
+            reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(load("vkDestroyAccelerationStructureKHR"));
+        context->buildStructures =
+            reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(load("vkCmdBuildAccelerationStructuresKHR"));
+        context->structureAddress = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+            load("vkGetAccelerationStructureDeviceAddressKHR"));
+        context->bufferAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(load("vkGetBufferDeviceAddress"));
+        context->rayQuery = context->getBuildSizes != nullptr and context->createStructure != nullptr
+                        and context->destroyStructure != nullptr and context->buildStructures != nullptr
+                        and context->structureAddress != nullptr and context->bufferAddress != nullptr;
+    }
     if (context->syncFdImport or context->syncFdExport) {
         getSemaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device.handle, "vkGetSemaphoreFdKHR"));
         importSemaphoreFd =
@@ -1220,6 +1328,8 @@ DeviceObject<VkDeviceMemory> VulkanDevice::allocate(VkMemoryRequirements const &
     auto info = vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
     info.allocationSize = requirements.size;
     info.memoryTypeIndex = memoryType(requirements.memoryTypeBits, flags);
+    auto const addressable = addressableMemory();
+    info.pNext = context->rayQuery ? &addressable : nullptr;
     auto memory = VkDeviceMemory{};
     check(vkAllocateMemory(device.handle, &info, nullptr, &memory), "vkAllocateMemory");
     return DeviceObject<VkDeviceMemory>{device.handle, memory, vkFreeMemory};
@@ -1235,7 +1345,7 @@ std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity co
     allocation->context = context;
     auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     info.size = bytes;
-    info.usage = kBufferUsage;
+    info.usage = bufferUsage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     shareAcrossQueues(info);
     auto buffer = VkBuffer{};
@@ -1251,6 +1361,8 @@ std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity co
     auto allocateInfo = vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
     allocateInfo.allocationSize = requirements.size;
     allocateInfo.memoryTypeIndex = type;
+    auto const addressable = addressableMemory();
+    allocateInfo.pNext = context->rayQuery ? &addressable : nullptr;
     auto memory = VkDeviceMemory{};
     check(vkAllocateMemory(device.handle, &allocateInfo, nullptr, &memory), "vkAllocateMemory");
     allocation->memory = DeviceObject<VkDeviceMemory>{device.handle, memory, vkFreeMemory};
@@ -1291,10 +1403,11 @@ StagingChunk VulkanDevice::makeStaging(VkDeviceSize const capacity) {
 DeviceObject<VkDescriptorPool> VulkanDevice::makeDescriptorPool() {
     VkDescriptorPoolSize const sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512},
                                           {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512},
-                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512}};
+                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512},
+                                          {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 128}};
     auto info = vkStruct<VkDescriptorPoolCreateInfo>(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
     info.maxSets = 128;
-    info.poolSizeCount = 3;
+    info.poolSizeCount = context->rayQuery ? 4 : 3;
     info.pPoolSizes = sizes;
     auto pool = VkDescriptorPool{};
     check(vkCreateDescriptorPool(device.handle, &info, nullptr, &pool), "vkCreateDescriptorPool");
@@ -1622,6 +1735,14 @@ VkDescriptorSet VulkanDevice::allocateSet(VkDescriptorSetLayout const layout) {
 // with them.
 void VulkanDevice::collectGarbage() {
     retireCompleted();
+    for (auto it = structures.begin(); it != structures.end();) {
+        if (it->second.owner.expired()) {
+            bury(std::move(it->second));
+            it = structures.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = heaps.begin(); it != heaps.end();) {
         if (it->second.owner.expired()) {
             bury(std::move(it->second));
@@ -1692,7 +1813,7 @@ void VulkanDevice::doUploadBuffer(ResourceIdentity const &identity, ConstByteSpa
         mirror.owner = identity.watch();
         auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
         info.size = bytes.size();
-        info.usage = kBufferUsage;
+        info.usage = bufferUsage;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         shareAcrossQueues(info);
         auto buffer = VkBuffer{};
@@ -1838,7 +1959,7 @@ PlacementSize VulkanDevice::placementOf(VkMemoryRequirements const &requirements
 PlacementSize VulkanDevice::doBufferPlacement(std::size_t const bytes) {
     auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     info.size = bytes;
-    info.usage = kBufferUsage;
+    info.usage = bufferUsage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     shareAcrossQueues(info);
     auto buffer = VkBuffer{};
@@ -1865,7 +1986,7 @@ bool VulkanDevice::doCreateHeap(HeapCreation const &request) {
     collectGarbage();
     auto bufferInfo = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     bufferInfo.size = 256;
-    bufferInfo.usage = kBufferUsage;
+    bufferInfo.usage = bufferUsage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     shareAcrossQueues(bufferInfo);
     auto buffer = VkBuffer{};
@@ -1895,6 +2016,8 @@ bool VulkanDevice::doCreateHeap(HeapCreation const &request) {
     auto info = vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
     info.allocationSize = request.bytes;
     info.memoryTypeIndex = heap.memoryType;
+    auto const addressable = addressableMemory();
+    info.pNext = context->rayQuery ? &addressable : nullptr;
     auto memory = VkDeviceMemory{};
     check(vkAllocateMemory(device.handle, &info, nullptr, &memory), "vkAllocateMemory (heap)");
     heap.memory = std::make_shared<DeviceObject<VkDeviceMemory>>(device.handle, memory, vkFreeMemory);
@@ -1922,7 +2045,7 @@ bool VulkanDevice::doCreateDeviceBuffer(BufferCreation const &request) {
     mirror.owner = request.identity->watch();
     auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     info.size = request.bytes;
-    info.usage = kBufferUsage;
+    info.usage = bufferUsage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     shareAcrossQueues(info);
     auto buffer = VkBuffer{};
@@ -1975,7 +2098,7 @@ void VulkanDevice::doImportBuffer(BufferImport const &request) {
     auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
     info.pNext = &externalBuffer;
     info.size = request.bytes;
-    info.usage = kBufferUsage;
+    info.usage = kBufferUsage; // no device address: the exporter's memory need not have one
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     auto buffer = VkBuffer{};
     check(vkCreateBuffer(device.handle, &info, nullptr, &buffer), "vkCreateBuffer (imported)");
@@ -2001,6 +2124,205 @@ void VulkanDevice::doImportBuffer(BufferImport const &request) {
     check(vkBindBufferMemory(device.handle, buffer, raw, memory.offset), "vkBindBufferMemory (imported)");
     mirror.size = request.bytes;
     buffers[request.identity->key()] = std::move(mirror);
+}
+
+VkDeviceAddress VulkanDevice::addressOf(VkBuffer const buffer) const {
+    auto info = vkStruct<VkBufferDeviceAddressInfo>(VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO);
+    info.buffer = buffer;
+    return context->bufferAddress(device.handle, &info);
+}
+
+void VulkanDevice::addressedBuffer(VkDeviceSize const size, VkBufferUsageFlags const usage,
+                                   DeviceObject<VkBuffer> &buffer, DeviceObject<VkDeviceMemory> &memory) {
+    auto info = vkStruct<VkBufferCreateInfo>(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+    info.size = size;
+    info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    auto raw = VkBuffer{};
+    check(vkCreateBuffer(device.handle, &info, nullptr, &raw), "vkCreateBuffer (acceleration structure)");
+    auto created = DeviceObject<VkBuffer>{device.handle, raw, vkDestroyBuffer};
+    auto requirements = VkMemoryRequirements{};
+    vkGetBufferMemoryRequirements(device.handle, raw, &requirements);
+    auto allocated = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    check(vkBindBufferMemory(device.handle, raw, allocated.get(), 0), "vkBindBufferMemory (acceleration structure)");
+    memory = std::move(allocated);
+    buffer = std::move(created);
+}
+
+void VulkanDevice::createStructure(StructureMirror &mirror, VkAccelerationStructureTypeKHR const type,
+                                   VkDeviceSize const size) {
+    addressedBuffer(size, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, mirror.buffer, mirror.memory);
+    auto info = vkStruct<VkAccelerationStructureCreateInfoKHR>(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR);
+    info.buffer = mirror.buffer.get();
+    info.size = size;
+    info.type = type;
+    auto structure = VkAccelerationStructureKHR{};
+    check(context->createStructure(device.handle, &info, nullptr, &structure), "vkCreateAccelerationStructureKHR");
+    mirror.structure = DeviceObject<VkAccelerationStructureKHR>{device.handle, structure, context->destroyStructure};
+}
+
+namespace {
+
+VkBuildAccelerationStructureFlagsKHR buildFlags(BuildOptions const &options) {
+    return options.preferFastBuild ? VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR
+                                   : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+}
+
+VkDeviceAddress alignUp(VkDeviceAddress const address, VkDeviceSize const alignment) {
+    return alignment == 0 ? address : (address + alignment - 1) / alignment * alignment;
+}
+
+} // namespace
+
+// Records the build in the current batch, after the work that wrote the
+// geometry; the scratch memory goes to the graveyard with it.
+void VulkanDevice::doCreateBottomLevel(BottomLevelBuild const &request) {
+    collectGarbage();
+    auto geometries = std::vector<VkAccelerationStructureGeometryKHR>{};
+    auto ranges = std::vector<VkAccelerationStructureBuildRangeInfoKHR>{};
+    auto counts = std::vector<std::uint32_t>{};
+    auto accesses = std::vector<detail::ResourceAccess>{};
+    auto used = std::vector<void const *>{};
+    for (auto const &geometry : *request.geometries) {
+        auto const positions = buffers.find(geometry.positions->key());
+        auto const indices = buffers.find(geometry.indices->key());
+        if (positions == buffers.end() or indices == buffers.end()) {
+            throw DeviceError{"createBottomLevel: a geometry buffer was never uploaded to this device"};
+        }
+        if (positions->second.imported or indices->second.imported) {
+            throw DeviceError{"createBottomLevel: imported buffers have no device address"};
+        }
+        auto triangles = vkStruct<VkAccelerationStructureGeometryTrianglesDataKHR>(
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR);
+        triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        triangles.vertexData.deviceAddress = addressOf(positions->second.handle()) + geometry.positionOffset;
+        triangles.vertexStride = geometry.stride;
+        triangles.maxVertex = geometry.vertexCount - 1;
+        triangles.indexType = VK_INDEX_TYPE_UINT32;
+        triangles.indexData.deviceAddress = addressOf(indices->second.handle()) + geometry.indexOffset;
+        auto entry = vkStruct<VkAccelerationStructureGeometryKHR>(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR);
+        entry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        entry.geometry.triangles = triangles;
+        entry.flags = geometry.opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+        geometries.push_back(entry);
+        ranges.push_back(VkAccelerationStructureBuildRangeInfoKHR{geometry.triangleCount, 0, 0, 0});
+        counts.push_back(geometry.triangleCount);
+        accesses.push_back(access(geometry.positions->key(), geometry.positionOffset,
+                                  std::size_t{geometry.vertexCount} * geometry.stride, true, false));
+        accesses.push_back(access(geometry.indices->key(), geometry.indexOffset,
+                                  std::size_t{geometry.triangleCount} * 3 * sizeof(uint), true, false));
+        used.push_back(geometry.positions->key());
+        used.push_back(geometry.indices->key());
+    }
+    auto build = vkStruct<VkAccelerationStructureBuildGeometryInfoKHR>(
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR);
+    build.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    build.flags = buildFlags(request.options);
+    build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    build.geometryCount = static_cast<std::uint32_t>(geometries.size());
+    build.pGeometries = geometries.data();
+    auto sizes = vkStruct<VkAccelerationStructureBuildSizesInfoKHR>(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR);
+    context->getBuildSizes(device.handle, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build, counts.data(), &sizes);
+    auto const &identity = request.state->identity;
+    auto &mirror = structures[identity.key()];
+    mirror = StructureMirror{};
+    mirror.owner = identity.watch();
+    mirror.serial = bottomLevelSerial++;
+    createStructure(mirror, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, sizes.accelerationStructureSize);
+    auto scratch = StructureMirror{};
+    auto const alignment = context->accelerationProperties.minAccelerationStructureScratchOffsetAlignment;
+    addressedBuffer(sizes.buildScratchSize + alignment, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, scratch.scratch,
+                    scratch.scratchMemory);
+    build.dstAccelerationStructure = mirror.structure.get();
+    build.scratchData.deviceAddress = alignUp(addressOf(scratch.scratch.get()), alignment);
+    accesses.push_back(detail::ResourceAccess{identity.key(), 0, 0, false, true});
+    accesses.push_back(detail::ResourceAccess{&bottomLevelsTag, mirror.serial, 1, false, true});
+    auto const cmd = commandFor(accesses);
+    for (auto const *key : used) {
+        claim(cmd, key);
+    }
+    auto const *rangePointer = ranges.data();
+    context->buildStructures(cmd, 1, &build, &rangePointer);
+    bury(std::move(scratch));
+    auto addressInfo = vkStruct<VkAccelerationStructureDeviceAddressInfoKHR>(
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR);
+    addressInfo.accelerationStructure = mirror.structure.get();
+    request.state->reference = context->structureAddress(device.handle, &addressInfo);
+}
+
+// Sized for its capacity, with scratch memory every build reuses: builds
+// of one top level are ordered by the writes to it.
+void VulkanDevice::doCreateTopLevel(TopLevelCreation const &request) {
+    collectGarbage();
+    auto instances = vkStruct<VkAccelerationStructureGeometryInstancesDataKHR>(
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR);
+    auto geometry = vkStruct<VkAccelerationStructureGeometryKHR>(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR);
+    geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    geometry.geometry.instances = instances;
+    auto build = vkStruct<VkAccelerationStructureBuildGeometryInfoKHR>(
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR);
+    build.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    build.flags = buildFlags(request.options);
+    build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    build.geometryCount = 1;
+    build.pGeometries = &geometry;
+    auto sizes = vkStruct<VkAccelerationStructureBuildSizesInfoKHR>(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR);
+    auto const capacity = request.state->count;
+    context->getBuildSizes(device.handle, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build, &capacity, &sizes);
+    auto const &identity = request.state->identity;
+    auto &mirror = structures[identity.key()];
+    mirror = StructureMirror{};
+    mirror.owner = identity.watch();
+    mirror.topLevel = true;
+    createStructure(mirror, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizes.accelerationStructureSize);
+    auto const alignment = context->accelerationProperties.minAccelerationStructureScratchOffsetAlignment;
+    addressedBuffer(sizes.buildScratchSize + alignment, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mirror.scratch,
+                    mirror.scratchMemory);
+    mirror.scratchAddress = alignUp(addressOf(mirror.scratch.get()), alignment);
+}
+
+void VulkanDevice::doBuildTopLevel(TopLevelBuild const &request) {
+    auto const found = buffers.find(request.instances->key());
+    if (found == buffers.end()) {
+        throw DeviceError{"buildTopLevel: the instance buffer was never uploaded to this device"};
+    }
+    if (found->second.imported) {
+        throw DeviceError{"buildTopLevel: imported buffers have no device address"};
+    }
+    auto const &identity = request.state->identity;
+    auto &mirror = structures.at(identity.key());
+    auto instances = vkStruct<VkAccelerationStructureGeometryInstancesDataKHR>(
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR);
+    instances.data.deviceAddress = addressOf(found->second.handle()) + request.offset;
+    auto geometry = vkStruct<VkAccelerationStructureGeometryKHR>(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR);
+    geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    geometry.geometry.instances = instances;
+    auto build = vkStruct<VkAccelerationStructureBuildGeometryInfoKHR>(
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR);
+    build.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    build.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    build.geometryCount = 1;
+    build.pGeometries = &geometry;
+    build.dstAccelerationStructure = mirror.structure.get();
+    build.scratchData.deviceAddress = mirror.scratchAddress;
+    auto const cmd = commandFor({access(request.instances->key(), request.offset,
+                                        std::size_t{request.count} * sizeof(TopLevelInstance), true, false),
+                                 detail::ResourceAccess{&bottomLevelsTag, 0, 0, true, false},
+                                 detail::ResourceAccess{identity.key(), 0, 0, false, true}});
+    claim(cmd, request.instances->key());
+    auto const range = VkAccelerationStructureBuildRangeInfoKHR{request.count, 0, 0, 0};
+    auto const *rangePointer = &range;
+    context->buildStructures(cmd, 1, &build, &rangePointer);
+}
+
+void VulkanDevice::doBindAccelerationStructure(AccelerationBindRequest const &request) {
+    auto const it = structures.find(request.identity->key());
+    if (it == structures.end() or not it->second.topLevel) {
+        throw DeviceError{"bindAccelerationStructure: binding " + std::to_string(request.binding)
+                          + " refers to no top level of this device"};
+    }
+    boundStructures[request.binding] = request.identity->key();
 }
 
 void VulkanDevice::claim(VkCommandBuffer const cmd, void const *const key) {
@@ -2323,6 +2645,7 @@ void VulkanDevice::doUseKernel(KernelUse const &use) {
     boundTextures.clear();
     boundExternals.clear();
     boundExternalImages.clear();
+    boundStructures.clear();
     uniformsSet.clear();
 }
 
@@ -2695,8 +3018,12 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
 
     auto bufferInfos = std::vector<VkDescriptorBufferInfo>{};
     auto imageInfos = std::vector<VkDescriptorImageInfo>{};
+    auto structureHandles = std::vector<VkAccelerationStructureKHR>{};
+    auto structureWrites = std::vector<VkWriteDescriptorSetAccelerationStructureKHR>{};
     bufferInfos.reserve(reflection.resources.size());
     imageInfos.reserve(reflection.resources.size());
+    structureHandles.reserve(reflection.resources.size());
+    structureWrites.reserve(reflection.resources.size());
     auto writes = std::vector<VkWriteDescriptorSet>{};
     auto accesses = std::vector<detail::ResourceAccess>{};
     auto used = std::vector<void const *>{};
@@ -2755,6 +3082,21 @@ void VulkanDevice::doExecute(Dispatch const &dispatch) {
             storageFrames.push_back({frame.image.get(), frame.acquired});
             frame.acquired = true;
             access(bound->second, std::nullopt, slot.access);
+        } else if (slot.kind == ResourceKind::AccelerationStructure) {
+            auto const bound = boundStructures.find(slot.binding);
+            if (bound == boundStructures.end()) {
+                throw DeviceError{"execute: acceleration structure '" + name + " is not bound"};
+            }
+            structureHandles.push_back(structures.at(bound->second).structure.get());
+            auto structureWrite = vkStruct<VkWriteDescriptorSetAccelerationStructureKHR>(
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+            structureWrite.accelerationStructureCount = 1;
+            structureWrite.pAccelerationStructures = &structureHandles.back();
+            structureWrites.push_back(structureWrite);
+            write.pNext = &structureWrites.back();
+            write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            access(bound->second, std::nullopt, Access::ReadOnly);
+            accesses.push_back(detail::ResourceAccess{&bottomLevelsTag, 0, 0, true, false});
         } else if (slot.kind == ResourceKind::ExternalTexture) {
             auto const &frame = externals.at(boundExternals.at(slot.binding));
             imageInfos.push_back(VkDescriptorImageInfo{frame.sampler.get(), frame.view.get(),

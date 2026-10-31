@@ -45,7 +45,12 @@ struct CpuDevice final : Device {
         limits.workGroupCount = uvec3{unlimited};
         limits.storageBufferOffsetAlignment = 1;
         limits.features = (KernelFeature::Double | KernelFeature::Subgroups)
-                        | (KernelFeature::Int64 | KernelFeature::Int64Atomics);
+                        | (KernelFeature::Int64 | KernelFeature::Int64Atomics)
+                        | static_cast<std::uint32_t>(KernelFeature::RayQuery);
+        limits.accelerationStructures = unlimited;
+        limits.maxInstances = 1u << 24; // the custom index has 24 bits
+        limits.maxTriangles = unlimited;
+        limits.maxGeometries = unlimited;
         limits.subgroupSize = subgroupSize;
         limits.compressedFormats = (1u << kCompressedFormatCount) - 1u;
         limits.compressedArrayFormats = limits.compressedFormats;
@@ -90,6 +95,54 @@ protected:
         use(copy.target->key());
         std::memmove(copy.targetHost.data() + copy.targetOffset, copy.sourceHost.data() + copy.sourceOffset, copy.bytes);
     }
+    // Acceleration structures are BVHs on the host, built at once: the
+    // work before has run already.
+    void doCreateBottomLevel(BottomLevelBuild const &request) override {
+        auto geometries = std::vector<detail::HostGeometry>{};
+        for (auto const &geometry : *request.geometries) {
+            auto host = detail::HostGeometry{};
+            host.positions = ConstByteSpan{geometry.positionHost.data() + geometry.positionOffset,
+                                           geometry.positionHost.size() - geometry.positionOffset};
+            host.stride = geometry.stride;
+            host.vertexCount = geometry.vertexCount;
+            host.indices = ConstByteSpan{geometry.indexHost.data() + geometry.indexOffset,
+                                         geometry.indexHost.size() - geometry.indexOffset};
+            host.triangleCount = geometry.triangleCount;
+            host.opaque = geometry.opaque;
+            geometries.push_back(host);
+        }
+        auto blas = detail::buildBottomLevel(geometries);
+        request.state->reference = ++references;
+        bottomLevels[request.state->reference] = blas;
+        request.state->host = std::move(blas);
+    }
+    void doCreateTopLevel(TopLevelCreation const &request) override {
+        request.state->host = std::make_shared<detail::TopLevelHost const>();
+    }
+    void doBuildTopLevel(TopLevelBuild const &request) override {
+        auto instances = std::vector<detail::HostInstance>{};
+        for (std::uint32_t i = 0; i < request.count; ++i) {
+            auto instance = TopLevelInstance{};
+            std::memcpy(&instance, request.host.data() + request.offset + i * sizeof instance, sizeof instance);
+            auto const reference = std::uint64_t{instance.reference.x} | std::uint64_t{instance.reference.y} << 32;
+            auto const found = bottomLevels.find(reference);
+            auto blas = found != bottomLevels.end() ? found->second.lock() : nullptr;
+            if (blas == nullptr) {
+                throw DeviceError{"buildTopLevel: instance " + std::to_string(i)
+                                  + " refers to a bottom level that does not exist (any more)"};
+            }
+            auto host = detail::HostInstance{};
+            host.objectToWorld = instance.transform;
+            host.customIndex = instance.customIndexAndMask & 0xFFFFFFu;
+            host.mask = instance.customIndexAndMask >> 24;
+            host.flags = instance.offsetAndFlags >> 24;
+            host.index = i;
+            host.blas = std::move(blas);
+            instances.push_back(std::move(host));
+        }
+        request.state->host = detail::buildTopLevel(std::move(instances));
+    }
+    void doBindAccelerationStructure(AccelerationBindRequest const &) override {}
     void doUseKernel(KernelUse const &) override { writtenFrames.clear(); }
     void doBindBuffer(BufferBindRequest const &request) override { use(request.identity->key()); }
     void doBindImage(ImageBindRequest const &request) override { use(request.identity->key()); }
@@ -133,6 +186,8 @@ private:
     std::vector<KernelTiming> timings;
     detail::AliasTracker aliases;
     std::unordered_map<void const *, std::byte *> hostBytes; // of placed resources
+    std::uint64_t references = 0; // the reference of the latest bottom level
+    std::unordered_map<std::uint64_t, std::weak_ptr<detail::BottomLevelHost const>> bottomLevels;
 };
 
 void CpuDevice::doExecute(Dispatch const &dispatch) {

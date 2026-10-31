@@ -106,7 +106,7 @@ ReloadReport ProgramRegistry::reloadFrom(std::string const &directory) {
                                                           "features) changed; rebuild and restart"});
             continue;
         }
-        auto desktop = readFile(base + ".gl.comp");
+        auto desktop = program.glslDesktop.empty() ? std::optional<std::string>{std::string{}} : readFile(base + ".gl.comp");
         auto spirv = readSpirv(base + ".vk.comp.spv");
         if (not desktop or not spirv) {
             report.rejected.push_back({std::string{name}, "its GLSL or SPIR-V is missing"});

@@ -285,6 +285,11 @@ private:
     void unsupported(clang::SourceLocation loc, std::string const &what) {
         diags.error(loc, what + " is not supported in GPU kernels");
     }
+    static bool isRayQuery(clang::QualType const type) {
+        auto const *record = bareType(type)->getAsCXXRecordDecl();
+        return record != nullptr and record->getQualifiedNameAsString() == "tc::rayQueryEXT";
+    }
+    void useRayQueries() { out.features |= static_cast<std::uint32_t>(tc::KernelFeature::RayQuery); }
     void useSubgroups(llvm::StringRef const name, clang::SourceLocation const loc) {
         if (not kernel.usesSubgroups) {
             diags.error(loc, "kernels that use subgroup operations must declare 'static constexpr bool usesSubgroups = "
@@ -389,6 +394,10 @@ std::string Writer::typeName(clang::QualType const original, clang::SourceLocati
         return typeName(templateTypeArg(encoded, 0), loc); // only tables store the encoding
     }
     if (auto const *record = type->getAsCXXRecordDecl()) {
+        if (isRayQuery(type)) {
+            useRayQueries();
+            return "rayQueryEXT";
+        }
         if (isTcDecl(record) and not isTcValueRecord(record)) {
             diags.error(loc, "'" + original.getAsString() + "' cannot be used as a value inside a kernel");
             return "int";
@@ -1104,6 +1113,10 @@ std::string Writer::varDecl(clang::VarDecl const *var) {
         diags.warning(var->getLocation(), "64-bit integer '" + var->getName().str()
                                               + "' becomes 32-bit on the GPU; use tc::i64 or tc::u64 for 64 bits");
     }
+    if (isRayQuery(type)) {
+        // Opaque: declared, and initialised by rayQueryInitializeEXT.
+        return declaration(type, localName(var), var->getLocation());
+    }
     auto const isConstant = var->isConstexpr() or (type.isConstQualified() and var->getInit() != nullptr
                                                    and var->getInit()->isCXX11ConstantExpr(context));
     auto text = std::string{isConstant ? "const " : ""} + declaration(type, localName(var), var->getLocation());
@@ -1385,6 +1398,9 @@ std::string Writer::declRef(clang::DeclRefExpr const *ref, Role const inherited)
             if (var->getName().starts_with("gl_Subgroup") or var->getName() == "gl_NumSubgroups") {
                 useSubgroups(var->getName(), loc);
             }
+            if (var->getName().starts_with("gl_RayFlags") or var->getName().starts_with("gl_RayQuery")) {
+                useRayQueries();
+            }
             return var->getName().str();
         }
         if (inherited != Role::Read) {
@@ -1410,7 +1426,7 @@ clang::FieldDecl const *Writer::kernelField(clang::Expr const *e) const {
 
 std::string Writer::kernelMember(clang::FieldDecl const *field, Role const inherited, clang::SourceLocation const loc) {
     if (kernel.findBuffer(field) != nullptr or kernel.findTable(field) != nullptr or kernel.findImage(field) != nullptr
-        or kernel.isTexture(field) or kernel.isShared(field)) {
+        or kernel.isTexture(field) or kernel.isShared(field) or kernel.isAccelerationStructure(field)) {
         return glslIdentifier(field->getName());
     }
     if (kernel.findUniform(field) != nullptr) {
@@ -1717,6 +1733,8 @@ std::string Writer::call(clang::CallExpr const *c) {
                         name.str() + " needs a buffer element or a Shared variable as its first argument");
         } else if (name.starts_with("subgroup")) {
             useSubgroups(name, loc);
+        } else if (name.starts_with("rayQuery")) {
+            useRayQueries();
         }
         if (name.starts_with("atomic") and c->getNumArgs() > 0
             and context.getTypeSize(bareType(c->getArg(0)->getType())) == 64) {

@@ -59,19 +59,28 @@ bool compileShaders(KernelArtifact &kernel, GlslangRunner const &glslang) {
     auto const desktop = glslPath(kernel, "gl");
     auto const es = glslPath(kernel, "es");
     auto const vulkan = glslPath(kernel, "vk");
-    if (not writeFile(desktop, kernel.glslDesktop) or not writeFile(vulkan, kernel.glslVulkan)) {
+    if (not writeFile(vulkan, kernel.glslVulkan)) {
         return false;
     }
-    // glslang has no 64-bit atomics for desktop GLSL (GL_NV_shader_atomic_int64);
-    // the driver checks that variant when the OpenGL backend compiles it.
-    auto const checkDesktop = not tc::uses(kernel.features, tc::KernelFeature::Int64Atomics);
-    auto const desktopResult = checkDesktop ? glslang.validate(desktop) : GlslangResult{true, {}, {}};
-    if (not desktopResult.ok) {
-        llvm::errs() << desktop << ": error: generated OpenGL GLSL does not compile:\n" << desktopResult.log << "\n";
-        return false;
+    // Kernels with ray queries have no OpenGL variants.
+    if (not kernel.glslDesktop.empty()) {
+        if (not writeFile(desktop, kernel.glslDesktop)) {
+            return false;
+        }
+        // glslang has no 64-bit atomics for desktop GLSL (GL_NV_shader_atomic_int64);
+        // the driver checks that variant when the OpenGL backend compiles it.
+        auto const checkDesktop = not tc::uses(kernel.features, tc::KernelFeature::Int64Atomics);
+        auto const desktopResult = checkDesktop ? glslang.validate(desktop) : GlslangResult{true, {}, {}};
+        if (not desktopResult.ok) {
+            llvm::errs() << desktop << ": error: generated OpenGL GLSL does not compile:\n" << desktopResult.log << "\n";
+            return false;
+        }
     }
-    auto const subgroups = tc::uses(kernel.features, tc::KernelFeature::Subgroups);
-    auto spirv = glslang.compileSpirv(vulkan, vulkan + ".spv", subgroups ? "vulkan1.1" : "vulkan1.0");
+    // Ray queries need SPIR-V 1.4 (Vulkan 1.2), subgroups SPIR-V 1.3 (Vulkan 1.1).
+    auto const target = tc::uses(kernel.features, tc::KernelFeature::RayQuery)    ? "vulkan1.2"
+                      : tc::uses(kernel.features, tc::KernelFeature::Subgroups) ? "vulkan1.1"
+                                                                                : "vulkan1.0";
+    auto spirv = glslang.compileSpirv(vulkan, vulkan + ".spv", target);
     if (not spirv.ok) {
         llvm::errs() << vulkan << ": error: generated Vulkan GLSL does not compile:\n" << spirv.log << "\n";
         return false;
