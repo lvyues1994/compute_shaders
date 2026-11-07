@@ -60,6 +60,38 @@ TEST_P(Equivalence, DeviceBuffersHaveNoHostCopy) {
     }
 }
 
+// Buffers the host reads back (HostAccess::Reads) are in other memory where the
+// device has it, and hold the same results.
+TEST_P(Equivalence, BuffersTheHostReadsHoldWhatKernelsWrote) {
+    for (auto *device : {cpu.get(), gpu.get()}) {
+        auto const name = device->info().backend;
+        auto written = device->createBuffer<uint>(kWords);
+        for (int i = 0; i < kWords; ++i) {
+            written[i] = static_cast<uint>(i * 5 + 2);
+        }
+        device->uploadBuffer(written);
+        auto filled = device->createBuffer<uint>(kWords, HostAccess::Reads);
+        auto copied = device->createBuffer<uint>(kWords, HostAccess::Reads);
+        auto sink = device->createBuffer<uint>(kWords);
+        for (auto *buffer : {&filled, &copied, &sink}) {
+            device->uploadBuffer(*buffer);
+        }
+        auto target = BufferBinding<uint, 0>{};
+        target.attach(filled);
+        fill(*device, target, 3u);
+        slowCopy(*device, written, copied, sink, 0u);
+        device->finish();
+        device->downloadBuffer(filled);
+        device->downloadBuffer(copied);
+        auto mismatches = 0;
+        for (int i = 0; i < kWords; ++i) {
+            mismatches += filled[i] == static_cast<uint>(i * 3 + 1) ? 0 : 1;
+            mismatches += copied[i] == static_cast<uint>(i * 5 + 2) ? 0 : 1;
+        }
+        EXPECT_EQ(mismatches, 0) << name;
+    }
+}
+
 // Words go host buffer -> device buffer -> kernel -> device buffer -> host
 // buffer, an indirect dispatch reads its counts from a device buffer, and
 // a device buffer fills a device image.

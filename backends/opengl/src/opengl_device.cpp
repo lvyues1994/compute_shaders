@@ -296,7 +296,8 @@ struct OpenGLDevice final : Device {
     }
 
 protected:
-    std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes) override;
+    std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes,
+                                                   HostAccess access) override;
     void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes, ByteRange range) override;
     void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes, ByteRange range) override;
     std::optional<std::string> doCheckKernel(KernelProgram const &program) const override {
@@ -671,8 +672,8 @@ PfnBufferStorage OpenGLDevice::bufferStorage() const {
     return core44 or hasGlExtension(gl(), "GL_ARB_buffer_storage") ? gl().glBufferStorage : nullptr;
 }
 
-std::optional<ExternalMemory> OpenGLDevice::doAllocateBuffer(ResourceIdentity const &identity,
-                                                             std::size_t const bytes) {
+std::optional<ExternalMemory> OpenGLDevice::doAllocateBuffer(ResourceIdentity const &identity, std::size_t const bytes,
+                                                             HostAccess const access) {
     egl->makeCurrent();
     auto const storage = bufferStorage();
     if (storage == nullptr or bytes == 0) {
@@ -684,7 +685,9 @@ std::optional<ExternalMemory> OpenGLDevice::doAllocateBuffer(ResourceIdentity co
     gl().glGenBuffers(1, &allocation->buffer);
     gl().glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation->buffer);
     auto const flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | kMapPersistentBit | kMapCoherentBit;
-    storage(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, flags);
+    // A hint only: drivers that honour it keep the buffer in host memory.
+    auto const placement = access == HostAccess::Reads ? kClientStorageBit : GLbitfield{0};
+    storage(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, flags | placement);
     allocation->mapped = static_cast<std::byte *>(
         gl().glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(bytes), flags));
     if (allocation->mapped == nullptr) {

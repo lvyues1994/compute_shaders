@@ -595,7 +595,8 @@ struct VulkanDevice final : Device {
     }
 
 protected:
-    std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes) override;
+    std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes,
+                                                   HostAccess access) override;
     void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes, ByteRange range) override;
     void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes, ByteRange range) override;
     std::optional<std::string> doCheckKernel(KernelProgram const &program) const override {
@@ -696,7 +697,7 @@ private:
     void pickPhysicalDevice(VulkanDeviceConfig const &config);
     void createLogicalDevice();
     std::uint32_t memoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
-    std::uint32_t sharedMemoryType() const;
+    std::uint32_t sharedMemoryType(HostAccess access = HostAccess::Writes) const;
     DeviceObject<VkDeviceMemory> allocate(VkMemoryRequirements const &requirements, VkMemoryPropertyFlags flags);
     // Commands go into the recording batch, begun on first use, until
     // submitBatch() sends it; flush() also waits for every batch.
@@ -1288,10 +1289,13 @@ std::uint32_t VulkanDevice::memoryType(std::uint32_t const typeBits, VkMemoryPro
     throw DeviceError{"no Vulkan memory type with the required properties"};
 }
 
-// Memory for createBuffer(): CPU-visible and coherent. Device-local memory
-// wins when its heap is large (unified memory, resizable BAR) rather than the
-// small BAR window of a discrete GPU; otherwise cached system memory.
-std::uint32_t VulkanDevice::sharedMemoryType() const {
+// Memory for createBuffer(): CPU-visible and coherent. For HostAccess::Writes
+// device-local memory wins when its heap is large (unified memory, resizable
+// BAR) rather than the small BAR window of a discrete GPU; otherwise cached
+// system memory. For HostAccess::Reads cached memory wins, system memory
+// before device-local: hosts read device memory across the bus very slowly
+// (8 MB in 153 ms on an RTX 5070 Ti against 0.29 ms from cached system memory).
+std::uint32_t VulkanDevice::sharedMemoryType(HostAccess const access) const {
     auto constexpr hostShared = VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                                                       | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
     auto largestDeviceHeap = VkDeviceSize{0};
@@ -1310,8 +1314,9 @@ std::uint32_t VulkanDevice::sharedMemoryType() const {
         auto const heapSize = memoryProperties.memoryHeaps[type.heapIndex].size;
         auto const deviceLocal = (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
         auto const largeHeap = heapSize * 2 >= largestDeviceHeap;
-        auto score = deviceLocal ? (largeHeap ? 4 : -1) : 0;
-        score += (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0 ? 2 : 0;
+        auto const cached = (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+        auto score = access == HostAccess::Reads ? (cached ? 4 : 0) + (deviceLocal ? 0 : 1)
+                                                 : (deviceLocal ? (largeHeap ? 4 : -1) : 0) + (cached ? 2 : 0);
         if (score > bestScore) {
             best = i;
             bestScore = score;
@@ -1335,8 +1340,8 @@ DeviceObject<VkDeviceMemory> VulkanDevice::allocate(VkMemoryRequirements const &
     return DeviceObject<VkDeviceMemory>{device.handle, memory, vkFreeMemory};
 }
 
-std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity const &identity,
-                                                             std::size_t const bytes) {
+std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity const &identity, std::size_t const bytes,
+                                                             HostAccess const access) {
     if (bytes == 0) {
         return std::nullopt;
     }
@@ -1353,7 +1358,7 @@ std::optional<ExternalMemory> VulkanDevice::doAllocateBuffer(ResourceIdentity co
     allocation->buffer = DeviceObject<VkBuffer>{device.handle, buffer, vkDestroyBuffer};
     auto requirements = VkMemoryRequirements{};
     vkGetBufferMemoryRequirements(device.handle, buffer, &requirements);
-    auto type = sharedMemoryType();
+    auto type = sharedMemoryType(access);
     if ((requirements.memoryTypeBits & (1u << type)) == 0) {
         type = memoryType(requirements.memoryTypeBits,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);

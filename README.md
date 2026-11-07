@@ -453,7 +453,7 @@ RTX 5070 Ti、Vulkan 上的部分结果（GPU 时间，毫秒；OpenGL 和 GLES 
 
 ## 零拷贝与外部帧
 
-`device->createBuffer<T>(n)` 返回的 `BufferResource` 直接指向设备分配、映射到主机的内存：Vulkan 用 host-visible 的设备内存，GL/GLES 用持久映射（`glBufferStorage`，GLES 需要 `GL_EXT_buffer_storage`），CPU 后端就是普通内存。这样的 buffer 在主机上直接读写，`uploadBuffer` / `downloadBuffer` 只负责同步，不再复制数据；不调用它们而直接读写时，先 `device->finish()`。驱动不支持映射时自动退回普通 buffer，接口不变。`DeviceInfo::unifiedMemory` 表示主机写入的内存是否就是 GPU 读取的内存（手机等统一内存架构，或开启 ReBAR 的独立显卡）。
+`device->createBuffer<T>(n)` 返回的 `BufferResource` 直接指向设备分配、映射到主机的内存：Vulkan 用 host-visible 的设备内存，GL/GLES 用持久映射（`glBufferStorage`，GLES 需要 `GL_EXT_buffer_storage`），CPU 后端就是普通内存。这样的 buffer 在主机上直接读写，`uploadBuffer` / `downloadBuffer` 只负责同步，不再复制数据；不调用它们而直接读写时，先 `device->finish()`。驱动不支持映射时自动退回普通 buffer，接口不变。`DeviceInfo::unifiedMemory` 表示主机写入的内存是否就是 GPU 读取的内存（手机等统一内存架构，或开启 ReBAR 的独立显卡）。第二个参数 `HostAccess` 说明主机怎么用这块内存：默认的 `Writes`（主机写、设备读：上传、暂存）在设备本地的堆够大时（统一内存，或开启 ReBAR）用设备本地、主机可见的内存，主机写得快、读得极慢；`Reads`（设备写、主机读：回读）用主机缓存的系统内存。RTX 5070 Ti 开了 ReBAR，主机从前一种内存读 8 MB 要 153 ms，从后一种只要 0.29 ms。GL/GLES 上 `Reads` 给 `glBufferStorage` 加 `GL_CLIENT_STORAGE_BIT`，只是提示；CPU 后端不区分。两种内存里的结果相同。
 
 Vulkan 后端会把连续的传输和 dispatch 录进同一个命令缓冲区，到 `submit()` 时提交，或者在需要把结果交给主机时（`downloadBuffer`/`downloadImage`/`finish()`）提交并等待。`device->finish()` 等待所有已提交的工作完成。
 

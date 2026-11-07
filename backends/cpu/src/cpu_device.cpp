@@ -63,7 +63,7 @@ struct CpuDevice final : Device {
 protected:
     // Host memory is the working copy, so transfers, bindings and uniforms
     // need no work: kernels read their members directly.
-    std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &, std::size_t) override {
+    std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &, std::size_t, HostAccess) override {
         return std::nullopt;
     }
     void doUploadBuffer(ResourceIdentity const &, ConstByteSpan, ByteRange) override {}

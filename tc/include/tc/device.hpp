@@ -722,6 +722,17 @@ private:
     std::uint64_t submitted = 0;
 };
 
+// How the host uses a createBuffer() buffer, which decides the memory it gets.
+enum class HostAccess : std::uint8_t {
+    // The host writes and the device reads: uploads, staging. Device-local memory the
+    // host maps where its heap is large (unified memory, resizable BAR), which hosts
+    // write fast and read very slowly; otherwise cached system memory.
+    Writes,
+    // The device writes and the host reads: readbacks. Cached system memory, which the
+    // host reads fast, wherever the device has it.
+    Reads,
+};
+
 // A compute device. The public template API mirrors the talk:
 //
 //   device.uploadBuffer(a);            device.useKernel(kernel);
@@ -737,12 +748,14 @@ struct Device {
     // A buffer the CPU and this device share without copies when the device
     // can map its memory (Vulkan; OpenGL with buffer storage). uploadBuffer
     // and downloadBuffer then only synchronise. Otherwise an ordinary host
-    // buffer. Contents start zeroed.
+    // buffer. Contents start zeroed. `access` picks the memory (see HostAccess);
+    // either kind holds the same results.
     template <class T, Dim D = Dim::D1>
-    BufferResource<T, D> createBuffer(typename DimTraits<D>::IndexType const extent) {
+    BufferResource<T, D> createBuffer(typename DimTraits<D>::IndexType const extent,
+                                      HostAccess const access = HostAccess::Writes) {
         auto identity = ResourceIdentity::create();
         auto const bytes = static_cast<std::size_t>(DimTraits<D>::product(extent)) * sizeof(T);
-        if (auto memory = doAllocateBuffer(identity, bytes)) {
+        if (auto memory = doAllocateBuffer(identity, bytes, access)) {
             return BufferResource<T, D>::wrap(extent, std::move(*memory), std::move(identity));
         }
         return BufferResource<T, D>{extent};
@@ -1348,7 +1361,8 @@ struct Device {
 protected:
     // Allocates `bytes` of device memory mapped for the CPU and registers it
     // as the device mirror of `identity`; nullopt when the device cannot.
-    virtual std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes) = 0;
+    virtual std::optional<ExternalMemory> doAllocateBuffer(ResourceIdentity const &identity, std::size_t bytes,
+                                                           HostAccess access) = 0;
     // `bytes` is the whole host buffer; only `range` of it moves.
     virtual void doUploadBuffer(ResourceIdentity const &identity, ConstByteSpan bytes, ByteRange range) = 0;
     virtual void doDownloadBuffer(ResourceIdentity const &identity, ByteSpan bytes, ByteRange range) = 0;

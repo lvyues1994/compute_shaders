@@ -13,6 +13,7 @@ using PfnTextureView = void(GL_APIENTRY *)(GLuint, GLenum, GLuint, GLenum, GLuin
 
 inline constexpr GLbitfield kMapPersistentBit = 0x0040;
 inline constexpr GLbitfield kMapCoherentBit = 0x0080;
+inline constexpr GLbitfield kClientStorageBit = 0x0200;
 
 // GL_EXT_memory_object and GL_EXT_memory_object_fd: buffers in memory other
 // APIs exported, and the UUIDs that say whose GPU it is.
